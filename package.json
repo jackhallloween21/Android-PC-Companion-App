@@ -1,0 +1,23 @@
+{
+  "name": "android-pc-companion",
+  "version": "0.1.0",
+  "description": "PC companion app for Android devices: mirroring, battery, files, sideloading, app management, bootloader unlock.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.example.androidcompanion",
+    "productName": "Companion",
+    "win": { "target": "nsis" },
+    "mac": { "target": "dmg" },
+    "linux": { "target": "AppImage" }
+  }
+}
