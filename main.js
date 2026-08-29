@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
 
@@ -254,6 +255,134 @@ ipcMain.handle('fastboot:devices', async () => {
 });
 
 ipcMain.handle('fastboot:unlock', (_e, serial) => fastboot(['-s', serial, 'flashing', 'unlock']));
+
+// ---------------------------------------------------------------------------
+// Audio forwarding (device speaker/media audio -> PC speakers) via scrcpy.
+// Flag name for the audio source has changed across scrcpy versions
+// (older: --audio-source=output, newer: --audio-source=playback) — if this
+// fails on your scrcpy version, run `scrcpy --help` and adjust AUDIO_SOURCE.
+// ---------------------------------------------------------------------------
+
+const AUDIO_SOURCE = 'output';
+let audioProcess = null;
+
+ipcMain.handle('audio:start', (_e, serial) => {
+  if (audioProcess) return true;
+  audioProcess = spawn(
+    tools.scrcpy,
+    ['-s', serial, '--no-video', '--no-control', `--audio-source=${AUDIO_SOURCE}`],
+    { stdio: 'ignore' }
+  );
+  audioProcess.on('exit', () => { audioProcess = null; });
+  audioProcess.on('error', () => { audioProcess = null; });
+  return true;
+});
+
+ipcMain.handle('audio:stop', () => {
+  if (audioProcess) {
+    audioProcess.kill();
+    audioProcess = null;
+  }
+  return true;
+});
+
+ipcMain.handle('audio:status', () => !!audioProcess);
+
+// ---------------------------------------------------------------------------
+// Media transport controls — standard Android media keycodes via adb, works
+// against whatever app currently holds the active media session.
+// ---------------------------------------------------------------------------
+
+const MEDIA_KEYCODES = { playPause: 85, next: 87, previous: 88 };
+
+ipcMain.handle('media:key', (_e, { serial, action }) => {
+  const code = MEDIA_KEYCODES[action];
+  if (!code) throw new Error(`Unknown media action: ${action}`);
+  return adb(['-s', serial, 'shell', 'input', 'keyevent', String(code)]);
+});
+
+ipcMain.handle('media:nowPlaying', async (_e, serial) => {
+  // dumpsys media_session's text format isn't a stable API and varies by
+  // Android version/OEM — this is best-effort scraping, not guaranteed.
+  const out = await adb(['-s', serial, 'shell', 'dumpsys', 'media_session']);
+  const descMatch = out.match(/description=([^,\n]+)/);
+  return { description: descMatch ? descMatch[1].trim() : null };
+});
+
+// ---------------------------------------------------------------------------
+// Backup — pulls shared storage folders and/or installed APKs. This is NOT a
+// full system/app-data backup (adb backup is unreliable on modern Android
+// and most apps opt out of it); it only reaches what's accessible without
+// root: shared storage and APK files.
+// ---------------------------------------------------------------------------
+
+const BACKUP_PATHS = {
+  dcim: '/sdcard/DCIM',
+  pictures: '/sdcard/Pictures',
+  downloads: '/sdcard/Download',
+  music: '/sdcard/Music',
+  documents: '/sdcard/Documents',
+};
+
+ipcMain.handle('backup:chooseDestination', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+  return canceled || !filePaths.length ? null : filePaths[0];
+});
+
+ipcMain.handle('backup:run', async (event, { serial, categories, destDir, includeApks }) => {
+  const send = (line) => event.sender.send('backup:progress', line);
+
+  for (const cat of categories) {
+    const remote = BACKUP_PATHS[cat];
+    if (!remote) continue;
+    const localDir = path.join(destDir, cat);
+    fs.mkdirSync(localDir, { recursive: true });
+    send(`Pulling ${remote} …`);
+    try {
+      await adb(['-s', serial, 'pull', remote, localDir]);
+      send(`Done: ${cat}`);
+    } catch (err) {
+      send(`Skipped ${cat}: ${err.message}`);
+    }
+  }
+
+  if (includeApks) {
+    send('Listing installed apps…');
+    const pkgOut = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '-3']);
+    const pkgs = pkgOut.split('\n').map((l) => l.replace('package:', '').trim()).filter(Boolean);
+    const apkDir = path.join(destDir, 'apks');
+    fs.mkdirSync(apkDir, { recursive: true });
+    for (const pkg of pkgs) {
+      try {
+        const pathOut = await adb(['-s', serial, 'shell', 'pm', 'path', pkg]);
+        const remoteApk = pathOut.split('\n')[0].replace('package:', '').trim();
+        if (!remoteApk) continue;
+        await adb(['-s', serial, 'pull', remoteApk, path.join(apkDir, `${pkg}.apk`)]);
+        send(`APK saved: ${pkg}`);
+      } catch (err) {
+        send(`APK failed (${pkg}): ${err.message}`);
+      }
+    }
+  }
+
+  send('Backup complete.');
+  return true;
+});
+
+// ---------------------------------------------------------------------------
+// Camera preview (phone camera -> its own window, via scrcpy's camera video
+// source). This is the video half of a "use phone as webcam" feature. Making
+// that video available to other apps as an actual webcam device needs a
+// signed virtual-camera driver per OS — out of scope here; see README.
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('webcam:launchPreview', (_e, { serial, facing }) => {
+  const args = ['-s', serial, '--video-source=camera', '--no-audio', '--window-title', `Camera — ${serial}`];
+  if (facing) args.push(`--camera-facing=${facing}`);
+  const child = spawn(tools.scrcpy, args, { detached: true, stdio: 'ignore' });
+  child.unref();
+  return true;
+});
 
 // ---------------------------------------------------------------------------
 // Custom titlebar window controls (frameless window has no native ones)

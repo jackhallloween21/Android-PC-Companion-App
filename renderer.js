@@ -46,6 +46,7 @@ function setActiveTab(tab) {
   state.activeTab = tab;
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.tab-content').forEach((s) => s.classList.add('hidden'));
+  if (tab !== 'audio') clearInterval(nowPlayingTimer);
   if (state.selected) {
     el('empty-state').classList.add('hidden');
     el(`tab-${tab}`).classList.remove('hidden');
@@ -58,6 +59,7 @@ function refreshTab(tab) {
   if (tab === 'battery') loadBattery();
   if (tab === 'files') loadFiles();
   if (tab === 'apps') loadApps();
+  if (tab === 'audio') refreshAudioStatus();
 }
 
 // -------------------------------------------------------------- devices
@@ -104,6 +106,51 @@ el('refresh-btn').onclick = refreshDevices;
 // ------------------------------------------------------------------- mirror
 
 el('launch-scrcpy').onclick = () => state.selected && window.api.launchScrcpy(state.selected);
+
+// ----------------------------------------------------------------- webcam
+
+el('launch-camera-btn').onclick = () => {
+  if (!state.selected) return;
+  const facing = el('camera-facing').value;
+  window.api.launchCameraPreview(state.selected, facing);
+};
+
+// ------------------------------------------------------------------- audio
+
+let nowPlayingTimer = null;
+
+async function refreshAudioStatus() {
+  const forwarding = await window.api.audioStatus();
+  el('audio-status').textContent = forwarding ? 'Forwarding device audio to PC speakers.' : 'Not forwarding.';
+  clearInterval(nowPlayingTimer);
+  if (state.activeTab === 'audio') {
+    pollNowPlaying();
+    nowPlayingTimer = setInterval(pollNowPlaying, 4000);
+  }
+}
+
+async function pollNowPlaying() {
+  if (!state.selected) return;
+  try {
+    const { description } = await window.api.nowPlaying(state.selected);
+    el('now-playing').textContent = description || 'No active media session detected.';
+  } catch {
+    el('now-playing').textContent = '';
+  }
+}
+
+el('audio-start-btn').onclick = async () => {
+  if (!state.selected) return;
+  await window.api.startAudio(state.selected);
+  refreshAudioStatus();
+};
+el('audio-stop-btn').onclick = async () => {
+  await window.api.stopAudio();
+  refreshAudioStatus();
+};
+el('media-prev-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'previous');
+el('media-playpause-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'playPause');
+el('media-next-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'next');
 
 // ------------------------------------------------------------------ battery
 
@@ -204,6 +251,46 @@ async function loadApps() {
     container.innerHTML = `<span class="muted">${err.message}</span>`;
   }
 }
+
+// ------------------------------------------------------------------- backup
+
+let backupDest = null;
+
+el('choose-dest-btn').onclick = async () => {
+  const dir = await window.api.chooseBackupDestination();
+  if (dir) {
+    backupDest = dir;
+    el('backup-dest').value = dir;
+  }
+};
+
+window.api.onBackupProgress((line) => {
+  const out = el('backup-output');
+  out.textContent += (out.textContent ? '\n' : '') + line;
+  out.scrollTop = out.scrollHeight;
+});
+
+el('run-backup-btn').onclick = async () => {
+  if (!state.selected) return;
+  if (!backupDest) {
+    alert('Choose a destination folder first.');
+    return;
+  }
+  const categories = Array.from(document.querySelectorAll('.checkbox-list input[type="checkbox"][value]'))
+    .filter((c) => c.checked)
+    .map((c) => c.value);
+  const includeApks = el('backup-apks').checked;
+
+  el('backup-output').textContent = '';
+  el('run-backup-btn').disabled = true;
+  try {
+    await window.api.runBackup(state.selected, categories, backupDest, includeApks);
+  } catch (err) {
+    el('backup-output').textContent += `\nError: ${err.message}`;
+  } finally {
+    el('run-backup-btn').disabled = false;
+  }
+};
 
 // -------------------------------------------------------------- bootloader
 

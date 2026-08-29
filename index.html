@@ -45,9 +45,12 @@
     <main id="panel">
       <nav id="tabs">
         <button class="tab active" data-tab="mirror">Mirror</button>
+        <button class="tab" data-tab="webcam">Webcam</button>
+        <button class="tab" data-tab="audio">Audio</button>
         <button class="tab" data-tab="battery">Battery</button>
         <button class="tab" data-tab="files">Files</button>
         <button class="tab" data-tab="apps">Apps</button>
+        <button class="tab" data-tab="backup">Backup</button>
         <button class="tab" data-tab="bootloader">Bootloader</button>
       </nav>
 
@@ -60,6 +63,35 @@
         <h3>Screen mirror</h3>
         <p class="muted">Launches scrcpy in its own window. In-app embedding of the video stream is a later upgrade — see the README.</p>
         <button id="launch-scrcpy" class="primary-btn">Start mirroring</button>
+      </section>
+
+      <section id="tab-webcam" class="tab-content glass-card hidden">
+        <h3>Camera preview</h3>
+        <p class="muted">Streams the phone's camera to a preview window via scrcpy's camera video source. This is the video half of a "use phone as webcam" feature — making it selectable inside other apps (Zoom, OBS, browsers) needs a signed virtual-camera driver per OS, which isn't built yet. See the README for what that would take.</p>
+        <div class="path-bar" style="margin-top: 14px;">
+          <select id="camera-facing" class="mono">
+            <option value="back">Back camera</option>
+            <option value="front">Front camera</option>
+          </select>
+          <button id="launch-camera-btn" class="primary-btn" style="margin-top:0;">Open camera preview</button>
+        </div>
+      </section>
+
+      <section id="tab-audio" class="tab-content glass-card hidden">
+        <h3>Audio &amp; media controls</h3>
+        <p class="muted">Forwards device audio (music, media playback) to your PC speakers via scrcpy, and sends standard media-key commands to whatever app holds the active playback session.</p>
+        <div class="bootloader-actions" style="margin-top: 14px;">
+          <button id="audio-start-btn" class="primary-btn" style="margin-top:0;">Start audio forwarding</button>
+          <button id="audio-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
+        </div>
+        <p id="audio-status" class="muted" style="margin-top: 10px;">Not forwarding.</p>
+
+        <div class="transport-controls">
+          <button id="media-prev-btn" class="ghost-btn" style="margin-top:0;">&#9198; Prev</button>
+          <button id="media-playpause-btn" class="primary-btn" style="margin-top:0;">&#9199; Play / Pause</button>
+          <button id="media-next-btn" class="ghost-btn" style="margin-top:0;">&#9197; Next</button>
+        </div>
+        <p id="now-playing" class="muted mono" style="margin-top: 12px;"></p>
       </section>
 
       <section id="tab-battery" class="tab-content glass-card hidden">
@@ -83,6 +115,25 @@
           <button id="install-apk-btn" class="primary-btn">Sideload APK</button>
         </div>
         <div id="app-list" class="mono app-list"></div>
+      </section>
+
+      <section id="tab-backup" class="tab-content glass-card hidden">
+        <h3>Backup</h3>
+        <p class="muted">Pulls shared storage folders and, optionally, installed APKs to a folder on this PC. This isn't a full system/app-data backup — modern Android doesn't allow that without root — just what's reachable from userspace adb.</p>
+        <div class="checkbox-list">
+          <label class="checkbox-row"><input type="checkbox" value="dcim" checked /> Camera photos &amp; videos (DCIM)</label>
+          <label class="checkbox-row"><input type="checkbox" value="pictures" checked /> Pictures</label>
+          <label class="checkbox-row"><input type="checkbox" value="downloads" /> Downloads</label>
+          <label class="checkbox-row"><input type="checkbox" value="music" /> Music</label>
+          <label class="checkbox-row"><input type="checkbox" value="documents" /> Documents</label>
+          <label class="checkbox-row"><input type="checkbox" id="backup-apks" /> Installed app APKs (not app data)</label>
+        </div>
+        <div class="path-bar">
+          <input id="backup-dest" class="mono" placeholder="Choose a destination folder…" readonly />
+          <button id="choose-dest-btn" class="ghost-btn">Browse</button>
+        </div>
+        <button id="run-backup-btn" class="primary-btn">Start backup</button>
+        <pre id="backup-output" class="mono output-block"></pre>
       </section>
 
       <section id="tab-bootloader" class="tab-content glass-card hidden">

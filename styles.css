@@ -441,6 +441,32 @@ button:disabled { opacity: 0.4; cursor: not-allowed; filter: none !important; }
 
 .bootloader-actions { display: flex; gap: 10px; }
 
+/* audio transport + backup checkboxes */
+
+.transport-controls {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.checkbox-list {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+.checkbox-row:hover { background: rgba(255, 255, 255, 0.03); }
+.checkbox-row input { accent-color: var(--accent); }
+
 /* --------------------------------------------------------------- pairing */
 
 .modal {

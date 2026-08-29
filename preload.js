@@ -29,6 +29,22 @@ contextBridge.exposeInMainWorld('api', {
   // mirroring
   launchScrcpy: (serial) => ipcRenderer.invoke('scrcpy:launch', serial),
 
+  // audio forwarding + media controls
+  startAudio: (serial) => ipcRenderer.invoke('audio:start', serial),
+  stopAudio: () => ipcRenderer.invoke('audio:stop'),
+  audioStatus: () => ipcRenderer.invoke('audio:status'),
+  mediaKey: (serial, action) => ipcRenderer.invoke('media:key', { serial, action }),
+  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', serial),
+
+  // backup
+  chooseBackupDestination: () => ipcRenderer.invoke('backup:chooseDestination'),
+  runBackup: (serial, categories, destDir, includeApks) =>
+    ipcRenderer.invoke('backup:run', { serial, categories, destDir, includeApks }),
+  onBackupProgress: (callback) => ipcRenderer.on('backup:progress', (_e, line) => callback(line)),
+
+  // camera preview (webcam video half — see README for the virtual-cam gap)
+  launchCameraPreview: (serial, facing) => ipcRenderer.invoke('webcam:launchPreview', { serial, facing }),
+
   // fastboot
   fastbootDevices: () => ipcRenderer.invoke('fastboot:devices'),
   fastbootUnlock: (serial) => ipcRenderer.invoke('fastboot:unlock', serial),

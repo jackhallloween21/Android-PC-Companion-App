@@ -54,14 +54,50 @@ desktop machine.
 - **Wireless pairing** — Android 11+ pairing-code flow (`adb pair`) via a modal, plus
   `adb connect` / `adb tcpip` for the classic USB-then-wireless handoff.
 - **Mirror tab** — spawns `scrcpy` as its own window. See "Upgrading mirroring" below.
+- **Webcam tab** — opens a preview window of the phone's camera via scrcpy's
+  `--video-source=camera`. This is only the video-capture half of "use my phone as a
+  webcam" — see "Camera as a virtual webcam" below for the missing piece.
+- **Audio tab** — forwards device audio to PC speakers via scrcpy
+  (`--no-video --audio-source=output`), plus play/pause/next/previous using standard
+  Android media keycodes over `adb shell input keyevent`, and a best-effort "now
+  playing" scrape from `dumpsys media_session`.
 - **Battery tab** — parses `adb shell dumpsys battery` into a data grid.
 - **Files tab** — browse a path with `ls -la`, pull/push/delete over adb.
 - **Apps tab** — list third-party packages, sideload an APK, disable/enable/uninstall.
+- **Backup tab** — pulls shared-storage folders (DCIM, Pictures, Downloads, Music,
+  Documents) and, optionally, installed APKs to a folder you choose. This is **not** a
+  full system/app-data backup — Android doesn't allow reading another app's private
+  data without root, and `adb backup` itself is unreliable on modern Android since most
+  apps opt out via `allowBackup=false`. It only reaches what userspace adb can see.
 - **Bootloader tab** — reboot to bootloader, and a generic `fastboot flashing unlock`
   with a confirmation prompt. This only works on OEMs that support the standard
   fastboot unlock flow (Pixel-style AOSP devices). Xiaomi, OnePlus, and others require
   their own account-bound unlock tool and a mandatory wait period — there's no way to
   script around that, only surface instructions for it.
+
+## Camera as a virtual webcam — what's missing
+
+The Webcam tab captures and displays the phone's camera feed, which is the same
+video pipeline scrcpy uses for screen mirroring, just pointed at the camera instead.
+What it does **not** do is register that feed as a selectable webcam device inside
+other apps (Zoom, Discord, OBS, browsers) — that's what DroidCam and similar tools
+actually do, and it requires a signed virtual-camera driver per OS:
+
+- **Windows**: a DirectShow or Media Foundation virtual camera source filter —
+  needs a driver, typically kernel-signed for modern Windows to load it without
+  disabling driver signature enforcement.
+- **macOS**: a CoreMediaIO DAL plugin/extension, which needs to be notarized to run
+  without Gatekeeper warnings on current macOS.
+- **Linux**: comparatively easy — the `v4l2loopback` kernel module creates a
+  `/dev/videoN` device, and you can pipe scrcpy's camera output through `ffmpeg` into
+  it (`ffmpeg -i <scrcpy camera stream> -f v4l2 /dev/videoN`), and it shows up in any
+  app as a normal webcam.
+
+Realistic path if you want this: build and ship the Linux `v4l2loopback` version
+first since it needs no custom driver, and treat Windows/macOS as a much larger
+follow-on project (or lean on an already-installed driver, e.g. piping frames into
+OBS Studio's existing Virtual Camera via its WebSocket API, so users install OBS once
+rather than your own unsigned driver).
 
 ## Window chrome
 
@@ -86,7 +122,13 @@ change shape.
 
 **Bundling binaries.** For distribution, ship `adb`/`fastboot`/`scrcpy` per-platform
 under `resources/<platform>/` and resolve the binary path via `process.resourcesPath`
-instead of relying on the user's `PATH`.
+instead of relying on the user's `PATH`. (Auto-download already handles the common
+case — see above — this note is about fully offline/bundled distribution instead.)
+
+**Audio source flag.** scrcpy's audio-source flag name has changed across versions
+(`--audio-source=output` on some, `--audio-source=playback` on newer ones). If audio
+forwarding fails on your scrcpy version, run `scrcpy --help` and update
+`AUDIO_SOURCE` in `main.js`.
 
 **Upgrading mirroring.** scrcpy is a client/server pair: it pushes `scrcpy-server.jar`
 to the device over adb, which opens a socket and streams H.264/H.265 video plus
