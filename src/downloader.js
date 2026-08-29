@@ -51,7 +51,7 @@ async function ensurePlatformTools(onProgress) {
     return { adbPath, fastbootPath };
   }
 
-  const url = `https://dl.google.com/android/repo/${platformToolsAssetName()}`;
+  const url = `https://dl.google.com/android/repository/${platformToolsAssetName()}`;
   const zipPath = path.join(dir, 'platform-tools.zip');
   await download(url, zipPath, onProgress);
   await extract(zipPath, { dir }); // zip already contains a top-level platform-tools/ folder
@@ -67,6 +67,28 @@ async function ensurePlatformTools(onProgress) {
 // ---------------------------------------------------------------------------
 // scrcpy — fetched from its latest GitHub release
 // ---------------------------------------------------------------------------
+
+// scrcpy archives wrap everything in a single top-level folder
+// (e.g. scrcpy-win64-v3.1/), so the binary lands one level deeper than the
+// extract target. Recursively locate it so we don't assume a flat layout.
+function findBinary(dir, exeName) {
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const full = path.join(cur, e.name);
+      if (e.isDirectory()) stack.push(full);
+      else if (e.name === exeName) return full;
+    }
+  }
+  return null;
+}
 
 async function latestScrcpyAsset() {
   const res = await fetch('https://api.github.com/repos/Genymobile/scrcpy/releases/latest', {
@@ -90,9 +112,10 @@ async function ensureScrcpy(onProgress) {
   const dir = binDir();
   const scDir = path.join(dir, 'scrcpy');
   const exeName = process.platform === 'win32' ? 'scrcpy.exe' : 'scrcpy';
-  const exePath = path.join(scDir, exeName);
 
-  if (fs.existsSync(exePath)) return exePath;
+  // The archive extracts into a nested folder, so resolve the real binary path.
+  const existing = findBinary(scDir, exeName);
+  if (existing) return existing;
 
   const asset = await latestScrcpyAsset();
   const archivePath = path.join(dir, asset.name);
@@ -106,7 +129,9 @@ async function ensureScrcpy(onProgress) {
   }
   fs.unlinkSync(archivePath);
 
-  if (process.platform !== 'win32' && fs.existsSync(exePath)) {
+  const exePath = findBinary(scDir, exeName);
+  if (!exePath) throw new Error('scrcpy executable not found after extraction');
+  if (process.platform !== 'win32') {
     fs.chmodSync(exePath, 0o755);
   }
   return exePath;

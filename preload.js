@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld('api', {
   // mirroring
   launchScrcpy: (serial) => ipcRenderer.invoke('scrcpy:launch', serial),
 
+  // device hardware keys (power / volume / navigation)
+  sendKey: (serial, keycode) => ipcRenderer.invoke('device:key', { serial, keycode }),
+
   // audio forwarding + media controls
   startAudio: (serial) => ipcRenderer.invoke('audio:start', serial),
   stopAudio: () => ipcRenderer.invoke('audio:stop'),

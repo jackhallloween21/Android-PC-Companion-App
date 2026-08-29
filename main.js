@@ -160,17 +160,112 @@ ipcMain.handle('device:info', async (_e, serial) => {
   return info;
 });
 
+// ---------------------------------------------------------------------------
+// Battery — parse the raw `dumpsys battery` map into human-readable values:
+// decode status/health enums, scale temperature (tenths °C) / voltage (mV) /
+// charge counter (µAh) into display units, and collapse the four "* POWERED"
+// booleans into a single power source.
+// ---------------------------------------------------------------------------
+
+const BATTERY_STATUS = { 1: 'Unknown', 2: 'Charging', 3: 'Discharging', 4: 'Not charging', 5: 'Full' };
+const BATTERY_HEALTH = {
+  1: 'Unknown',
+  2: 'Good',
+  3: 'Overheat',
+  4: 'Dead',
+  5: 'Over voltage',
+  6: 'Unspecified failure',
+  7: 'Cold',
+};
+
+function parseBattery(raw) {
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const statusCode = num(raw.status);
+  const healthCode = num(raw.health);
+  const level = num(raw.level);
+  const scale = num(raw.scale) || 100;
+  const tempRaw = num(raw.temperature);
+  let voltRaw = num(raw.voltage);
+  if (voltRaw == null && raw['voltage_now'] != null) {
+    const vn = num(raw['voltage_now']); // sysfs reports µV
+    if (vn != null) voltRaw = vn / 1000;
+  }
+  const counterRaw = num(raw['Charge counter'] ?? raw.charge_counter);
+  let currentRaw = num(raw['current now'] ?? raw.current_now); // µA, + = charging on most devices
+  if (currentRaw == null && raw['current_now'] != null) currentRaw = num(raw['current_now']);
+
+  const charging = statusCode === 2 || statusCode === 5;
+  const percentage = level != null ? Math.round((level / scale) * 100) : null;
+  const tempC = tempRaw != null ? tempRaw / 10 : null;
+  const tempF = tempC != null ? (tempC * 9) / 5 + 32 : null;
+  const voltV = voltRaw != null ? voltRaw / 1000 : null;
+  const counterMah = counterRaw != null ? counterRaw / 1000 : null;
+  const currentA = currentRaw != null ? currentRaw / 1e6 : null; // signed amps
+  const currentMa = currentRaw != null ? currentRaw / 1000 : null; // signed milliamps
+  const powerW = currentA != null && voltV != null ? Math.abs(currentA) * voltV : null;
+
+  let powerSource = 'Battery';
+  if (raw['AC powered'] === 'true') powerSource = 'AC adapter';
+  else if (raw['USB powered'] === 'true') powerSource = 'USB-C';
+  else if (raw['Wireless powered'] === 'true') powerSource = 'Wireless';
+  else if (raw['Dock powered'] === 'true') powerSource = 'Dock';
+
+  return {
+    percentage,
+    level,
+    scale,
+    statusCode,
+    statusLabel: BATTERY_STATUS[statusCode] || (statusCode != null ? `Code ${statusCode}` : 'Unknown'),
+    healthCode,
+    healthLabel: BATTERY_HEALTH[healthCode] || (healthCode != null ? `Code ${healthCode}` : 'Unknown'),
+    temperatureC: tempC,
+    temperatureF: tempF,
+    voltageV: voltV,
+    chargeCounterMah: counterMah,
+    currentNowMa: currentMa,
+    currentNowA: currentA,
+    powerWatts: powerW,
+    technology: raw.technology || null,
+    powerSource,
+    charging,
+  };
+}
+
 ipcMain.handle('device:battery', async (_e, serial) => {
   const out = await adb(['-s', serial, 'shell', 'dumpsys', 'battery']);
-  const info = {};
+  const raw = {};
   out.split('\n').forEach((line) => {
     const idx = line.indexOf(':');
     if (idx === -1) return;
     const key = line.slice(0, idx).trim();
     const value = line.slice(idx + 1).trim();
-    if (key) info[key] = value;
+    if (key) raw[key] = value;
   });
-  return info;
+
+  // dumpsys battery often omits a live current reading; fall back to sysfs.
+  // current_now is in µA (positive while charging on most kernels), voltage_now in µV.
+  if (raw['current now'] == null || raw['current now'] === '' || Number(raw['current now']) === 0) {
+    try {
+      const c = (await adb(['-s', serial, 'shell', 'cat', '/sys/class/power_supply/battery/current_now'])).trim();
+      if (Number.isFinite(Number(c))) raw['current now'] = c;
+    } catch {
+      /* not all devices expose this node */
+    }
+  }
+  if (raw['voltage_now'] == null || raw['voltage_now'] === '') {
+    try {
+      const v = (await adb(['-s', serial, 'shell', 'cat', '/sys/class/power_supply/battery/voltage_now'])).trim();
+      if (Number.isFinite(Number(v))) raw['voltage_now'] = v;
+    } catch {
+      /* not all devices expose this node */
+    }
+  }
+
+  return parseBattery(raw);
 });
 
 ipcMain.handle('device:rebootBootloader', (_e, serial) => adb(['-s', serial, 'reboot', 'bootloader']));
@@ -299,6 +394,18 @@ ipcMain.handle('media:key', (_e, { serial, action }) => {
   const code = MEDIA_KEYCODES[action];
   if (!code) throw new Error(`Unknown media action: ${action}`);
   return adb(['-s', serial, 'shell', 'input', 'keyevent', String(code)]);
+});
+
+// ---------------------------------------------------------------------------
+// Device hardware-key controls — sent to the device via `adb shell input
+// keyevent` so they work whether or not mirroring (scrcpy) is active. Android
+// keycodes: POWER=26, VOLUME_UP=24, VOLUME_DOWN=25, HOME=3, BACK=4,
+// APP_SWITCH (recents)=187.
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('device:key', (_e, { serial, keycode }) => {
+  if (!serial || !keycode) throw new Error('device:key requires serial and keycode');
+  return adb(['-s', serial, 'shell', 'input', 'keyevent', String(keycode)]);
 });
 
 ipcMain.handle('media:nowPlaying', async (_e, serial) => {
