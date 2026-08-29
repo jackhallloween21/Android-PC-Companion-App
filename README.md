@@ -6,8 +6,11 @@ file management, sideloading, app management, and bootloader unlock.
 ## Requirements
 
 - Node.js 18+
-- `adb` and `scrcpy` on your `PATH` (install via Android Platform Tools + scrcpy release)
-- `fastboot` on your `PATH` for the bootloader tab
+- A real desktop session (this won't run headless — see "Running in a
+  container/Codespace" below) and, for USB workflows, physical USB access to
+  the phone
+
+That's it — you do **not** need to install `adb`/`fastboot`/`scrcpy` yourself.
 
 ## Run it
 
@@ -15,6 +18,35 @@ file management, sideloading, app management, and bootloader unlock.
 npm install
 npm start
 ```
+
+## Auto-downloaded tools
+
+On first launch the app checks whether `adb`, `fastboot`, and `scrcpy` are
+already on your `PATH`. If not, it downloads:
+
+- **Android platform-tools** (adb + fastboot) straight from Google
+  (`dl.google.com/android/repo/...`)
+- **scrcpy** from its [latest GitHub release](https://github.com/Genymobile/scrcpy/releases)
+
+into this app's user-data folder (`app.getPath('userData')/bin`) and uses
+those copies from then on — no reinstalling on every launch. A setup screen
+shows progress for each download. See `src/downloader.js` for the logic and
+`initTools()` in `main.js` for how it's wired into startup.
+
+If the scrcpy download fails (e.g. GitHub's release asset naming changes),
+everything except the Mirror tab still works — install scrcpy yourself and
+put it on your `PATH` as a fallback.
+
+## Running in a container/Codespace
+
+This won't work in a headless devcontainer or Codespace out of the box: it
+needs a real display to render the window, and USB devices generally aren't
+passed through to a remote container, so `adb`/`fastboot` can't see a
+USB-connected phone. Wireless ADB (pairing over the network) can work if the
+container can reach your phone's IP, but you'd still need a virtual display
+(e.g. Xvfb) plus a way to view it (VNC/remote desktop) to see the mirrored
+screen and interact with the UI. Simplest path: run this on your local
+desktop machine.
 
 ## What's implemented
 

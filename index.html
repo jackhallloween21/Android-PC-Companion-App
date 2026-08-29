@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com;" />
+<title>Companion</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <div id="titlebar">
+    <div class="titlebar-drag">
+      <span class="logo-dot"></span>
+      <span class="app-name">companion</span>
+    </div>
+    <div class="titlebar-controls">
+      <button id="min-btn" title="Minimize" aria-label="Minimize">&#8211;</button>
+      <button id="max-btn" title="Maximize" aria-label="Maximize">&#9633;</button>
+      <button id="close-btn" title="Close" aria-label="Close">&times;</button>
+    </div>
+  </div>
+
+  <div id="setup-overlay" class="modal">
+    <div class="modal-card glass-card">
+      <h3>Setting up tools</h3>
+      <p id="setup-line" class="muted">Checking for adb…</p>
+      <div class="progress-track"><div id="setup-bar" class="progress-fill"></div></div>
+      <p id="setup-error" class="muted danger-text hidden"></p>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <aside id="device-dock">
+      <div class="dock-header">
+        <h2>Devices</h2>
+        <button id="refresh-btn" class="icon-btn" title="Refresh">&#8635;</button>
+      </div>
+      <div id="device-list" class="device-list"></div>
+      <button id="pair-btn" class="ghost-btn">+ Pair wireless</button>
+    </aside>
+
+    <main id="panel">
+      <nav id="tabs">
+        <button class="tab active" data-tab="mirror">Mirror</button>
+        <button class="tab" data-tab="battery">Battery</button>
+        <button class="tab" data-tab="files">Files</button>
+        <button class="tab" data-tab="apps">Apps</button>
+        <button class="tab" data-tab="bootloader">Bootloader</button>
+      </nav>
+
+      <section id="empty-state" class="glass-card center-card">
+        <p class="empty-title">No device selected</p>
+        <span class="muted">Connect over USB, or pair a device wirelessly from the dock on the left.</span>
+      </section>
+
+      <section id="tab-mirror" class="tab-content glass-card hidden">
+        <h3>Screen mirror</h3>
+        <p class="muted">Launches scrcpy in its own window. In-app embedding of the video stream is a later upgrade — see the README.</p>
+        <button id="launch-scrcpy" class="primary-btn">Start mirroring</button>
+      </section>
+
+      <section id="tab-battery" class="tab-content glass-card hidden">
+        <h3>Battery</h3>
+        <div id="battery-grid" class="data-grid mono"></div>
+      </section>
+
+      <section id="tab-files" class="tab-content glass-card hidden">
+        <h3>Files</h3>
+        <div class="path-bar">
+          <input id="remote-path" class="mono" value="/sdcard/" spellcheck="false" />
+          <button id="list-files-btn">Go</button>
+          <button id="push-file-btn" class="ghost-btn">Upload here</button>
+        </div>
+        <div id="file-list" class="mono file-list"></div>
+      </section>
+
+      <section id="tab-apps" class="tab-content glass-card hidden">
+        <h3>Apps</h3>
+        <div class="apps-toolbar">
+          <button id="install-apk-btn" class="primary-btn">Sideload APK</button>
+        </div>
+        <div id="app-list" class="mono app-list"></div>
+      </section>
+
+      <section id="tab-bootloader" class="tab-content glass-card hidden">
+        <h3>Bootloader</h3>
+        <p class="muted danger-text">Unlocking wipes all data on the device and may trip a tamper flag or void warranty. The generic command below only works on OEMs that support standard fastboot unlock — some (Xiaomi, OnePlus, Samsung, etc.) require their own account-bound unlock tool instead.</p>
+        <div class="bootloader-actions">
+          <button id="reboot-bootloader-btn" class="ghost-btn">Reboot to bootloader</button>
+          <button id="unlock-btn" class="danger-btn">fastboot flashing unlock</button>
+        </div>
+        <pre id="bootloader-output" class="mono output-block"></pre>
+      </section>
+    </main>
+  </div>
+
+  <div id="pair-modal" class="modal hidden">
+    <div class="modal-card glass-card">
+      <h3>Pair wireless device</h3>
+      <p class="muted">On the phone: Developer options &rarr; Wireless debugging &rarr; Pair device with pairing code.</p>
+      <label class="field-label">Host &amp; port</label>
+      <input id="pair-host" placeholder="192.168.1.23:41235" class="mono" spellcheck="false" />
+      <label class="field-label">Pairing code</label>
+      <input id="pair-code" placeholder="123456" class="mono" spellcheck="false" />
+      <div class="modal-actions">
+        <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
+        <button id="pair-submit-btn" class="primary-btn">Pair</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

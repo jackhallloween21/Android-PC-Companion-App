@@ -33,6 +33,9 @@ contextBridge.exposeInMainWorld('api', {
   fastbootDevices: () => ipcRenderer.invoke('fastboot:devices'),
   fastbootUnlock: (serial) => ipcRenderer.invoke('fastboot:unlock', serial),
 
+  // first-run setup progress (adb/fastboot/scrcpy download)
+  onSetupProgress: (callback) => ipcRenderer.on('setup:progress', (_e, payload) => callback(payload)),
+
   // window chrome
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:maximize'),

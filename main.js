@@ -1,6 +1,11 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const { spawn, execFile } = require('child_process');
+const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
+
+// Resolved binary paths — start as bare names (PATH lookup) and get replaced
+// with absolute paths to downloaded copies in initTools() if not found.
+const tools = { adb: 'adb', fastboot: 'fastboot', scrcpy: 'scrcpy' };
 
 // ---------------------------------------------------------------------------
 // Window
@@ -33,8 +38,56 @@ function createWindow() {
   return win;
 }
 
+// ---------------------------------------------------------------------------
+// First-run tool resolution: use adb/fastboot/scrcpy on PATH if present,
+// otherwise download Android platform-tools + the latest scrcpy release into
+// this app's userData folder. Progress is streamed to the renderer so it can
+// show a setup screen instead of a blank/broken UI on first launch.
+// ---------------------------------------------------------------------------
+
+async function checkOnPath(bin) {
+  return new Promise((resolve) => {
+    execFile(bin, ['version'], (err) => resolve(!err));
+  });
+}
+
+async function initTools(win) {
+  const send = (payload) => win.webContents.send('setup:progress', payload);
+
+  send({ step: 'adb', status: 'checking' });
+  if (!(await checkOnPath('adb'))) {
+    try {
+      send({ step: 'adb', status: 'downloading', progress: 0 });
+      const { adbPath, fastbootPath } = await ensurePlatformTools((p) => send({ step: 'adb', status: 'downloading', progress: p }));
+      tools.adb = adbPath;
+      tools.fastboot = fastbootPath;
+    } catch (err) {
+      send({ step: 'adb', status: 'error', message: err.message });
+      return; // no point continuing setup without adb
+    }
+  }
+  send({ step: 'adb', status: 'done' });
+
+  send({ step: 'scrcpy', status: 'checking' });
+  if (!(await checkOnPath('scrcpy'))) {
+    try {
+      send({ step: 'scrcpy', status: 'downloading', progress: 0 });
+      tools.scrcpy = await ensureScrcpy((p) => send({ step: 'scrcpy', status: 'downloading', progress: p }));
+    } catch (err) {
+      // Mirroring just won't work until the user installs scrcpy themselves —
+      // everything else (files, apps, battery, bootloader) is unaffected.
+      send({ step: 'scrcpy', status: 'error', message: err.message });
+      send({ step: 'all', status: 'ready' });
+      return;
+    }
+  }
+  send({ step: 'scrcpy', status: 'done' });
+  send({ step: 'all', status: 'ready' });
+}
+
 app.whenReady().then(() => {
-  createWindow();
+  const win = createWindow();
+  win.webContents.once('did-finish-load', () => initTools(win));
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -63,8 +116,8 @@ function run(bin, args, opts = {}) {
   });
 }
 
-const adb = (args) => run('adb', args);
-const fastboot = (args) => run('fastboot', args);
+const adb = (args) => run(tools.adb, args);
+const fastboot = (args) => run(tools.fastboot, args);
 
 // ---------------------------------------------------------------------------
 // Devices
@@ -183,7 +236,7 @@ ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell
 // ---------------------------------------------------------------------------
 
 ipcMain.handle('scrcpy:launch', (_e, serial) => {
-  const child = spawn('scrcpy', ['-s', serial, '--window-title', `Mirror — ${serial}`], {
+  const child = spawn(tools.scrcpy, ['-s', serial, '--window-title', `Mirror — ${serial}`], {
     detached: true,
     stdio: 'ignore',
   });
