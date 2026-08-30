@@ -23,7 +23,13 @@ const {
   isConnected,
   pickConnectTarget,
   connectCandidates,
+  parsePairingQR,
 } = require('./src/wireless');
+// QR decoding lives here, not in preload.js: the preload runs sandboxed, where
+// `require` is a polyfill that only resolves `electron` and a couple of node
+// builtins. Requiring a third-party module (or a relative file) there throws,
+// the whole preload is discarded, and the renderer is left with no window.api.
+const jsQR = require('jsqr');
 const {
   DEFAULTS: DOCK_DEFAULTS,
   ZOOM_MIN,
@@ -110,6 +116,11 @@ function createWindow() {
   });
 
   win.once('ready-to-show', () => win.show());
+  // A broken preload is otherwise completely silent: the window loads, the
+  // renderer has no window.api, and the setup overlay never moves.
+  win.webContents.on('preload-error', (_e, preloadPath, error) => {
+    console.error(`[preload] failed to load ${preloadPath}: ${error && error.message}`);
+  });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -667,6 +678,20 @@ ipcMain.handle('wireless:enableTcpip', async (_e, { serial, port }) => {
   if (/error|failed/i.test(out)) throw new Error(out);
   return out;
 });
+
+// QR pairing. The renderer hands over raw RGBA pixels from its canvas; decoding
+// happens here because jsqr cannot be required from a sandboxed preload.
+ipcMain.handle('qr:decode', async (_e, { data, width, height }) => {
+  try {
+    const pixels = new Uint8ClampedArray(data instanceof ArrayBuffer ? data : data.buffer || data);
+    const result = jsQR(pixels, width, height);
+    return result ? result.data : null;
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle('qr:parsePairing', async (_e, text) => parsePairingQR(text));
 
 // ---------------------------------------------------------------------------
 // Files

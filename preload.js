@@ -1,6 +1,10 @@
+// This preload runs sandboxed (webPreferences.sandbox = true), where `require`
+// is a polyfill that resolves only `electron` and a handful of node builtins.
+// Requiring anything else — a node_module like jsqr, or a relative file like
+// ./src/wireless — throws, Electron discards the entire preload, and the
+// renderer boots with no window.api at all (which looked like the app hanging
+// forever on "Setting up tools"). Keep this file to `electron` only.
 const { contextBridge, ipcRenderer } = require('electron');
-const jsQR = require('jsqr');
-const { parsePairingQR } = require('./src/wireless');
 
 contextBridge.exposeInMainWorld('api', {
   // devices / dashboard
@@ -101,10 +105,8 @@ contextBridge.exposeInMainWorld('api', {
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
 
-  // QR scan for wireless pairing
-  decodeQR: (data, width, height) => {
-    const result = jsQR(new Uint8ClampedArray(data), width, height);
-    return result ? result.data : null;
-  },
-  parsePairingQR: (text) => parsePairingQR(text),
+  // QR scan for wireless pairing. Both are async now: the decoding happens in
+  // the main process (see the sandbox note at the top of this file).
+  decodeQR: (data, width, height) => ipcRenderer.invoke('qr:decode', { data, width, height }),
+  parsePairingQR: (text) => ipcRenderer.invoke('qr:parsePairing', text),
 });

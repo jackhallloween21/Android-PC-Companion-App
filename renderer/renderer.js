@@ -23,6 +23,20 @@ function enterShell() {
 
 el('setup-continue').onclick = enterShell;
 
+// If the preload script failed to load there is no window.api, every call below
+// would throw, and the setup overlay would sit on "Checking for adb…" forever
+// with no explanation. Say so instead of hanging.
+if (!window.api) {
+  const errorEl = el('setup-error');
+  errorEl.textContent =
+    'The app could not load its preload bridge, so it cannot talk to adb. ' +
+    'Check the terminal running "npm start" for an "Unable to load preload script" error.';
+  errorEl.classList.remove('hidden');
+  el('setup-line').textContent = 'Startup failed.';
+  el('setup-bar').style.width = '0%';
+  throw new Error('preload bridge missing: window.api is undefined');
+}
+
 window.api.onSetupProgress(({ step, status, progress, message }) => {
   const line = el('setup-line');
   const bar = el('setup-bar');
@@ -1173,6 +1187,10 @@ async function startQrScan() {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   let scanning = true;
 
+  // Decoding is an async IPC round-trip now, so a frame can come back after the
+  // modal was closed. `stopQrScan` nulls qrRaf; treat that as the stop signal.
+  const stopped = () => !scanning || qrRaf === null;
+
   async function tick() {
     if (!scanning) return;
 
@@ -1183,11 +1201,13 @@ async function startQrScan() {
 
       try {
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const qrText = window.api.decodeQR(new Uint8ClampedArray(imageData.data).buffer, imageData.width, imageData.height);
+        const qrText = await window.api.decodeQR(new Uint8ClampedArray(imageData.data).buffer, imageData.width, imageData.height);
+        if (stopped()) return;
 
         if (qrText) {
           status.textContent = 'QR code detected.';
-          const parsed = window.api.parsePairingQR(qrText);
+          const parsed = await window.api.parsePairingQR(qrText);
+          if (stopped()) return;
           if (parsed) {
             el('pair-host').value = `${parsed.host}:${parsed.port}`;
             el('pair-code').value = parsed.code;
