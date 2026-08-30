@@ -25,13 +25,15 @@ On first launch the app checks whether `adb`, `fastboot`, and `scrcpy` are
 already on your `PATH`. If not, it downloads:
 
 - **Android platform-tools** (adb + fastboot) straight from Google
-  (`dl.google.com/android/repo/...`)
+  (`dl.google.com/android/repository/...`)
 - **scrcpy** from its [latest GitHub release](https://github.com/Genymobile/scrcpy/releases)
 
 into this app's user-data folder (`app.getPath('userData')/bin`) and uses
 those copies from then on — no reinstalling on every launch. A setup screen
 shows progress for each download. See `src/downloader.js` for the logic and
-`initTools()` in `main.js` for how it's wired into startup.
+`initTools()` in `main.js` for how it's wired into startup. Check the
+**Binaries & Drivers** panel in the sidebar any time to see resolved paths
+and detected versions, or force a re-check.
 
 If the scrcpy download fails (e.g. GitHub's release asset naming changes),
 everything except the Mirror tab still works — install scrcpy yourself and
@@ -48,32 +50,61 @@ container can reach your phone's IP, but you'd still need a virtual display
 screen and interact with the UI. Simplest path: run this on your local
 desktop machine.
 
-## What's implemented
+## Layout
 
-- **Device dock** — polls `adb devices -l` every few seconds, lets you pick the active device.
-- **Wireless pairing** — Android 11+ pairing-code flow (`adb pair`) via a modal, plus
-  `adb connect` / `adb tcpip` for the classic USB-then-wireless handoff.
-- **Mirror tab** — spawns `scrcpy` as its own window. See "Upgrading mirroring" below.
-- **Webcam tab** — opens a preview window of the phone's camera via scrcpy's
-  `--video-source=camera`. This is only the video-capture half of "use my phone as a
-  webcam" — see "Camera as a virtual webcam" below for the missing piece.
-- **Audio tab** — forwards device audio to PC speakers via scrcpy
-  (`--no-video --audio-source=output`), plus play/pause/next/previous using standard
-  Android media keycodes over `adb shell input keyevent`, and a best-effort "now
-  playing" scrape from `dumpsys media_session`.
-- **Battery tab** — parses `adb shell dumpsys battery` into a data grid.
-- **Files tab** — browse a path with `ls -la`, pull/push/delete over adb.
-- **Apps tab** — list third-party packages, sideload an APK, disable/enable/uninstall.
-- **Backup tab** — pulls shared-storage folders (DCIM, Pictures, Downloads, Music,
-  Documents) and, optionally, installed APKs to a folder you choose. This is **not** a
-  full system/app-data backup — Android doesn't allow reading another app's private
-  data without root, and `adb backup` itself is unreliable on modern Android since most
-  apps opt out via `allowBackup=false`. It only reaches what userspace adb can see.
-- **Bootloader tab** — reboot to bootloader, and a generic `fastboot flashing unlock`
-  with a confirmation prompt. This only works on OEMs that support the standard
-  fastboot unlock flow (Pixel-style AOSP devices). Xiaomi, OnePlus, and others require
-  their own account-bound unlock tool and a mandatory wait period — there's no way to
-  script around that, only surface instructions for it.
+A sidebar (not tabs) drives navigation now:
+
+- **Dashboard** — device summary, battery ring, CPU load/memory, storage
+  breakdown by folder, and quick launchers into the other sections.
+- **File Explorer** — category shortcuts (Photos/Documents/Videos/Music),
+  a file list, and a File Inspector panel with an image preview (for common
+  image extensions), pull, and delete.
+- **App Management** — filter chips (All/User/System/Disabled), search,
+  sideload, and an App Diagnostics panel showing APK size, declared
+  permissions (scraped from `dumpsys package`), clear-data, disable/enable,
+  and uninstall.
+- **Screen Mirror** — resolution/bitrate/FPS controls that map to real scrcpy
+  flags, plus a transport bar (volume, long-press power, rotate, screenshot,
+  record) that works over adb independently of whether the mirror window is
+  open.
+- **Power Tools (ADB)** — a console: quick-command buttons plus a free-text
+  input that runs anything starting with `adb` or `fastboot`. See "Console
+  command parsing" below for its limits.
+- **Multimedia Hub** — camera preview (webcam video half) and audio
+  forwarding + media transport controls, combined under one section with an
+  internal toggle.
+- **Hardware & Power** — a fuller battery + device-spec readout than the
+  dashboard's summary cards.
+- **Bootloader & Backup** — unlock/reboot-to-bootloader, a fastboot
+  partition flasher (pick a partition + a local `.img`, confirm, flash), and
+  the shared-storage backup flow.
+- **Binaries & Drivers** (sidebar utility) — shows resolved adb/fastboot/scrcpy
+  paths, detected versions, and a re-verify button.
+
+## What's real vs. approximated
+
+Everything above calls real `adb`/`fastboot`/`scrcpy` commands — nothing is
+mocked — but a few things are best-effort approximations rather than a
+polished OS-level API, and are worth knowing about before you rely on them:
+
+- **Storage breakdown** is per-folder `du -sh` on DCIM/Pictures/Movies/Music/
+  Download/Documents, not a true Apps/Photos/System partition breakdown —
+  Android doesn't expose that cleanly without root.
+- **CPU/memory** uses `/proc/loadavg`, `/proc/meminfo`, and a process count
+  from `ps -A` — a real but coarse picture, not per-core frequency graphs.
+- **Battery cycle count** comes from
+  `/sys/class/power_supply/battery/cycle_count`, which isn't present on every
+  device/kernel; the UI shows "N/A" when it's missing rather than a fake number.
+- **Screen recording stop** sends `SIGINT` to the local `adb shell
+  screenrecord` process, which is how `screenrecord` normally gets told to
+  finalize the file — reliable in practice, but if the process is killed
+  harder than that the resulting file can be corrupt.
+- **Console command parsing** naively splits on whitespace, so arguments
+  needing quotes (paths with spaces, etc.) won't parse correctly. Fine for
+  the common one-liners it's meant for; not a full shell.
+- **Fastboot partition flashing** is a real `fastboot flash <partition>
+  <img>` — it will happily brick a device if given the wrong image for the
+  wrong partition. The confirmation dialog is there for a reason.
 
 ## Camera as a virtual webcam — what's missing
 

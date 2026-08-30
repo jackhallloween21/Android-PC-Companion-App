@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com;" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:;" />
 <title>Companion</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -16,10 +16,14 @@
       <span class="logo-dot"></span>
       <span class="app-name">companion</span>
     </div>
+    <div class="titlebar-status">
+      <span id="status-device" class="mono">No device</span>
+      <span id="status-dot" class="status-dot"></span>
+    </div>
     <div class="titlebar-controls">
-      <button id="min-btn" title="Minimize" aria-label="Minimize">&#8211;</button>
-      <button id="max-btn" title="Maximize" aria-label="Maximize">&#9633;</button>
-      <button id="close-btn" title="Close" aria-label="Close">&times;</button>
+      <button id="min-btn" title="Minimize">&#8211;</button>
+      <button id="max-btn" title="Maximize">&#9633;</button>
+      <button id="close-btn" title="Close">&times;</button>
     </div>
   </div>
 
@@ -32,131 +36,348 @@
     </div>
   </div>
 
-  <div id="app" class="hidden">
-    <aside id="device-dock">
-      <div class="dock-header">
-        <h2>Devices</h2>
-        <button id="refresh-btn" class="icon-btn" title="Refresh">&#8635;</button>
+  <div id="shell" class="hidden">
+    <aside id="sidebar">
+      <div class="sidebar-group">
+        <div class="sidebar-label">Core Workstation</div>
+        <button class="nav-item active" data-view="dashboard">Dashboard</button>
+        <button class="nav-item" data-view="files">File Explorer</button>
+        <button class="nav-item" data-view="apps">App Management</button>
+        <button class="nav-item" data-view="mirror">Screen Mirror</button>
+        <button class="nav-item" data-view="console">Power Tools (ADB)</button>
+        <button class="nav-item" data-view="multimedia">Multimedia Hub</button>
+        <button class="nav-item" data-view="hardware">Hardware &amp; Power</button>
+        <button class="nav-item" data-view="bootloader">Bootloader &amp; Backup</button>
+      </div>
+      <div class="sidebar-group">
+        <div class="sidebar-label">Utilities</div>
+        <button class="nav-item" id="tools-nav-btn">Binaries &amp; Drivers</button>
+      </div>
+      <div class="sidebar-footer">
+        <button id="device-picker-btn" class="ghost-btn">Devices &amp; pairing</button>
+      </div>
+    </aside>
+
+    <main id="content">
+
+      <section id="view-dashboard" class="view">
+        <section id="empty-state" class="glass-card center-card">
+          <p class="empty-title">No device selected</p>
+          <span class="muted">Open "Devices &amp; pairing" to connect over USB or wirelessly.</span>
+        </section>
+
+        <div id="dashboard-grid" class="hidden">
+          <div class="card">
+            <div class="card-head">
+              <h3 id="dash-model">Device</h3>
+              <span id="dash-online" class="badge badge-online">Online</span>
+            </div>
+            <div class="chip-row">
+              <span class="chip mono" id="dash-serial"></span>
+              <span class="chip mono" id="dash-android"></span>
+              <span class="chip mono" id="dash-ip"></span>
+            </div>
+            <div class="data-grid mono compact" id="dash-info-grid"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Battery station</h3><span id="dash-batt-status" class="badge"></span></div>
+            <div class="battery-row">
+              <div class="battery-ring-wrap">
+                <div id="battery-ring" class="battery-ring"><span id="battery-pct">—</span></div>
+              </div>
+              <div class="data-grid mono compact">
+                <div class="data-cell"><span class="k">Health</span><span class="v" id="dash-health">—</span></div>
+                <div class="data-cell"><span class="k">Cycles</span><span class="v" id="dash-cycles">—</span></div>
+                <div class="data-cell"><span class="k">Temp</span><span class="v" id="dash-temp">—</span></div>
+                <div class="data-cell"><span class="k">Voltage</span><span class="v" id="dash-voltage">—</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>CPU &amp; memory</h3><span id="dash-procs" class="muted mono"></span></div>
+            <div class="bar-row"><span class="bar-label">Load average</span><span class="mono" id="dash-load">—</span></div>
+            <div class="bar-row"><span class="bar-label">Memory</span><span class="mono" id="dash-mem">—</span></div>
+            <div class="progress-track"><div id="mem-bar" class="progress-fill"></div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Storage</h3><span class="mono muted" id="dash-storage-total"></span></div>
+            <div class="progress-track"><div id="storage-bar" class="progress-fill signal"></div></div>
+            <div class="data-grid mono compact" id="storage-breakdown-grid"></div>
+          </div>
+
+          <div class="card span-2">
+            <div class="card-head"><h3>Quick launchers</h3></div>
+            <div class="launcher-grid">
+              <button class="launcher" data-view="mirror"><span>Screen mirror</span><span class="muted">Start a live session</span></button>
+              <button class="launcher" data-view="apps"><span>App debloat</span><span class="muted">Sideload / disable</span></button>
+              <button class="launcher" data-view="multimedia"><span>Webcam bridge</span><span class="muted">Camera + mic</span></button>
+              <button class="launcher" data-view="console"><span>ADB shell</span><span class="muted">Raw commands</span></button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-files" class="view hidden">
+        <div class="view-header"><h2>File Explorer</h2></div>
+        <div class="chip-tabs" id="file-category-tabs">
+          <button class="chip-tab active" data-path="/sdcard/">All files</button>
+          <button class="chip-tab" data-path="/sdcard/Pictures">Photos</button>
+          <button class="chip-tab" data-path="/sdcard/Documents">Documents</button>
+          <button class="chip-tab" data-path="/sdcard/Movies">Videos</button>
+          <button class="chip-tab" data-path="/sdcard/Music">Music</button>
+        </div>
+        <div class="split-panel">
+          <div class="glass-card">
+            <div class="path-bar">
+              <input id="remote-path" class="mono" value="/sdcard/" spellcheck="false" />
+              <button id="list-files-btn">Go</button>
+              <button id="push-file-btn" class="ghost-btn">Upload here</button>
+            </div>
+            <div id="file-list" class="mono file-list"></div>
+          </div>
+          <div class="glass-card inspector">
+            <h3>File inspector</h3>
+            <div id="file-inspector-empty" class="muted">Select a file to see its details.</div>
+            <div id="file-inspector-body" class="hidden">
+              <img id="file-preview-img" class="file-preview hidden" />
+              <div class="data-cell"><span class="k">Name</span><span class="v mono" id="fi-name"></span></div>
+              <div class="data-cell"><span class="k">Path</span><span class="v mono" id="fi-path"></span></div>
+              <button id="fi-pull-btn" class="primary-btn">Copy to PC (Pull)</button>
+              <button id="fi-delete-btn" class="danger-btn">Delete from device</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-apps" class="view hidden">
+        <div class="view-header"><h2>App Management</h2></div>
+        <div class="chip-tabs" id="app-category-tabs">
+          <button class="chip-tab active" data-filter="all">All</button>
+          <button class="chip-tab" data-filter="user">User</button>
+          <button class="chip-tab" data-filter="system">System</button>
+          <button class="chip-tab" data-filter="disabled">Disabled</button>
+        </div>
+        <div class="apps-toolbar">
+          <input id="app-search" class="mono" placeholder="Search package name…" spellcheck="false" />
+          <button id="install-apk-btn" class="primary-btn">Sideload APK</button>
+        </div>
+        <div class="split-panel">
+          <div class="glass-card">
+            <div id="app-list" class="mono app-list"></div>
+          </div>
+          <div class="glass-card inspector">
+            <h3>App diagnostics</h3>
+            <div id="app-inspector-empty" class="muted">Select an app to see details.</div>
+            <div id="app-inspector-body" class="hidden">
+              <div class="data-cell"><span class="k">Package</span><span class="v mono" id="ai-pkg"></span></div>
+              <div class="data-cell"><span class="k">APK size</span><span class="v mono" id="ai-size"></span></div>
+              <div id="ai-permissions" class="permission-list mono"></div>
+              <button id="ai-clear-btn" class="ghost-btn">Clear app cache &amp; data</button>
+              <button id="ai-disable-btn" class="ghost-btn">Disable</button>
+              <button id="ai-enable-btn" class="ghost-btn">Enable</button>
+              <button id="ai-uninstall-btn" class="danger-btn">Uninstall via ADB</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-mirror" class="view hidden">
+        <div class="view-header"><h2>Screen Mirror</h2></div>
+        <div class="split-panel">
+          <div class="glass-card">
+            <h3>Preview window</h3>
+            <p class="muted">Launches scrcpy in its own window with the parameters set here. Use the transport bar below to control the device without touching it directly.</p>
+            <button id="launch-scrcpy" class="primary-btn">Start mirroring</button>
+
+            <div class="control-bar">
+              <button id="ctrl-power" class="ghost-btn danger-hover">Power (Hold)</button>
+              <button id="ctrl-vol-down" class="ghost-btn">Vol –</button>
+              <button id="ctrl-vol-up" class="ghost-btn">Vol +</button>
+              <button id="ctrl-rotate" class="ghost-btn">Rotate</button>
+              <button id="ctrl-screenshot" class="primary-btn">Screenshot</button>
+            </div>
+            <div class="control-bar">
+              <button id="ctrl-record" class="danger-btn">Record</button>
+              <span id="record-status" class="muted mono"></span>
+            </div>
+          </div>
+
+          <div class="glass-card">
+            <h3>Stream parameters</h3>
+            <div class="field-label">Max resolution limit</div>
+            <div class="chip-tabs" id="res-options">
+              <button class="chip-tab active" data-value="1920">1080p</button>
+              <button class="chip-tab" data-value="1280">720p</button>
+              <button class="chip-tab" data-value="854">480p</button>
+              <button class="chip-tab" data-value="">Original</button>
+            </div>
+            <div class="field-label">Video bitrate: <span id="bitrate-value" class="mono">8</span> Mbps</div>
+            <input id="bitrate-slider" type="range" min="2" max="24" value="8" />
+            <div class="field-label">Max target framerate</div>
+            <div class="chip-tabs" id="fps-options">
+              <button class="chip-tab active" data-value="60">60 FPS</button>
+              <button class="chip-tab" data-value="30">30 FPS</button>
+            </div>
+            <label class="checkbox-row"><input type="checkbox" id="opt-stay-awake" checked /> Keep device display awake</label>
+            <label class="checkbox-row"><input type="checkbox" id="opt-screen-off" /> Turn physical screen off (save battery)</label>
+            <label class="checkbox-row"><input type="checkbox" id="opt-show-touches" /> Show physical touch dots</label>
+            <label class="checkbox-row"><input type="checkbox" id="opt-audio" checked /> Forward phone audio to PC</label>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-console" class="view hidden">
+        <div class="view-header"><h2>Power Tools — ADB / Fastboot console</h2></div>
+        <div class="glass-card">
+          <div class="quick-cmd-row" id="quick-cmds">
+            <button class="quick-cmd" data-cmd="adb devices">adb devices</button>
+            <button class="quick-cmd" data-cmd="adb shell getprop">adb shell getprop</button>
+            <button class="quick-cmd" data-cmd="adb shell dumpsys battery">adb shell dumpsys battery</button>
+            <button class="quick-cmd" data-cmd="adb shell pm list packages -3">adb shell pm list packages -3</button>
+            <button class="quick-cmd" data-cmd="adb shell df -h">adb shell df -h</button>
+            <button class="quick-cmd" data-cmd="adb reboot bootloader">adb reboot bootloader</button>
+            <button class="quick-cmd" data-cmd="fastboot devices">fastboot devices</button>
+          </div>
+          <div id="console-log" class="mono console-log"></div>
+          <div class="path-bar">
+            <span class="prompt mono">$</span>
+            <input id="console-input" class="mono" placeholder="adb shell dumpsys battery" spellcheck="false" />
+            <button id="console-run-btn" class="primary-btn" style="margin-top:0;">Execute</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-multimedia" class="view hidden">
+        <div class="view-header"><h2>Multimedia Hub</h2></div>
+        <div class="chip-tabs">
+          <button class="chip-tab active" data-mm="webcam">Phone as PC webcam</button>
+          <button class="chip-tab" data-mm="audio">Audio &amp; music routing</button>
+        </div>
+
+        <div id="mm-webcam" class="glass-card">
+          <h3>Camera preview</h3>
+          <p class="muted">Streams the phone's camera to a preview window via scrcpy's camera source. Making this feed selectable as a real webcam in Zoom/OBS/browsers needs a signed virtual-camera driver per OS — not built yet. See README.</p>
+          <div class="path-bar">
+            <select id="camera-facing" class="mono">
+              <option value="back">Rear camera</option>
+              <option value="front">Front camera</option>
+            </select>
+            <button id="launch-camera-btn" class="primary-btn" style="margin-top:0;">Start camera stream</button>
+          </div>
+        </div>
+
+        <div id="mm-audio" class="glass-card hidden">
+          <h3>Audio &amp; media controls</h3>
+          <p class="muted">Forwards device audio to PC speakers via scrcpy, and sends media-key commands to the active playback session.</p>
+          <div class="control-bar">
+            <button id="audio-start-btn" class="primary-btn" style="margin-top:0;">Start audio forwarding</button>
+            <button id="audio-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
+            <span id="audio-status" class="muted">Not forwarding.</span>
+          </div>
+          <div class="transport-controls">
+            <button id="media-prev-btn" class="ghost-btn" style="margin-top:0;">&#9198; Prev</button>
+            <button id="media-playpause-btn" class="primary-btn" style="margin-top:0;">&#9199; Play / Pause</button>
+            <button id="media-next-btn" class="ghost-btn" style="margin-top:0;">&#9197; Next</button>
+          </div>
+          <p id="now-playing" class="muted mono" style="margin-top: 12px;"></p>
+        </div>
+      </section>
+
+      <section id="view-hardware" class="view hidden">
+        <div class="view-header"><h2>Hardware &amp; Power</h2></div>
+        <div class="dashboard-grid-static">
+          <div class="card">
+            <div class="card-head"><h3>Battery</h3><span id="hw-batt-status" class="badge"></span></div>
+            <div class="data-grid mono">
+              <div class="data-cell"><span class="k">Level</span><span class="v" id="hw-level">—</span></div>
+              <div class="data-cell"><span class="k">Health</span><span class="v" id="hw-health">—</span></div>
+              <div class="data-cell"><span class="k">Cycle count</span><span class="v" id="hw-cycles">—</span></div>
+              <div class="data-cell"><span class="k">Voltage</span><span class="v" id="hw-voltage">—</span></div>
+              <div class="data-cell"><span class="k">Temperature</span><span class="v" id="hw-temp">—</span></div>
+              <div class="data-cell"><span class="k">Technology</span><span class="v" id="hw-tech">—</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Device specs</h3></div>
+            <div class="data-grid mono">
+              <div class="data-cell"><span class="k">Chipset / hardware</span><span class="v" id="hw-chipset">—</span></div>
+              <div class="data-cell"><span class="k">Display</span><span class="v" id="hw-display">—</span></div>
+              <div class="data-cell"><span class="k">RAM</span><span class="v" id="hw-ram">—</span></div>
+              <div class="data-cell"><span class="k">Storage</span><span class="v" id="hw-storage">—</span></div>
+              <div class="data-cell"><span class="k">Android</span><span class="v" id="hw-android">—</span></div>
+              <div class="data-cell"><span class="k">Security patch</span><span class="v" id="hw-secpatch">—</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-bootloader" class="view hidden">
+        <div class="view-header"><h2>Bootloader &amp; Backup</h2></div>
+        <div class="chip-tabs">
+          <button class="chip-tab active" data-bl="unlock">Bootloader &amp; fastboot flash</button>
+          <button class="chip-tab" data-bl="backup">System backup &amp; restore</button>
+        </div>
+
+        <div id="bl-unlock" class="split-panel">
+          <div class="glass-card">
+            <h3>Bootloader unlock suite</h3>
+            <p class="muted danger-text">Unlocking wipes all data on the device and may trip a tamper flag or void warranty. The generic command below only works on OEMs that support standard fastboot unlock — some (Xiaomi, OnePlus, Samsung, etc.) require their own account-bound unlock tool instead.</p>
+            <button id="reboot-bootloader-btn" class="ghost-btn">Reboot into bootloader (fastboot mode)</button>
+            <button id="unlock-btn" class="danger-btn">Execute bootloader unlock command</button>
+          </div>
+          <div class="glass-card">
+            <h3>Fastboot partition flasher</h3>
+            <div class="field-label">Target partition</div>
+            <select id="flash-partition" class="mono">
+              <option value="boot">boot (kernel &amp; ramdisk)</option>
+              <option value="recovery">recovery</option>
+              <option value="vendor_boot">vendor_boot</option>
+              <option value="dtbo">dtbo</option>
+              <option value="vbmeta">vbmeta</option>
+            </select>
+            <div class="field-label">Image file</div>
+            <button id="choose-flash-img-btn" class="ghost-btn">Choose .img from PC</button>
+            <div id="flash-img-path" class="muted mono"></div>
+            <button id="flash-btn" class="primary-btn">Flash to partition</button>
+            <pre id="bootloader-output" class="mono output-block"></pre>
+          </div>
+        </div>
+
+        <div id="bl-backup" class="glass-card hidden">
+          <h3>Backup</h3>
+          <p class="muted">Pulls shared storage folders and, optionally, installed APKs to a folder on this PC. Not a full system/app-data backup — Android doesn't allow that without root.</p>
+          <div class="checkbox-list">
+            <label class="checkbox-row"><input type="checkbox" value="dcim" checked /> Camera photos &amp; videos (DCIM)</label>
+            <label class="checkbox-row"><input type="checkbox" value="pictures" checked /> Pictures</label>
+            <label class="checkbox-row"><input type="checkbox" value="downloads" /> Downloads</label>
+            <label class="checkbox-row"><input type="checkbox" value="music" /> Music</label>
+            <label class="checkbox-row"><input type="checkbox" value="documents" /> Documents</label>
+            <label class="checkbox-row"><input type="checkbox" id="backup-apks" /> Installed app APKs (not app data)</label>
+          </div>
+          <div class="path-bar">
+            <input id="backup-dest" class="mono" placeholder="Choose a destination folder…" readonly />
+            <button id="choose-dest-btn" class="ghost-btn">Browse</button>
+          </div>
+          <button id="run-backup-btn" class="primary-btn">Start backup</button>
+          <pre id="backup-output" class="mono output-block"></pre>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <div id="device-modal" class="modal hidden">
+    <div class="modal-card glass-card wide">
+      <div class="modal-head">
+        <h3>Devices</h3>
+        <button id="device-modal-close" class="icon-btn">&times;</button>
       </div>
       <div id="device-list" class="device-list"></div>
       <button id="pair-btn" class="ghost-btn">+ Pair wireless</button>
-    </aside>
-
-    <main id="panel">
-      <nav id="tabs">
-        <button class="tab active" data-tab="mirror">Mirror</button>
-        <button class="tab" data-tab="webcam">Webcam</button>
-        <button class="tab" data-tab="audio">Audio</button>
-        <button class="tab" data-tab="battery">Battery</button>
-        <button class="tab" data-tab="files">Files</button>
-        <button class="tab" data-tab="apps">Apps</button>
-        <button class="tab" data-tab="backup">Backup</button>
-        <button class="tab" data-tab="bootloader">Bootloader</button>
-      </nav>
-
-      <section id="empty-state" class="glass-card center-card">
-        <p class="empty-title">No device selected</p>
-        <span class="muted">Connect over USB, or pair a device wirelessly from the dock on the left.</span>
-      </section>
-
-      <section id="tab-mirror" class="tab-content glass-card hidden">
-        <h3>Screen mirror</h3>
-        <p class="muted">Launches scrcpy in its own window. In-app embedding of the video stream is a later upgrade — see the README.</p>
-        <button id="launch-scrcpy" class="primary-btn">Start mirroring</button>
-
-        <h4 class="section-subtitle">Device controls</h4>
-        <p class="muted">Hardware-key presses sent to the device — works while mirroring too.</p>
-        <div class="device-controls">
-          <button class="ctrl-btn" data-key="26" title="Power">&#9211; Power</button>
-          <button class="ctrl-btn" data-key="24" title="Volume up">&#128266; Vol&nbsp;+</button>
-          <button class="ctrl-btn" data-key="25" title="Volume down">&#128263; Vol&nbsp;&minus;</button>
-          <button class="ctrl-btn" data-key="3" title="Home">&#127968; Home</button>
-          <button class="ctrl-btn" data-key="4" title="Back">&#8592; Back</button>
-          <button class="ctrl-btn" data-key="187" title="Recent apps">&#9783; Recents</button>
-        </div>
-      </section>
-
-      <section id="tab-webcam" class="tab-content glass-card hidden">
-        <h3>Camera preview</h3>
-        <p class="muted">Streams the phone's camera to a preview window via scrcpy's camera video source. This is the video half of a "use phone as webcam" feature — making it selectable inside other apps (Zoom, OBS, browsers) needs a signed virtual-camera driver per OS, which isn't built yet. See the README for what that would take.</p>
-        <div class="path-bar" style="margin-top: 14px;">
-          <select id="camera-facing" class="mono">
-            <option value="back">Back camera</option>
-            <option value="front">Front camera</option>
-          </select>
-          <button id="launch-camera-btn" class="primary-btn" style="margin-top:0;">Open camera preview</button>
-        </div>
-      </section>
-
-      <section id="tab-audio" class="tab-content glass-card hidden">
-        <h3>Audio &amp; media controls</h3>
-        <p class="muted">Forwards device audio (music, media playback) to your PC speakers via scrcpy, and sends standard media-key commands to whatever app holds the active playback session.</p>
-        <div class="bootloader-actions" style="margin-top: 14px;">
-          <button id="audio-start-btn" class="primary-btn" style="margin-top:0;">Start audio forwarding</button>
-          <button id="audio-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
-        </div>
-        <p id="audio-status" class="muted" style="margin-top: 10px;">Not forwarding.</p>
-
-        <div class="transport-controls">
-          <button id="media-prev-btn" class="ghost-btn" style="margin-top:0;">&#9198; Prev</button>
-          <button id="media-playpause-btn" class="primary-btn" style="margin-top:0;">&#9199; Play / Pause</button>
-          <button id="media-next-btn" class="ghost-btn" style="margin-top:0;">&#9197; Next</button>
-        </div>
-        <p id="now-playing" class="muted mono" style="margin-top: 12px;"></p>
-      </section>
-
-      <section id="tab-battery" class="tab-content glass-card hidden">
-        <h3>Battery</h3>
-        <div id="battery-grid"></div>
-      </section>
-
-      <section id="tab-files" class="tab-content glass-card hidden">
-        <h3>Files</h3>
-        <div class="path-bar">
-          <input id="remote-path" class="mono" value="/sdcard/" spellcheck="false" />
-          <button id="list-files-btn">Go</button>
-          <button id="push-file-btn" class="ghost-btn">Upload here</button>
-        </div>
-        <div id="file-list" class="mono file-list"></div>
-      </section>
-
-      <section id="tab-apps" class="tab-content glass-card hidden">
-        <h3>Apps</h3>
-        <div class="apps-toolbar">
-          <button id="install-apk-btn" class="primary-btn">Sideload APK</button>
-        </div>
-        <div id="app-list" class="mono app-list"></div>
-      </section>
-
-      <section id="tab-backup" class="tab-content glass-card hidden">
-        <h3>Backup</h3>
-        <p class="muted">Pulls shared storage folders and, optionally, installed APKs to a folder on this PC. This isn't a full system/app-data backup — modern Android doesn't allow that without root — just what's reachable from userspace adb.</p>
-        <div class="checkbox-list">
-          <label class="checkbox-row"><input type="checkbox" value="dcim" checked /> Camera photos &amp; videos (DCIM)</label>
-          <label class="checkbox-row"><input type="checkbox" value="pictures" checked /> Pictures</label>
-          <label class="checkbox-row"><input type="checkbox" value="downloads" /> Downloads</label>
-          <label class="checkbox-row"><input type="checkbox" value="music" /> Music</label>
-          <label class="checkbox-row"><input type="checkbox" value="documents" /> Documents</label>
-          <label class="checkbox-row"><input type="checkbox" id="backup-apks" /> Installed app APKs (not app data)</label>
-        </div>
-        <div class="path-bar">
-          <input id="backup-dest" class="mono" placeholder="Choose a destination folder…" readonly />
-          <button id="choose-dest-btn" class="ghost-btn">Browse</button>
-        </div>
-        <button id="run-backup-btn" class="primary-btn">Start backup</button>
-        <pre id="backup-output" class="mono output-block"></pre>
-      </section>
-
-      <section id="tab-bootloader" class="tab-content glass-card hidden">
-        <h3>Bootloader</h3>
-        <p class="muted danger-text">Unlocking wipes all data on the device and may trip a tamper flag or void warranty. The generic command below only works on OEMs that support standard fastboot unlock — some (Xiaomi, OnePlus, Samsung, etc.) require their own account-bound unlock tool instead.</p>
-        <div class="bootloader-actions">
-          <button id="reboot-bootloader-btn" class="ghost-btn">Reboot to bootloader</button>
-          <button id="unlock-btn" class="danger-btn">fastboot flashing unlock</button>
-        </div>
-        <pre id="bootloader-output" class="mono output-block"></pre>
-      </section>
-    </main>
+    </div>
   </div>
 
   <div id="pair-modal" class="modal hidden">
@@ -171,6 +392,17 @@
         <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
         <button id="pair-submit-btn" class="primary-btn">Pair</button>
       </div>
+    </div>
+  </div>
+
+  <div id="tools-modal" class="modal hidden">
+    <div class="modal-card glass-card wide">
+      <div class="modal-head">
+        <h3>Android system binaries &amp; drivers</h3>
+        <button id="tools-modal-close" class="icon-btn">&times;</button>
+      </div>
+      <div id="tools-list"></div>
+      <button id="tools-refresh-btn" class="primary-btn">Re-verify tools</button>
     </div>
   </div>
 
