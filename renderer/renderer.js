@@ -4,7 +4,7 @@ const state = {
   activeView: 'dashboard',
   selectedFile: null, // { name, fullPath }
   selectedApp: null,
-  mirror: { maxSize: '1920', bitrate: 8, maxFps: '60' },
+  mirror: { maxSize: '1920', bitrate: 8, maxFps: '60', zoom: 1 },
   rotation: 0,
 };
 
@@ -12,6 +12,16 @@ const el = (id) => document.getElementById(id);
 const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 // -------------------------------------------------------------- first-run setup
+
+let setupFailed = false;
+
+function enterShell() {
+  el('setup-overlay').classList.add('hidden');
+  el('shell').classList.remove('hidden');
+  refreshDevices();
+}
+
+el('setup-continue').onclick = enterShell;
 
 window.api.onSetupProgress(({ step, status, progress, message }) => {
   const line = el('setup-line');
@@ -23,16 +33,19 @@ window.api.onSetupProgress(({ step, status, progress, message }) => {
     line.textContent = `Downloading ${step === 'adb' ? 'Android platform-tools' : 'scrcpy'}…`;
     bar.style.width = `${Math.round((progress || 0) * 100)}%`;
   }
-  if (status === 'done') bar.style.width = '100%';
+  if (status === 'done') {
+    bar.style.width = '100%';
+    line.textContent = message ? `${step}: ${message}` : `${step} ready`;
+  }
   if (status === 'error') {
-    errorEl.textContent = `${step}: ${message}`;
+    // Don't silently swallow this: a failed scrcpy step is exactly why
+    // mirroring appears to do nothing later on.
+    setupFailed = true;
+    errorEl.textContent = `${step} failed — ${message}`;
     errorEl.classList.remove('hidden');
+    el('setup-continue').classList.remove('hidden');
   }
-  if (status === 'ready') {
-    el('setup-overlay').classList.add('hidden');
-    el('shell').classList.remove('hidden');
-    refreshDevices();
-  }
+  if (status === 'ready' && !setupFailed) enterShell();
 });
 
 // --------------------------------------------------------------- titlebar
@@ -56,12 +69,14 @@ function setView(view) {
 }
 
 function refreshView(view) {
+  if (view !== 'hardware') stopHardwarePolling();
   if (!state.selected) return;
   if (view === 'dashboard') loadDashboard();
   if (view === 'files') loadFiles();
   if (view === 'apps') loadApps();
-  if (view === 'hardware') loadHardware();
-  if (view === 'multimedia') refreshAudioStatus();
+  if (view === 'hardware') { loadHardware(); startHardwarePolling(); }
+  if (view === 'multimedia') { refreshAudioStatus(); refreshBridge(); }
+  if (view === 'mirror') showScrcpyBuild();
 }
 
 // -------------------------------------------------------------- device modal
@@ -186,27 +201,160 @@ async function loadDashboard() {
 
 // ---------------------------------------------------------------- hardware view
 
+const fmt = (v, digits = 2) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? '—' : Number(v).toFixed(digits));
+const setText = (id, value) => { el(id).textContent = value; };
+
+function formatEta(minutes, charging) {
+  if (!minutes) return '';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  const span = h ? `${h}h ${m}m` : `${m}m`;
+  return charging ? `~${span} to full` : `~${span} left`;
+}
+
+// dumpsys reports BatteryManager health constants numerically on some builds.
+const HEALTH_NAMES = {
+  1: 'Unknown', 2: 'Good', 3: 'Overheat', 4: 'Dead',
+  5: 'Over voltage', 6: 'Unspecified failure', 7: 'Cold',
+};
+
+function healthLabel(power) {
+  const raw = (power.health || '').trim();
+  const name = HEALTH_NAMES[raw] || (raw && !/^\d+$/.test(raw) ? raw : null);
+  if (power.healthPct !== null && power.healthPct !== undefined) {
+    return { text: `${power.healthPct}%${name ? ` (${name})` : ''}`, pct: power.healthPct };
+  }
+  return { text: name || '—', pct: null };
+}
+
+let hardwareTimer = null;
+
 async function loadHardware() {
   const serial = state.selected;
-  const [battery, hw, info] = await Promise.all([
-    window.api.getBattery(serial),
-    window.api.getHardware(serial),
-    window.api.getDeviceInfo(serial),
-  ]);
-  el('hw-batt-status').textContent = /2|charg/i.test(battery.status || '') ? 'Charging' : 'On battery';
-  el('hw-level').textContent = battery.level ? `${battery.level}%` : '—';
-  el('hw-health').textContent = battery.health || '—';
-  el('hw-cycles').textContent = battery['cycle count'] || 'N/A';
-  el('hw-voltage').textContent = battery.voltage ? `${(Number(battery.voltage) / 1000).toFixed(2)} V` : '—';
-  el('hw-temp').textContent = battery.temperature ? `${(Number(battery.temperature) / 10).toFixed(1)}°C` : '—';
-  el('hw-tech').textContent = battery.technology || '—';
+  if (!serial) return;
 
-  el('hw-chipset').textContent = info['ro.board.platform'] || info['ro.hardware'] || '—';
-  el('hw-display').textContent = hw.resolution ? `${hw.resolution} @ ${hw.density || '?'} dpi` : '—';
-  el('hw-ram').textContent = hw.ramTotalGb ? `${hw.ramTotalGb} GB` : '—';
-  el('hw-storage').textContent = hw.storageTotalGb ? `${hw.storageTotalGb} GB total` : '—';
-  el('hw-android').textContent = info['ro.build.version.release'] || '—';
-  el('hw-secpatch').textContent = info['ro.build.version.security_patch'] || '—';
+  const [power, hw, info, soc] = await Promise.all([
+    window.api.getPower(serial).catch((e) => ({ error: e.message })),
+    window.api.getHardware(serial).catch(() => ({})),
+    window.api.getDeviceInfo(serial).catch(() => ({})),
+    window.api.getSoc(serial).catch(() => ({})),
+  ]);
+
+  if (power.error) {
+    setText('hw-source-note', `Could not read power telemetry: ${power.error}`);
+    return;
+  }
+
+  // --- battery power station -------------------------------------------------
+  const level = power.level ?? 0;
+  const ring = el('hw-ring');
+  ring.style.setProperty('--pct', level);
+  ring.classList.toggle('critical', level <= 15);
+  ring.classList.toggle('warn', level > 15 && level <= 35);
+
+  setText('hw-level', power.level === null ? '—' : `${power.level}%`);
+  setText('hw-eta', formatEta(power.minutesRemaining, power.charging));
+  el('hw-ring-bolt').classList.toggle('hidden', !power.charging);
+
+  const statusBadge = el('hw-batt-status');
+  const plugged = (power.plugged || '').replace(/^BATTERY_PLUGGED_/, '');
+  statusBadge.textContent = power.charging
+    ? `Charging${plugged ? ` (${plugged})` : ''}`
+    : 'On battery';
+  statusBadge.classList.toggle('badge-online', power.charging);
+
+  const health = healthLabel(power);
+  const healthEl = el('hw-health');
+  healthEl.textContent = health.text;
+  healthEl.className = 'fact-value' + (
+    health.pct === null ? '' : health.pct >= 85 ? ' good' : health.pct >= 70 ? ' warn' : ' bad'
+  );
+
+  setText('hw-capacity', power.chargeFullMah
+    ? `${power.chargeFullMah} / ${power.chargeDesignMah || '?'} mAh`
+    : (power.chargeDesignMah ? `${power.chargeDesignMah} mAh design` : '—'));
+
+  setText('hw-cycles', power.cycleCount ?? 'Not exposed');
+  setText('hw-tech', power.technology || '—');
+
+  // --- electrical & thermal telemetry ---------------------------------------
+  setText('hw-watts', fmt(power.watts, 2));
+  setText('hw-voltage', fmt(power.voltage, 2));
+  setText('hw-voltage-mv', power.voltageMv ? `${power.voltageMv} mV` : '');
+  setText('hw-current', fmt(power.current, 2));
+  setText('hw-current-ma', power.currentMa ? `${power.charging ? '+' : '−'}${power.currentMa} mA` : '');
+
+  setText('hw-temp', fmt(power.batteryTemp, 1));
+  setText('hw-temp-sub', power.batteryTemp === null
+    ? ''
+    : `${(power.batteryTemp * 9 / 5 + 32).toFixed(1)}°F · ${power.batteryTemp >= 43 ? 'Hot' : power.batteryTemp >= 38 ? 'Warm' : 'Normal'}`);
+
+  setText('hw-soc-temp', fmt(power.socTemp, 1));
+  setText('hw-soc-zone', power.socZone ? `zone: ${power.socZone}` : 'Not exposed');
+
+  setText('hw-protocol', power.protocol || (power.charging ? 'USB (unreported)' : 'Not charging'));
+  const inputBits = [
+    power.inputVoltage ? `${fmt(power.inputVoltage, 1)} V` : null,
+    power.inputCurrentLimit ? `${fmt(power.inputCurrentLimit, 2)} A limit` : null,
+    power.typecMode || null,
+  ].filter(Boolean);
+  setText('hw-protocol-sub', inputBits.join(' · '));
+
+  const rate = el('hw-rate');
+  rate.textContent = power.watts ? `${power.watts >= 15 ? 'Fast charge' : 'Charging'} (${fmt(power.watts, 1)} W)` : '';
+  rate.style.color = power.watts >= 15 ? 'var(--accent)' : 'var(--signal)';
+
+  setText('hw-source-note', power.sysfsAvailable
+    ? `Power measurements read directly from the Android kernel power-supply subsystem (${power.source}).`
+    : 'Kernel power-supply nodes are not readable on this device — values fall back to "dumpsys battery", so current and wattage may be missing.');
+
+  // --- processor & device specs --------------------------------------------
+  setText('hw-chipset', soc.socName || info['ro.board.platform'] || '—');
+  setText('hw-chipset-sub', [
+    soc.clusterSummary,
+    soc.coreCount ? `${soc.coreCount} cores` : null,
+  ].filter(Boolean).join(' · '));
+
+  setText('hw-display', hw.resolution ? `${hw.resolution} pixels` : '—');
+  setText('hw-display-sub', hw.density ? `${hw.density} dpi` : '');
+
+  setText('hw-ram', hw.ramTotalGb ? `${hw.ramTotalGb} GB` : '—');
+  setText('hw-ram-sub', [
+    soc.ddrType ? `DDR type ${soc.ddrType}` : null,
+    hw.ramUsedGb ? `${hw.ramUsedGb} GB in use` : null,
+  ].filter(Boolean).join(' · '));
+
+  setText('hw-storage', hw.storageTotalGb ? `${hw.storageTotalGb} GB` : '—');
+  setText('hw-storage-sub', [
+    soc.storageModel,
+    hw.storageUsedGb ? `${hw.storageUsedGb} GB used` : null,
+  ].filter(Boolean).join(' · '));
+
+  setText('hw-android', info['ro.build.version.release']
+    ? `Android ${info['ro.build.version.release']} (API ${info['ro.build.version.sdk'] || '?'})`
+    : '—');
+  setText('hw-abi', soc.abi || info['ro.product.cpu.abi'] || '');
+
+  setText('hw-secpatch', info['ro.build.version.security_patch'] || '—');
+  setText('hw-bootloader', info.bootloaderLocked === '1'
+    ? 'Bootloader locked'
+    : info.bootloaderLocked === '0' ? 'Bootloader unlocked' : '');
+
+  el('hw-updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+// Telemetry is only meaningful live, so poll while the view is on screen and
+// stop as soon as the user navigates away.
+function startHardwarePolling() {
+  stopHardwarePolling();
+  hardwareTimer = setInterval(() => {
+    if (state.activeView === 'hardware' && state.selected) loadHardware();
+    else stopHardwarePolling();
+  }, 3000);
+}
+
+function stopHardwarePolling() {
+  if (hardwareTimer) { clearInterval(hardwareTimer); hardwareTimer = null; }
 }
 
 // ----------------------------------------------------------------------- files
@@ -377,18 +525,120 @@ el('bitrate-slider').oninput = (e) => {
   el('bitrate-value').textContent = e.target.value;
 };
 
-el('launch-scrcpy').onclick = () => {
-  if (!state.selected) return;
-  window.api.launchScrcpy(state.selected, {
-    maxSize: state.mirror.maxSize,
-    bitrate: state.mirror.bitrate,
-    maxFps: state.mirror.maxFps,
-    stayAwake: el('opt-stay-awake').checked,
-    turnScreenOff: el('opt-screen-off').checked,
-    showTouches: el('opt-show-touches').checked,
-    forwardAudio: el('opt-audio').checked,
-  });
+// Window size, as a fraction of the largest that fits the screen. Applied live
+// when a session is already docked, so this doubles as a resize control for the
+// borderless video window — which by design has no edges to drag.
+qAll('#zoom-options .chip-tab').forEach((tab) => {
+  tab.onclick = async () => {
+    qAll('#zoom-options .chip-tab').forEach((t) => t.classList.remove('active'));
+    tab.classList.add('active');
+    state.mirror.zoom = Number(tab.dataset.value);
+    const { docked } = await window.api.dockState();
+    if (!docked) return;
+    try {
+      const res = await window.api.setMirrorZoom(state.mirror.zoom);
+      setMirrorStatus(res.relaunched
+        ? `Resized to ${Math.round(res.zoom * 100)}% by restarting the stream.`
+        : `Resized to ${Math.round(res.zoom * 100)}%.`, 'ok');
+    } catch (err) { setMirrorStatus(cleanIpcError(err.message), 'err'); }
+  };
+});
+
+// Reports which scrcpy the main process actually resolved — the single most
+// useful thing to see when mirroring won't start. Also settles whether docking
+// is even possible: a build with no --window-x cannot be positioned, so the
+// checkbox is disabled rather than silently ignored.
+async function showScrcpyBuild() {
+  try {
+    const info = await window.api.scrcpyInfo();
+    el('scrcpy-build').textContent = info.version
+      ? `${info.version} · ${info.path}`
+      : `scrcpy not detected (looked at: ${info.path})`;
+    const dock = el('opt-dock');
+    if (info.version && info.canDock === false) {
+      dock.checked = false;
+      dock.disabled = true;
+      dock.closest('.checkbox-row').title =
+        `${info.version} has no --window-x/--window-y, so its window cannot be positioned.`;
+    }
+  } catch { el('scrcpy-build').textContent = ''; }
+}
+
+function setMirrorStatus(text, cls) {
+  const node = el('mirror-status');
+  node.textContent = text;
+  node.className = `mono mirror-status${cls ? ` ${cls}` : ''}`;
+}
+
+el('launch-scrcpy').onclick = async () => {
+  if (!state.selected) { setMirrorStatus('Select a device first.', 'err'); return; }
+  const btn = el('launch-scrcpy');
+  btn.disabled = true;
+  setMirrorStatus('Starting scrcpy…', 'busy');
+  try {
+    const res = await window.api.launchScrcpy(state.selected, {
+      maxSize: state.mirror.maxSize,
+      bitrate: state.mirror.bitrate,
+      maxFps: state.mirror.maxFps,
+      stayAwake: el('opt-stay-awake').checked,
+      turnScreenOff: el('opt-screen-off').checked,
+      showTouches: el('opt-show-touches').checked,
+      forwardAudio: el('opt-audio').checked,
+      dock: el('opt-dock').checked,
+      borderless: el('opt-borderless').checked,
+      zoom: state.mirror.zoom,
+    });
+    if (res && res.docked) {
+      setMirrorStatus(el('opt-borderless').checked
+        ? 'Mirroring with a docked control bar. The video window is borderless, so resize it with − / + / Fit on the bar.'
+        : 'Mirroring with a docked control bar. Drag or resize the video window freely, then press Re-dock to bring the bar back under it.', 'ok');
+    } else {
+      setMirrorStatus([
+        'Mirror window running. Close that window to end the session.',
+        res && res.note,
+      ].filter(Boolean).join(' '), res && res.note ? 'busy' : 'ok');
+    }
+  } catch (err) {
+    setMirrorStatus(cleanIpcError(err.message), 'err');
+  } finally {
+    btn.disabled = false;
+  }
 };
+
+el('stop-scrcpy').onclick = async () => {
+  const stopped = await window.api.stopMirror();
+  setMirrorStatus(stopped
+    ? 'Mirroring stopped.'
+    : 'No docked session to stop — close the scrcpy window itself.', stopped ? 'ok' : 'busy');
+};
+
+// Navigation and the notification shade. These go over adb, so they also work
+// when mirroring is not running at all.
+const navBtn = (id, action) => {
+  el(id).onclick = async () => {
+    if (!state.selected) { setMirrorStatus('Select a device first.', 'err'); return; }
+    try { await window.api.navKey(state.selected, action); }
+    catch (err) { setMirrorStatus(cleanIpcError(err.message), 'err'); }
+  };
+};
+navBtn('ctrl-back', 'back');
+navBtn('ctrl-home', 'home');
+navBtn('ctrl-recents', 'recents');
+
+// A second press collapses the panel, matching the gesture these replace.
+let openShadePanel = null;
+const shadeBtn = (id, panel) => {
+  el(id).onclick = async () => {
+    if (!state.selected) { setMirrorStatus('Select a device first.', 'err'); return; }
+    const target = openShadePanel === panel ? 'collapse' : panel;
+    try {
+      await window.api.statusBar(state.selected, target);
+      openShadePanel = target === 'collapse' ? null : panel;
+    } catch (err) { setMirrorStatus(cleanIpcError(err.message), 'err'); }
+  };
+};
+shadeBtn('ctrl-shade', 'notifications');
+shadeBtn('ctrl-qs', 'quickSettings');
 
 el('ctrl-vol-up').onclick = () => state.selected && window.api.volumeUp(state.selected);
 el('ctrl-vol-down').onclick = () => state.selected && window.api.volumeDown(state.selected);
@@ -460,13 +710,194 @@ qAll('.chip-tab[data-mm]').forEach((tab) => {
     el('mm-webcam').classList.toggle('hidden', tab.dataset.mm !== 'webcam');
     el('mm-audio').classList.toggle('hidden', tab.dataset.mm !== 'audio');
     if (tab.dataset.mm === 'audio') refreshAudioStatus();
+    else refreshBridge();
   };
 });
 
-el('launch-camera-btn').onclick = () => {
-  if (!state.selected) return;
-  window.api.launchCameraPreview(state.selected, el('camera-facing').value);
+const cleanIpcError = (msg) => msg.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, '');
+
+// ---- camera ----------------------------------------------------------------
+// The lens list and both dropdowns are populated only from what the phone
+// reports. Nothing is offered speculatively: asking scrcpy for a size the sensor
+// does not list is a fatal error, not a downgrade.
+
+const camera = { list: [], selected: null, mic: true, v4l2: false, bridge: null, limits: null };
+
+function setCameraStatus(text, kind = '') {
+  const node = el('camera-status');
+  node.textContent = text || '';
+  node.className = `mirror-status${kind ? ` ${kind}` : ''}`;
+}
+
+function renderLensList() {
+  const box = el('camera-lens-list');
+  box.innerHTML = '';
+  if (!camera.list.length) {
+    box.innerHTML = '<div class="muted" style="padding:10px 12px;">Not detected yet.</div>';
+    return;
+  }
+  const labels = { back: 'Rear', front: 'Front', external: 'External' };
+  camera.list.forEach((cam) => {
+    const row = document.createElement('div');
+    row.className = `list-row${camera.selected === cam.id ? ' selected' : ''}`;
+    const mp = cam.megapixels ? `${cam.megapixels} MP` : '—';
+    row.innerHTML = `<span>${labels[cam.facing] || cam.facing} camera</span>`
+      + `<span class="muted mono">id ${cam.id} · ${mp} · ${cam.maxSize || '—'}</span>`;
+    row.onclick = () => { camera.selected = cam.id; renderLensList(); renderSizeOptions(); };
+    box.appendChild(row);
+  });
+}
+
+function currentCamera() {
+  return camera.list.find((c) => c.id === camera.selected) || camera.list[0] || null;
+}
+
+function renderSizeOptions() {
+  const cam = currentCamera();
+  const sizeSel = el('camera-size');
+  const fpsSel = el('camera-fps');
+  const highSpeed = el('camera-highspeed').checked;
+  sizeSel.innerHTML = '<option value="">Sensor default</option>';
+  fpsSel.innerHTML = '<option value="">Default fps</option>';
+  el('camera-size-note').textContent = '';
+  if (!cam) return;
+
+  const sizes = highSpeed ? cam.highSpeedSizes : cam.sizes;
+  let blocked = 0;
+  for (const s of sizes) {
+    const opt = document.createElement('option');
+    opt.value = s.size;
+    // A megapixel figure is more meaningful next to the raw size than alone.
+    const mp = Math.round((s.width * s.height) / 100000) / 10;
+    opt.textContent = `${s.size} (${mp} MP)${s.fps ? ` · fps ${s.fps.join('/')}` : ''}`;
+    // The sensor genuinely offers these, so they are shown and disabled rather
+    // than hidden: the phone's video encoder is what cannot compress them, and
+    // silently dropping them would look like the app losing resolutions.
+    if (s.encodable === false) {
+      opt.disabled = true;
+      opt.textContent += ' — too large for this phone\'s encoder';
+      blocked += 1;
+    }
+    sizeSel.appendChild(opt);
+  }
+  if (!sizes.length) {
+    sizeSel.innerHTML = `<option value="">${highSpeed ? 'No high-speed sizes on this lens' : 'No sizes reported'}</option>`;
+  }
+  const limit = camera.limits && camera.limits.maxWidth
+    ? `Hardware encoder limit: ${camera.limits.maxWidth}x${camera.limits.maxHeight}.` : '';
+  el('camera-size-note').textContent = blocked
+    ? `${limit} ${blocked} size${blocked === 1 ? '' : 's'} the sensor offers cannot be encoded, so ${blocked === 1 ? 'it is' : 'they are'} greyed out.`
+    : limit;
+  for (const f of cam.fps || []) {
+    const opt = document.createElement('option');
+    opt.value = String(f);
+    opt.textContent = `${f} fps`;
+    fpsSel.appendChild(opt);
+  }
+  el('camera-mic').disabled = !camera.mic;
+  el('camera-highspeed').disabled = !cam.highSpeedSizes.length && !highSpeed;
+}
+
+el('camera-highspeed').onchange = renderSizeOptions;
+
+el('camera-refresh-btn').onclick = async () => {
+  if (!state.selected) { el('camera-detect-status').textContent = 'Select a device first.'; return; }
+  const btn = el('camera-refresh-btn');
+  btn.disabled = true;
+  el('camera-detect-status').textContent = 'Asking scrcpy what this phone offers…';
+  try {
+    const res = await window.api.listCameras(state.selected);
+    camera.list = res.cameras;
+    camera.mic = res.mic;
+    camera.v4l2 = res.v4l2;
+    camera.limits = res.limits || null;
+    camera.selected = res.cameras[0] ? res.cameras[0].id : null;
+    el('camera-detect-status').textContent =
+      `${res.cameras.length} camera${res.cameras.length === 1 ? '' : 's'} reported.`;
+    renderLensList();
+    renderSizeOptions();
+  } catch (err) {
+    el('camera-detect-status').textContent = cleanIpcError(err.message);
+  } finally {
+    btn.disabled = false;
+  }
 };
+
+el('camera-start-btn').onclick = async () => {
+  if (!state.selected) return;
+  const cam = currentCamera();
+  const btn = el('camera-start-btn');
+  btn.disabled = true;
+  setCameraStatus('Starting the camera stream…', 'busy');
+  try {
+    const opts = {
+      serial: state.selected,
+      cameraId: cam ? cam.id : undefined,
+      size: el('camera-size').value || undefined,
+      fps: el('camera-fps').value ? Number(el('camera-fps').value) : undefined,
+      highSpeed: el('camera-highspeed').checked,
+      mic: el('camera-mic').checked,
+    };
+    // Only on Linux with a loopback device does a real virtual camera exist; the
+    // sink is passed only then, because the flag is otherwise absent or useless.
+    if (camera.bridge && camera.bridge.mode === 'v4l2' && camera.bridge.ready) {
+      opts.v4l2Device = camera.bridge.devices[0];
+    }
+    await window.api.startCamera(opts);
+    el('camera-state').textContent = 'Streaming';
+    setCameraStatus(opts.v4l2Device
+      ? `Streaming into ${opts.v4l2Device} — other apps can select it as a camera.`
+      : 'Streaming to a preview window.', 'ok');
+  } catch (err) {
+    el('camera-state').textContent = 'Standby';
+    setCameraStatus(cleanIpcError(err.message), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+el('camera-stop-btn').onclick = async () => {
+  await window.api.stopCamera();
+  el('camera-state').textContent = 'Standby';
+  setCameraStatus('Camera stream stopped.');
+};
+
+el('torch-btn').onclick = async () => {
+  if (!state.selected) return;
+  const btn = el('torch-btn');
+  btn.disabled = true;
+  try {
+    const res = await window.api.toggleTorch(state.selected);
+    // Only claim a state the camera service actually confirmed. The tile click is
+    // a toggle that reports nothing, so without read-back the honest message is
+    // "clicked", not "on".
+    setCameraStatus(res && res.state
+      ? `Flashlight is ${res.state}.`
+      : 'Flashlight tile clicked — this phone does not report torch state, so check the light itself.', 'ok');
+  } catch (err) {
+    setCameraStatus(cleanIpcError(err.message), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+async function refreshBridge() {
+  try {
+    const bridge = await window.api.cameraBridge();
+    camera.bridge = bridge;
+    el('bridge-badge').textContent = bridge.ready ? bridge.label : `Virtual camera: ${bridge.label}`;
+    el('bridge-label').textContent = `Virtual camera: ${bridge.label}`;
+    el('bridge-hint').textContent = bridge.hint;
+  } catch {
+    el('bridge-badge').textContent = 'Virtual camera: unknown';
+    el('bridge-label').textContent = 'Virtual camera: could not be checked';
+    el('bridge-hint').textContent = '';
+  }
+  const st = await window.api.cameraStatus().catch(() => null);
+  if (st) el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
+}
+
+// ---- audio + now playing ---------------------------------------------------
 
 let nowPlayingTimer = null;
 
@@ -477,18 +908,126 @@ async function refreshAudioStatus() {
   if (state.activeView === 'multimedia') {
     pollNowPlaying();
     nowPlayingTimer = setInterval(pollNowPlaying, 4000);
+  } else {
+    clearInterval(np.timer);
+  }
+}
+
+/**
+ * Absent fields stay as an em dash — the phone not reporting one is information.
+ *
+ * The seek bar is the honest-reporting case that matters here: `dumpsys
+ * media_session` prints the playback position but usually not the track length,
+ * so there is often no percentage to draw. Rather than leave an empty track that
+ * looks broken, the bar is hidden and the reason is said out loud. Album art is
+ * never in the dump at all (it is a bitmap held in the app's process), so there is
+ * no artwork slot to fill.
+ */
+function renderNowPlaying(track, sessions, readAt) {
+  const dash = '—';
+  const set = (id, value) => { el(id).textContent = value || dash; };
+  np.track = track || null;
+  np.readAt = readAt || Date.now();
+  set('np-title', track && track.title);
+  set('np-artist', track && track.artist);
+  set('np-album', track && track.album);
+  set('np-app', track && track.app);
+  set('np-state', track && track.stateLabel);
+  tickNowPlaying();
+
+  // Transport buttons follow the session's advertised actions, so a button that
+  // the app would ignore is visibly disabled rather than silently inert.
+  const actions = track && track.actions;
+  el('media-prev-btn').disabled = !!actions && !actions.previous;
+  el('media-next-btn').disabled = !!actions && !actions.next;
+  el('media-playpause-btn').disabled = !!actions && !actions.play && !actions.pause;
+
+  el('now-playing').textContent = track
+    ? `${sessions} media session${sessions === 1 ? '' : 's'} on the device.`
+    : 'No active media session detected.';
+}
+
+// The last dump plus when it was read: enough to advance the clock locally.
+const np = { track: null, readAt: 0, timer: null };
+
+/** mm:ss, with an hours field only when the track needs one. */
+function clock(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const total = Math.round(ms / 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const h = Math.floor(total / 3600);
+  return h
+    ? `${h}:${pad(Math.floor(total / 60) % 60)}:${pad(total % 60)}`
+    : `${Math.floor(total / 60)}:${pad(total % 60)}`;
+}
+
+/**
+ * Advances the displayed position between polls.
+ *
+ * The dump's `position` is a snapshot, so a bar driven only by polling jumps in
+ * four-second steps. Multiplying elapsed wall time by the session's reported
+ * speed reproduces what the notification shows, and only while it says it is
+ * playing — a paused track must not creep forward.
+ */
+function tickNowPlaying() {
+  const t = np.track;
+  const barRow = el('np-bar-row');
+  if (!t || t.positionMs === null) {
+    el('np-position').textContent = '—';
+    el('np-duration').textContent = '—';
+    el('np-progress').style.width = '0%';
+    barRow.style.display = '';
+    el('np-bar-note').textContent = '';
+    return;
+  }
+
+  const speed = t.playing ? (Number.isFinite(t.speed) && t.speed !== 0 ? t.speed : 1) : 0;
+  const elapsed = Math.max(0, Date.now() - np.readAt) * speed;
+  const position = t.durationMs
+    ? Math.min(t.durationMs, t.positionMs + elapsed)
+    : t.positionMs + elapsed;
+
+  el('np-position').textContent = clock(position) || '—';
+  if (t.durationMs) {
+    barRow.style.display = '';
+    el('np-duration').textContent = clock(t.durationMs) || '—';
+    el('np-progress').style.width = `${Math.round((position / t.durationMs) * 100)}%`;
+    el('np-bar-note').textContent = '';
+  } else {
+    // No length in the dump means no percentage exists to draw.
+    barRow.style.display = 'none';
+    el('np-bar-note').textContent = `Elapsed ${clock(position)} — this app does not publish the track length over adb, so there is no seek bar to fill.`;
   }
 }
 
 async function pollNowPlaying() {
   if (!state.selected) return;
   try {
-    const { description } = await window.api.nowPlaying(state.selected);
-    el('now-playing').textContent = description || 'No active media session detected.';
-  } catch { el('now-playing').textContent = ''; }
+    const res = await window.api.nowPlaying(state.selected);
+    renderNowPlaying(res.track, res.sessions, res.readAt);
+  } catch {
+    renderNowPlaying(null, 0, Date.now());
+  }
+  // A 1 s local tick between 4 s polls, so the elapsed time counts instead of
+  // stepping. Cleared and restarted with each poll to avoid stacking timers.
+  clearInterval(np.timer);
+  np.timer = setInterval(tickNowPlaying, 1000);
 }
 
-el('audio-start-btn').onclick = async () => { if (state.selected) { await window.api.startAudio(state.selected); refreshAudioStatus(); } };
+el('np-refresh-btn').onclick = pollNowPlaying;
+
+el('audio-start-btn').onclick = async () => {
+  if (!state.selected) return;
+  el('audio-status').textContent = 'Starting…';
+  try {
+    await window.api.startAudio(state.selected);
+  } catch (err) {
+    el('audio-status').textContent = cleanIpcError(err.message);
+    return;
+  }
+  refreshAudioStatus();
+};
+
 el('audio-stop-btn').onclick = async () => { await window.api.stopAudio(); refreshAudioStatus(); };
 el('media-prev-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'previous');
 el('media-playpause-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'playPause');
@@ -560,17 +1099,47 @@ el('run-backup-btn').onclick = async () => {
 
 // -------------------------------------------------------------- wireless pair
 
-el('pair-btn').onclick = () => el('pair-modal').classList.remove('hidden');
+function setPairStatus(text, cls) {
+  const node = el('pair-status');
+  node.textContent = text || '';
+  node.className = `mirror-status${cls ? ` ${cls}` : ''}`;
+}
+
+el('pair-btn').onclick = () => {
+  setPairStatus('');
+  el('pair-modal').classList.remove('hidden');
+};
 el('pair-cancel-btn').onclick = () => el('pair-modal').classList.add('hidden');
 el('pair-submit-btn').onclick = async () => {
   const host = el('pair-host').value.trim();
   const code = el('pair-code').value.trim();
-  if (!host || !code) return;
+  const connectPort = el('pair-connect-port').value.trim();
+  if (!host || !code) {
+    setPairStatus('Enter the host:port and the 6-digit code from the pairing dialog.', 'err');
+    return;
+  }
+
+  const btn = el('pair-submit-btn');
+  btn.disabled = true;
+  setPairStatus('Pairing, then connecting…', 'busy');
   try {
-    await window.api.pairWireless(host, code);
-    el('pair-modal').classList.add('hidden');
+    // Pairing only exchanges keys; the device appears in adb devices after the
+    // separate connect step, which main.js attempts as part of this call.
+    const res = await window.api.pairWireless(host, code, connectPort);
+    if (res && res.connected) {
+      setPairStatus(res.message, 'ok');
+      el('pair-modal').classList.add('hidden');
+    } else {
+      // Paired but unreachable — keep the modal open so the connect port can be
+      // filled in without redoing the pairing (the code is single-use).
+      setPairStatus(res ? res.message : 'Paired, but the connect step did not run.', 'err');
+    }
     refreshDevices();
-  } catch (err) { alert(err.message); }
+  } catch (err) {
+    setPairStatus(cleanIpcError(err.message), 'err');
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 // ------------------------------------------------------------------- tools modal
@@ -580,7 +1149,17 @@ async function openToolsModal() {
   await loadToolsStatus();
 }
 el('tools-modal-close').onclick = () => el('tools-modal').classList.add('hidden');
-el('tools-refresh-btn').onclick = loadToolsStatus;
+el('tools-refresh-btn').onclick = async () => {
+  const btn = el('tools-refresh-btn');
+  btn.disabled = true;
+  el('tools-list').innerHTML = '<span class="muted">Re-running detection (may re-download a missing tool)…</span>';
+  // Full re-init rather than a passive status read, so a tool that failed to
+  // download on first run gets another attempt.
+  try { await window.api.reinitTools(); } catch { /* status render will show it */ }
+  await loadToolsStatus();
+  showScrcpyBuild();
+  btn.disabled = false;
+};
 
 async function loadToolsStatus() {
   const list = el('tools-list');

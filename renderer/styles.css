@@ -44,6 +44,16 @@ body::before {
 button { font-family: inherit; cursor: pointer; }
 input, select { font-family: inherit; }
 
+/* The dropdown list itself is drawn by the OS, which uses a light background
+   while the options inherit our near-white text — unreadable. Options need
+   their own explicit colours; inheriting is not enough. */
+select option {
+  background-color: #16191d;
+  color: #e7e9ec;
+}
+select option:disabled { color: #6b7280; }
+select:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
+
 /* ---------------------------------------------------------------- titlebar */
 
 #titlebar {
@@ -167,6 +177,169 @@ input, select { font-family: inherit; }
 .card.span-2 { grid-column: span 2; }
 
 .dashboard-grid-static { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+
+/* -------------------------------------------------- hardware & power view */
+
+.power-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 5fr) 7fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.head-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin-right: 7px; border-radius: 6px;
+  background: var(--signal-dim); color: var(--signal); font-size: 11px;
+  vertical-align: middle;
+}
+.head-icon.accent { background: var(--accent-dim); color: var(--accent); }
+
+.card-head h3 { text-transform: uppercase; letter-spacing: 0.06em; font-size: 11.5px; color: var(--text-muted); }
+.badge-text { font-size: 11.5px; font-weight: 700; color: var(--signal); }
+
+/* battery power station */
+
+.station-body {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 20px;
+  align-items: center;
+  padding: 14px 0 20px;
+}
+
+.power-ring {
+  width: 124px; height: 124px; border-radius: 50%;
+  background: conic-gradient(
+    var(--signal) 0deg,
+    var(--signal) calc(var(--pct, 0) * 3.6deg),
+    rgba(255, 255, 255, 0.07) calc(var(--pct, 0) * 3.6deg)
+  );
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.4s ease;
+}
+.power-ring.warn { --ring: var(--accent); }
+.power-ring.warn {
+  background: conic-gradient(
+    var(--accent) 0deg,
+    var(--accent) calc(var(--pct, 0) * 3.6deg),
+    rgba(255, 255, 255, 0.07) calc(var(--pct, 0) * 3.6deg)
+  );
+}
+.power-ring.critical {
+  background: conic-gradient(
+    var(--danger) 0deg,
+    var(--danger) calc(var(--pct, 0) * 3.6deg),
+    rgba(255, 255, 255, 0.07) calc(var(--pct, 0) * 3.6deg)
+  );
+}
+.ring-inner {
+  width: 104px; height: 104px; border-radius: 50%;
+  background: var(--bg-base);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 1px;
+}
+.ring-bolt { font-size: 12px; color: var(--accent); line-height: 1; }
+.ring-bolt.hidden { display: none; }
+.ring-level { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; }
+.ring-eta { font-size: 10.5px; color: var(--text-muted); }
+
+.station-facts { display: flex; flex-direction: column; gap: 10px; }
+.fact-box {
+  display: flex; flex-direction: column; gap: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  padding: 11px 13px;
+}
+.fact-label { font-size: 11px; color: var(--text-muted); }
+.fact-value { font-size: 14.5px; font-weight: 700; }
+.fact-value.good { color: var(--signal); }
+.fact-value.warn { color: var(--accent); }
+.fact-value.bad { color: var(--danger); }
+
+.station-footer {
+  display: flex; gap: 10px;
+  border-top: 1px solid var(--panel-border);
+  padding-top: 14px;
+}
+.footer-pill {
+  flex: 1;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-md);
+  padding: 9px 12px;
+  font-size: 11.5px;
+}
+.footer-pill .k { color: var(--text-muted); }
+.footer-pill .v { font-weight: 700; font-family: var(--font-mono); font-size: 11.5px; }
+
+/* telemetry tiles */
+
+.telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.metric {
+  display: flex; flex-direction: column; gap: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+.metric-label { font-size: 11px; color: var(--text-muted); }
+.metric-value {
+  font-size: 25px; font-weight: 800; line-height: 1.05; letter-spacing: -0.02em;
+  display: flex; align-items: baseline; gap: 4px;
+}
+.metric-value em { font-style: normal; font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.metric-value.amber { color: var(--accent); }
+.metric-value.green { color: var(--signal); }
+.metric-value.small { font-size: 15px; }
+.metric-sub { font-size: 10px; color: var(--text-muted); min-height: 13px; }
+
+.note-strip {
+  display: flex; gap: 9px; align-items: flex-start;
+  margin-top: 12px; padding: 11px 13px;
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 10.5px; color: var(--text-muted); line-height: 1.5;
+}
+.note-icon { color: var(--accent); }
+
+/* processor / specs strip */
+
+.specs-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.spec {
+  display: flex; flex-direction: column; gap: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+.spec-label { font-size: 11px; color: var(--text-muted); }
+.spec-value { font-size: 13.5px; font-weight: 700; line-height: 1.35; }
+.spec-sub { font-size: 10px; color: var(--text-muted); min-height: 13px; }
+
+/* Grid and flex children default to min-width:auto, which lets a long value —
+   the CPU cluster summary, a verbose usb_type string — push its column wider
+   than the track and overflow the card. */
+.card.power-station, .card.telemetry, .card.specs-card { min-width: 0; }
+.fact-box, .metric, .spec { min-width: 0; }
+.fact-value, .metric-value, .metric-sub, .spec-value, .spec-sub { overflow-wrap: anywhere; }
+
+@media (max-width: 1180px) {
+  .power-grid { grid-template-columns: 1fr; }
+  .telemetry-grid { grid-template-columns: repeat(2, 1fr); }
+  .specs-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+.mirror-status { font-size: 11.5px; margin: 8px 0 0; line-height: 1.5; white-space: pre-wrap; }
+.mirror-status.err { color: var(--danger); }
+.mirror-status.ok { color: var(--signal); }
+.mirror-status.busy { color: var(--text-muted); }
 
 .center-card {
   display: flex; flex-direction: column; align-items: center; justify-content: center;

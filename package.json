@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
     "dist": "electron-builder"
   },
   "author": "",
@@ -20,6 +21,7 @@
   "build": {
     "appId": "com.example.androidcompanion",
     "productName": "Companion",
+    "publish": false,
     "win": { "target": "nsis", "icon": "smartphone.ico" },
     "mac": { "target": "dmg" },
     "linux": { "target": "AppImage", "icon": "smartphone.png" }
