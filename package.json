@@ -21,6 +21,7 @@
   "build": {
     "appId": "com.example.androidcompanion",
     "productName": "Companion",
+    "publish": false,
     "win": { "target": "nsis", "icon": "smartphone.ico" },
     "mac": { "target": "dmg" },
     "linux": { "target": "AppImage", "icon": "smartphone.png" }
