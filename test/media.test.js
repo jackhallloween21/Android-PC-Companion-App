@@ -148,3 +148,35 @@ test('a session block introduced only by its component name is still found', () 
   assert.strictEqual(track.package, 'com.deezer.android.app');
   assert.strictEqual(track.title, 'Track');
 });
+
+// ---------------------------------------------------------------------------
+// Playback speed. position= is a snapshot, so the renderer advances it locally
+// between polls; that needs the session's own speed, and a paused track must
+// report 0 so nothing creeps forward.
+// ---------------------------------------------------------------------------
+
+test('playback speed is carried through so elapsed time can be advanced locally', () => {
+  const [chrome, spotify] = parseAllSessions(DUMP);
+  assert.strictEqual(spotify.speed, 1);
+  assert.strictEqual(chrome.speed, 0, 'a paused session reports speed=0.0');
+});
+
+test('a session without a speed field reports null, not an assumed 1x', () => {
+  const track = parseSession({
+    pkg: 'com.example.player',
+    text: 'package=com.example.player\nstate=PlaybackState {state=3, position=5000, actions=0}',
+  });
+  assert.strictEqual(track.speed, null);
+});
+
+test('no duration means no progress fraction — the bar has nothing to draw', () => {
+  const track = parseSession({
+    pkg: 'com.example.player',
+    text: 'package=com.example.player\nstate=PlaybackState {state=3, position=28000, speed=1.0, actions=0}\nmetadata: size=3, description=40 Pra, Imran Khan, Unforgettable',
+  });
+  assert.strictEqual(track.positionMs, 28000);
+  assert.strictEqual(track.durationMs, null);
+  assert.strictEqual(track.duration, null);
+  assert.strictEqual(track.progress, null);
+  assert.strictEqual(track.position, '0:28');
+});
