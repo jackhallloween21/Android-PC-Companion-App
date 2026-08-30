@@ -1,10 +1,87 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
+const {
+  POWER_SCRIPT,
+  parsePowerDump,
+  parseDumpsysBattery,
+  buildPowerReport,
+  parseCpuTopology,
+  formatClusters,
+} = require('./src/power');
+const {
+  buildMirrorArgs: buildScrcpyMirrorArgs,
+  hasAudio,
+  hasAudioSource,
+  hasCameraSource,
+} = require('./src/scrcpy');
+const {
+  splitHostPort,
+  isPaired,
+  isConnected,
+  pickConnectTarget,
+  connectCandidates,
+} = require('./src/wireless');
+const {
+  DEFAULTS: DOCK_DEFAULTS,
+  ZOOM_MIN,
+  ZOOM_MAX,
+  stepZoom,
+  parseWmSize,
+  parseRotation,
+  computeDockLayout,
+  barBelow,
+  buildWindowArgs,
+  supportsPlacement,
+} = require('./src/dock');
+const {
+  MOVE_SCRIPT,
+  RECT_SCRIPT,
+  mirrorWindowTitle,
+  moveWindowArgs,
+  findWindowEnv,
+  moveWindowEnv,
+  canMoveWindows,
+  classifyMoveResult,
+  parseRectOutput,
+} = require('./src/winmove');
+const {
+  keyEventArgs,
+  statusBarArgs,
+  describeStatusBarFailure,
+} = require('./src/keys');
+const {
+  TORCH_TILES,
+  parseCameraList,
+  buildCameraArgs,
+  supportsMic,
+  supportsV4l2,
+  parseEncoderLimits,
+  annotateSizes,
+  describeCameraFailure,
+  torchArgs,
+  parseQsTiles,
+  hasTorchTile,
+  parseTorchStatus,
+  describeTorchFailure,
+  describeBridge,
+} = require('./src/camera');
+const {
+  parseNowPlaying,
+  parseAllSessions,
+  describeTrack,
+} = require('./src/media');
 
 const tools = { adb: 'adb', fastboot: 'fastboot', scrcpy: 'scrcpy' };
+
+// scrcpy's CLI changed shape across majors, so every launch path has to know
+// which generation it is talking to. `help` holds the raw `--help` text, which
+// is what we actually feature-detect against — option names have been renamed
+// more than once (--bit-rate -> --video-bit-rate in 2.0), and guessing them
+// from the version number turns a cosmetic rename into a fatal launch error.
+const scrcpyInfo = { version: null, major: 0, minor: 0, help: null };
 
 // ---------------------------------------------------------------------------
 // Window
@@ -37,9 +114,64 @@ function createWindow() {
   return win;
 }
 
-async function checkOnPath(bin) {
-  return new Promise((resolve) => execFile(bin, ['version'], (err) => resolve(!err)));
+// `adb version` works but `scrcpy version` does not — scrcpy only accepts
+// `--version`, so probing every binary with the same argument made the scrcpy
+// check always fail and pushed us down the download path (and then silently
+// left tools.scrcpy pointing at a missing file).
+const VERSION_ARGS = { adb: ['version'], fastboot: ['--version'], scrcpy: ['--version'] };
+
+function probeVersion(bin, args) {
+  return new Promise((resolve) => {
+    execFile(bin, args, { timeout: 10000, windowsHide: true }, (err, stdout, stderr) => {
+      const text = `${stdout || ''}\n${stderr || ''}`.trim();
+      // Some builds print the banner and still exit non-zero; accept any output
+      // that actually names the tool.
+      if (err && !text) return resolve(null);
+      resolve(text || null);
+    });
+  });
 }
+
+async function checkOnPath(name) {
+  return (await probeVersion(name, VERSION_ARGS[name] || ['--version'])) !== null;
+}
+
+/**
+ * Absolute path of a binary that lives on PATH.
+ *
+ * Needed because scrcpy shells out to adb itself, and Windows' CreateProcess
+ * searches the *application directory and the cwd before PATH*. With cwd set to
+ * scrcpy's own folder, a bare "adb" resolved by scrcpy can land on a different
+ * (or unrunnable) file than the one we use — which surfaces as
+ * "CreateProcessW() error 5 / Could not start adb server". Handing scrcpy an
+ * absolute ADB removes the lookup entirely.
+ */
+function resolveOnPath(name) {
+  const finder = process.platform === 'win32' ? 'where' : 'which';
+  return new Promise((resolve) => {
+    execFile(finder, [name], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(null);
+      // `where` can print several hits; the first is the one that would be used.
+      const first = String(stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
+      resolve(first && path.isAbsolute(first) && fs.existsSync(first) ? first : null);
+    });
+  });
+}
+
+async function probeScrcpyVersion() {
+  const text = await probeVersion(tools.scrcpy, ['--version']);
+  scrcpyInfo.version = text ? text.split('\n')[0].trim() : null;
+  const m = text && text.match(/(\d+)\.(\d+)/);
+  scrcpyInfo.major = m ? Number(m[1]) : 0;
+  scrcpyInfo.minor = m ? Number(m[2]) : 0;
+  // `--help` is the authoritative list of what this build accepts.
+  scrcpyInfo.help = scrcpyInfo.version ? await probeVersion(tools.scrcpy, ['--help']) : null;
+  return scrcpyInfo;
+}
+
+// Note: there is no local scrcpySupports() helper any more. Every flag decision
+// now lives in the src/* module that builds the argv and takes `help` as an
+// argument, which is what makes those builders unit-testable.
 
 async function initTools(win) {
   const send = (payload) => win.webContents.send('setup:progress', payload);
@@ -55,6 +187,11 @@ async function initTools(win) {
       send({ step: 'adb', status: 'error', message: err.message });
       return;
     }
+  } else {
+    // Pin the PATH hit to an absolute path now, so scrcpy is handed the very
+    // same adb rather than repeating the lookup with a different cwd.
+    tools.adb = (await resolveOnPath('adb')) || tools.adb;
+    tools.fastboot = (await resolveOnPath('fastboot')) || tools.fastboot;
   }
   send({ step: 'adb', status: 'done' });
 
@@ -68,8 +205,19 @@ async function initTools(win) {
       send({ step: 'all', status: 'ready' });
       return;
     }
+  } else {
+    tools.scrcpy = (await resolveOnPath('scrcpy')) || tools.scrcpy;
   }
-  send({ step: 'scrcpy', status: 'done' });
+
+  // Verify the binary we settled on actually runs before declaring success,
+  // so a broken extraction surfaces here instead of at the first mirror attempt.
+  await probeScrcpyVersion();
+  if (!scrcpyInfo.version) {
+    send({ step: 'scrcpy', status: 'error', message: `scrcpy at ${tools.scrcpy} did not respond to --version` });
+    send({ step: 'all', status: 'ready' });
+    return;
+  }
+  send({ step: 'scrcpy', status: 'done', message: scrcpyInfo.version });
   send({ step: 'all', status: 'ready' });
 }
 
@@ -175,6 +323,81 @@ ipcMain.handle('device:battery', async (_e, serial) => {
   return info;
 });
 
+// ---------------------------------------------------------------------------
+// Power telemetry & SoC details
+//
+// Parsing/normalisation lives in src/power.js so it can be unit-tested against
+// captured device output without booting Electron.
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('device:power', async (_e, serial) => {
+  // dumpsys is the reliable floor; the sysfs sweep is the detail layer.
+  let dump = {};
+  try {
+    dump = parseDumpsysBattery(await adb(['-s', serial, 'shell', 'dumpsys', 'battery']));
+  } catch { /* keep going — sysfs may still work */ }
+
+  let supplies = {};
+  let zones = [];
+  try {
+    ({ supplies, zones } = parsePowerDump(await adb(['-s', serial, 'shell', POWER_SCRIPT])));
+  } catch { /* power-supply nodes unreadable on this device */ }
+
+  if (!Object.keys(dump).length && !Object.keys(supplies).length) {
+    throw new Error('Neither "dumpsys battery" nor /sys/class/power_supply could be read.');
+  }
+
+  return buildPowerReport({ dump, supplies, zones });
+});
+
+ipcMain.handle('device:soc', async (_e, serial) => {
+  const getprop = async (key) => {
+    try { return (await adb(['-s', serial, 'shell', 'getprop', key])).trim() || null; }
+    catch { return null; }
+  };
+
+  const [socModel, socMfr, platform, hardware, abi, ddrType, ufsProp] = await Promise.all([
+    getprop('ro.soc.model'),
+    getprop('ro.soc.manufacturer'),
+    getprop('ro.board.platform'),
+    getprop('ro.hardware'),
+    getprop('ro.product.cpu.abi'),
+    getprop('ro.boot.ddr_type'),
+    getprop('ro.boot.hardware.ufs'),
+  ]);
+
+  let topology = { coreCount: null, clusters: [], maxGhz: null };
+  try {
+    const [cpuinfo, freqs] = await Promise.all([
+      adb(['-s', serial, 'shell', 'cat', '/proc/cpuinfo']),
+      adb(['-s', serial, 'shell', 'grep . /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq 2>/dev/null']),
+    ]);
+    topology = parseCpuTopology(cpuinfo, freqs);
+  } catch { /* cpufreq is restricted on some builds */ }
+
+  // Flash chip identity, when the block device exposes it.
+  let storageModel = null;
+  try {
+    const out = await adb(['-s', serial, 'shell', 'cat /sys/block/sd*/device/model 2>/dev/null']);
+    storageModel = out.split('\n').map((l) => l.trim()).find(Boolean) || null;
+  } catch { /* not exposed */ }
+
+  return {
+    socName: [socMfr, socModel].filter(Boolean).join(' ') || platform || hardware || null,
+    socModel,
+    socManufacturer: socMfr,
+    platform,
+    hardware,
+    abi,
+    coreCount: topology.coreCount,
+    clusters: topology.clusters,
+    clusterSummary: formatClusters(topology.clusters),
+    maxGhz: topology.maxGhz,
+    ddrType: ddrType || null,
+    storageModel: storageModel || ufsProp || null,
+  };
+});
+
 ipcMain.handle('device:hardware', async (_e, serial) => {
   const result = {};
   try {
@@ -248,6 +471,20 @@ ipcMain.handle('control:volumeUp', (_e, serial) => adb(['-s', serial, 'shell', '
 ipcMain.handle('control:volumeDown', (_e, serial) => adb(['-s', serial, 'shell', 'input', 'keyevent', '25']));
 ipcMain.handle('control:powerLongPress', (_e, serial) => adb(['-s', serial, 'shell', 'input', 'keyevent', '--longpress', '26']));
 
+// Navigation keys (Back / Home / Recents) and the notification shade. The
+// keycodes and the `cmd statusbar` verbs live in src/keys.js so they can be
+// tested — a wrong keycode is silent, since `input keyevent` dispatches any
+// valid code without complaint.
+ipcMain.handle('control:navKey', (_e, { serial, action }) => adb(keyEventArgs(serial, action)));
+
+ipcMain.handle('control:statusBar', async (_e, { serial, panel }) => {
+  try {
+    return await adb(statusBarArgs(serial, panel));
+  } catch (err) {
+    throw new Error(describeStatusBarFailure(err.message));
+  }
+});
+
 ipcMain.handle('control:rotate', async (_e, { serial, rotation }) => {
   // rotation: 0=0°, 1=90°, 2=180°, 3=270°. Disables auto-rotate first so the
   // requested orientation actually sticks.
@@ -316,11 +553,73 @@ ipcMain.handle('console:run', async (_e, { serial, command }) => {
 
 // ---------------------------------------------------------------------------
 // Wireless pairing
+//
+// Pairing and connecting are two separate steps on two different ports — see
+// src/wireless.js for the details and for the output classification, since both
+// commands report failure on stdout and frequently still exit 0.
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('wireless:pair', (_e, { hostPort, code }) => adb(['pair', hostPort, code]));
-ipcMain.handle('wireless:connect', (_e, hostPort) => adb(['connect', hostPort]));
-ipcMain.handle('wireless:enableTcpip', (_e, { serial, port }) => adb(['-s', serial, 'tcpip', String(port || 5555)]));
+/** Runs an adb subcommand that signals failure through its output, not its exit code. */
+async function adbText(args) {
+  try {
+    return (await adb(args)).trim();
+  } catch (err) {
+    return String(err.message || '').trim();
+  }
+}
+
+async function adbConnect(target) {
+  const out = await adbText(['connect', target]);
+  if (isConnected(out)) return out || `connected to ${target}`;
+  throw new Error(out || `Could not connect to ${target}.`);
+}
+
+ipcMain.handle('wireless:pair', async (_e, { hostPort, code, connectPort }) => {
+  const paired = await adbText(['pair', hostPort, code]);
+  if (!isPaired(paired)) {
+    throw new Error(paired
+      || 'adb pair returned no output. Check the host:port and that the pairing dialog is still open.');
+  }
+
+  const { host } = splitHostPort(hostPort);
+  // mDNS discovery is unreliable on some Windows setups, so it is best-effort
+  // and only used when the user did not supply the connect port.
+  const targets = connectCandidates(host, connectPort, await adbText(['mdns', 'services']));
+
+  const attempts = [];
+  for (const target of targets) {
+    try {
+      return { paired, connected: true, target, message: await adbConnect(target) };
+    } catch (err) {
+      attempts.push(`${target}: ${err.message}`);
+    }
+  }
+
+  // Paired but not reachable — reported as a partial success so the user knows
+  // not to redo the pairing (the code is single-use), only to supply the port.
+  return {
+    paired,
+    connected: false,
+    target: null,
+    message: attempts.length
+      ? `Paired, but could not connect.\n${attempts.join('\n')}`
+      : 'Paired. Now enter the port from the "IP address & port" line on the phone\'s '
+        + 'Wireless debugging screen — not the one from the pairing dialog.',
+  };
+});
+
+ipcMain.handle('wireless:connect', async (_e, hostPort) => {
+  const { host, port } = splitHostPort(hostPort);
+  return adbConnect(`${host}:${port || 5555}`);
+});
+
+ipcMain.handle('wireless:discover', async () => pickConnectTarget(await adbText(['mdns', 'services'])));
+
+ipcMain.handle('wireless:enableTcpip', async (_e, { serial, port }) => {
+  const out = await adbText(['-s', serial, 'tcpip', String(port || 5555)]);
+  if (/error|failed/i.test(out)) throw new Error(out);
+  return out;
+});
 
 // ---------------------------------------------------------------------------
 // Files
@@ -472,37 +771,458 @@ ipcMain.handle('backup:run', async (event, { serial, categories, destDir, includ
 });
 
 // ---------------------------------------------------------------------------
-// Mirror (configurable stream parameters)
+// scrcpy process launcher
+//
+// Previously every scrcpy invocation was `spawn(..., { detached: true,
+// stdio: 'ignore' })` with no error handling, so any failure — missing binary,
+// unauthorized device, version-mismatched adb server, encoder error — produced
+// exactly nothing in the UI. Now stderr is captured and an early exit is
+// reported back to the renderer.
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('scrcpy:launch', (_e, { serial, maxSize, bitrate, maxFps, stayAwake, turnScreenOff, showTouches, forwardAudio }) => {
-  const args = ['-s', serial, '--window-title', `Mirror — ${serial}`];
-  if (maxSize) args.push(`--max-size=${maxSize}`);
-  if (bitrate) args.push(`--video-bitrate=${bitrate}M`);
-  if (maxFps) args.push(`--max-fps=${maxFps}`);
-  if (stayAwake) args.push('--stay-awake');
-  if (turnScreenOff) args.push('--turn-screen-off');
-  if (showTouches) args.push('--show-touches');
-  if (!forwardAudio) args.push('--no-audio');
+function scrcpyEnv() {
+  const env = { ...process.env };
+  // scrcpy shells out to adb. If it picks a different adb than we use, the two
+  // servers fight (one kills the other) and the mirror dies on connect. Point
+  // scrcpy at the exact same binary.
+  if (path.isAbsolute(tools.adb)) env.ADB = tools.adb;
 
-  const child = spawn(tools.scrcpy, args, { detached: true, stdio: 'ignore' });
-  child.unref();
+  // For the portable/extracted builds, scrcpy-server sits next to the exe.
+  if (path.isAbsolute(tools.scrcpy)) {
+    const serverPath = path.join(path.dirname(tools.scrcpy), 'scrcpy-server');
+    if (fs.existsSync(serverPath)) env.SCRCPY_SERVER_PATH = serverPath;
+  }
+  return env;
+}
+
+async function assertDeviceReady(serial) {
+  if (!serial) throw new Error('No device selected.');
+  let state;
+  try {
+    state = (await adb(['-s', serial, 'get-state'])).trim();
+  } catch (err) {
+    throw new Error(`Device ${serial} is not reachable over adb: ${err.message}`);
+  }
+  if (state !== 'device') {
+    throw new Error(
+      state === 'unauthorized'
+        ? `Device ${serial} has not authorized this computer — accept the "Allow USB debugging" prompt on the phone.`
+        : `Device ${serial} is in "${state}" state, not ready for mirroring.`
+    );
+  }
+}
+
+/**
+ * Spawns scrcpy and waits briefly to see whether it survives startup.
+ * Resolves once the window is up (or the process is still alive); rejects with
+ * scrcpy's own stderr if it bails out immediately.
+ *
+ * `onSpawn`/`onExit` let the caller follow the process past that grace window —
+ * the docked control bar uses them to tie its own lifetime to the video window.
+ */
+function spawnScrcpy(args, { graceMs = 2500, onSpawn, onExit } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!scrcpyInfo.version) {
+      reject(new Error('scrcpy is not available. Re-run tool setup from "Binaries & Drivers".'));
+      return;
+    }
+
+    let child;
+    try {
+      child = spawn(tools.scrcpy, args, {
+        cwd: path.isAbsolute(tools.scrcpy) ? path.dirname(tools.scrcpy) : undefined,
+        env: scrcpyEnv(),
+        windowsHide: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      reject(new Error(`Could not start scrcpy (${tools.scrcpy}): ${err.message}`));
+      return;
+    }
+
+    if (onSpawn) onSpawn(child);
+
+    let log = '';
+    const collect = (buf) => { log = (log + buf.toString()).slice(-4000); };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+
+    child.on('error', (err) => finish(reject, new Error(`Could not start scrcpy: ${err.message}`)));
+    child.on('exit', (code) => {
+      if (onExit) onExit(code);
+      if (code === 0) return finish(resolve, { ok: true, log: log.trim() });
+      const detail = log.trim().split('\n').filter(Boolean).slice(-6).join('\n');
+      // Options are feature-detected from `scrcpy --help`, so this should not
+      // happen; if it does, the probed help text was stale or truncated.
+      const hint = /unknown option|unrecognized option/i.test(log)
+        ? '\n\nThis build rejected one of the options we passed. Re-run detection from '
+          + '"Binaries & Drivers" to re-read its option list.'
+        : '';
+      finish(reject, new Error((detail || `scrcpy exited with code ${code}`) + hint));
+    });
+
+    // Still running after the grace window means the mirror window opened.
+    const timer = setTimeout(() => finish(resolve, { ok: true, pid: child.pid }), graceMs);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Mirror (configurable stream parameters), optionally with a docked control bar
+//
+// scrcpy draws into its own SDL window, so the controls cannot literally live
+// inside the app's Mirror view without native window reparenting. Docking gets
+// the same result: scrcpy is launched borderless at a rectangle we choose, and a
+// frameless always-on-top strip is placed directly underneath it. Borderless
+// also means the video window has no title bar to drag, so the pair cannot drift
+// apart mid-session.
+// ---------------------------------------------------------------------------
+
+function buildMirrorArgs(serial, opts) {
+  return buildScrcpyMirrorArgs(serial, opts, scrcpyInfo);
+}
+
+/** Live docked session: the scrcpy process, its control bar, and the layout. */
+let mirrorSession = null;
+
+/** Device resolution and rotation, for sizing the video window to the stream. */
+async function readDisplayGeometry(serial) {
+  const size = parseWmSize(await adb(['-s', serial, 'shell', 'wm', 'size']).catch(() => ''));
+  const rotation = parseRotation(
+    await adb(['-s', serial, 'shell', 'dumpsys', 'window', 'displays']).catch(() => '')
+  );
+  return { size, rotation };
+}
+
+function controlBarWindow(bar, serial) {
+  const win = new BrowserWindow({
+    x: bar.x,
+    y: bar.y,
+    width: bar.width,
+    height: bar.height,
+    frame: false,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    show: false,
+    // Matches the main window's treatment: the strip's own rounded border is
+    // drawn in CSS, so the frame behind it has to be transparent or the corners
+    // show up as dark squares.
+    transparent: process.platform !== 'linux',
+    backgroundColor: process.platform === 'linux' ? '#0d1220' : '#00000000',
+    icon: path.join(__dirname, 'smartphone.png'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  // Above scrcpy's own window, which SDL may itself raise on focus.
+  win.setAlwaysOnTop(true, 'screen-saver');
+  win.once('ready-to-show', () => win.showInactive());
+  win.loadFile(path.join(__dirname, 'renderer', 'controlbar.html'), {
+    query: { serial },
+  });
+  return win;
+}
+
+function closeMirrorSession({ killScrcpy = false } = {}) {
+  const session = mirrorSession;
+  mirrorSession = null;
+  if (!session) return;
+  if (session.bar && !session.bar.isDestroyed()) session.bar.destroy();
+  if (killScrcpy && session.child && session.child.exitCode === null) {
+    try { session.child.kill(); } catch { /* already gone */ }
+  }
+}
+
+function clampZoom(zoom) {
+  const n = Number(zoom);
+  if (!Number.isFinite(n)) return ZOOM_MAX;
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, n));
+}
+
+/**
+ * Runs one of the PowerShell window helpers against the live session.
+ * Resolves to the raw output text, or null when it could not be run at all.
+ */
+function runWindowScript(script, env) {
+  if (!canMoveWindows()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = execFile(
+        'powershell.exe',
+        moveWindowArgs(script),
+        { timeout: 8000, windowsHide: true, env: { ...process.env, ...env } },
+        // A non-zero exit is expected for NOTFOUND, so the text is what matters.
+        (_err, stdout, stderr) => resolve(`${stdout || ''}\n${stderr || ''}`)
+      );
+    } catch {
+      resolve(null);
+      return;
+    }
+    child.on('error', () => resolve(null));
+  });
+}
+
+/** How the live scrcpy window is identified: by pid first, title as a backstop. */
+function windowTarget(session) {
+  return {
+    pid: session.child && session.child.exitCode === null ? session.child.pid : undefined,
+    title: mirrorWindowTitle(session.serial),
+  };
+}
+
+/**
+ * Moves scrcpy's window in place via user32!MoveWindow, driven by the
+ * PowerShell that ships with Windows so this costs no npm dependency.
+ * Resolves to 'ok' | 'notfound' | 'failed' | 'unsupported'.
+ *
+ * The alternative — relaunching scrcpy at the new size — restarts the stream,
+ * which is a visible black flash on every click of a zoom button.
+ */
+async function moveScrcpyWindow(session, rect) {
+  if (!canMoveWindows()) return 'unsupported';
+  const text = await runWindowScript(MOVE_SCRIPT, moveWindowEnv(windowTarget(session), rect));
+  return text === null ? 'failed' : classifyMoveResult(text);
+}
+
+/** Where the video window actually is now — it may have been dragged since. */
+async function readScrcpyWindowRect(session) {
+  if (!canMoveWindows()) return null;
+  const text = await runWindowScript(RECT_SCRIPT, findWindowEnv(windowTarget(session)));
+  return text === null ? null : parseRectOutput(text);
+}
+
+/** Puts the strip at `bar` and re-asserts that it sits above the video. */
+function placeBar(session, bar) {
+  if (!session.bar || session.bar.isDestroyed()) return false;
+  session.bar.setBounds({
+    x: Math.round(bar.x), y: Math.round(bar.y),
+    width: Math.round(bar.width), height: Math.round(bar.height),
+  });
+  session.bar.setAlwaysOnTop(true, 'screen-saver');
   return true;
+}
+
+/** Re-lays out a live docked session at `zoom`, moving both windows. */
+async function applyMirrorZoom(zoom) {
+  const session = mirrorSession;
+  if (!session) throw new Error('Nothing is being mirrored.');
+
+  const next = clampZoom(zoom);
+  const workArea = screen.getPrimaryDisplay().workArea;
+  const layout = computeDockLayout({ ...session.geometry, zoom: next, workArea });
+
+  const moved = await moveScrcpyWindow(session, layout.video);
+
+  // The window could not be found or moved: fall back to relaunching at the new
+  // geometry, which always works but restarts the stream.
+  if (moved !== 'ok') {
+    const args = [
+      ...session.args,
+      ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: session.borderless }),
+    ];
+    if (session.child && session.child.exitCode === null) {
+      // Its exit handler would otherwise tear the bar down mid-resize.
+      session.child.removeAllListeners('exit');
+      try { session.child.kill(); } catch { /* already gone */ }
+    }
+    await spawnScrcpy(args, {
+      graceMs: 1800,
+      onSpawn: (child) => { session.child = child; },
+      onExit: () => { if (mirrorSession === session) closeMirrorSession(); },
+    });
+  }
+
+  session.zoom = next;
+  session.layout = layout;
+  placeBar(session, layout.bar);
+
+  return { zoom: next, relaunched: moved !== 'ok', reason: moved, layout };
+}
+
+ipcMain.handle('scrcpy:launch', async (_e, { serial, dock, ...opts }) => {
+  await assertDeviceReady(serial);
+  closeMirrorSession({ killScrcpy: true });
+
+  const args = buildMirrorArgs(serial, opts);
+
+  // A build that cannot be told where to open its window can still be mirrored;
+  // it just cannot be docked, and saying so beats silently ignoring the setting.
+  if (!dock || !supportsPlacement(scrcpyInfo.help)) {
+    const result = await spawnScrcpy(args);
+    return {
+      ...result,
+      docked: false,
+      note: dock && !supportsPlacement(scrcpyInfo.help)
+        ? `This scrcpy build (${scrcpyInfo.version || 'unknown'}) has no --window-x/--window-y, `
+          + 'so the controls stay in the app window.'
+        : undefined,
+    };
+  }
+
+  const { size, rotation } = await readDisplayGeometry(serial);
+  // Kept so a later resize can recompute the layout without re-probing the
+  // device or reopening the window.
+  const geometry = {
+    deviceWidth: size && size.width,
+    deviceHeight: size && size.height,
+    rotation,
+    maxSize: opts.maxSize,
+  };
+  const zoom = clampZoom(opts.zoom);
+  const layout = computeDockLayout({
+    ...geometry,
+    zoom,
+    workArea: screen.getPrimaryDisplay().workArea,
+  });
+
+  const dockArgs = [
+    ...args,
+    ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: !!opts.borderless }),
+  ];
+  const session = {
+    child: null, bar: null, layout, serial, geometry, zoom, opts, args,
+    borderless: !!opts.borderless,
+  };
+
+  const result = await spawnScrcpy(dockArgs, {
+    onSpawn: (child) => { session.child = child; },
+    // scrcpy closing (its own X, or Ctrl+C, or the device going away) must take
+    // the bar with it, otherwise a dead strip is left floating on top of
+    // everything with no video under it.
+    onExit: () => { if (mirrorSession === session) closeMirrorSession(); },
+  });
+
+  // The grace timer resolving means the window is up; if scrcpy exited cleanly
+  // in that window there is nothing to dock to.
+  if (!session.child || session.child.exitCode !== null) return { ...result, docked: false };
+
+  session.bar = controlBarWindow(layout.bar, serial);
+  session.bar.on('closed', () => {
+    // Closing the strip is the user's "stop mirroring" gesture.
+    if (mirrorSession === session) closeMirrorSession({ killScrcpy: true });
+  });
+  mirrorSession = session;
+
+  return { ...result, docked: true, layout, zoom };
+});
+
+ipcMain.handle('scrcpy:dockState', () => ({
+  docked: !!mirrorSession,
+  serial: mirrorSession ? mirrorSession.serial : null,
+  zoom: mirrorSession ? mirrorSession.zoom : null,
+  canResizeInPlace: canMoveWindows(),
+  zoomRange: { min: ZOOM_MIN, max: ZOOM_MAX },
+}));
+
+ipcMain.handle('scrcpy:setZoom', (_e, zoom) => applyMirrorZoom(zoom));
+
+ipcMain.handle('scrcpy:nudgeZoom', (_e, direction) => {
+  if (!mirrorSession) throw new Error('Nothing is being mirrored.');
+  return applyMirrorZoom(stepZoom(mirrorSession.zoom, direction));
+});
+
+/**
+ * Snap the strip back under the video.
+ *
+ * The video window keeps its title bar now, so it can be dragged and resized
+ * freely — which means the launch-time layout is only a guess about where it is.
+ * Ask Windows where it actually is and lay the strip out under that; only if the
+ * window cannot be read do we fall back to the remembered rectangle.
+ */
+ipcMain.handle('scrcpy:redock', async () => {
+  const session = mirrorSession;
+  if (!session || !session.bar || session.bar.isDestroyed()) return false;
+  const live = await readScrcpyWindowRect(session);
+  if (!live) return placeBar(session, session.layout.bar);
+  session.layout = { ...session.layout, video: live };
+  return placeBar(session, barBelow(live, screen.getPrimaryDisplay().workArea));
+});
+
+ipcMain.handle('scrcpy:stop', () => {
+  const wasOpen = !!mirrorSession;
+  closeMirrorSession({ killScrcpy: true });
+  return wasOpen;
+});
+
+app.on('before-quit', () => closeMirrorSession({ killScrcpy: true }));
+
+ipcMain.handle('scrcpy:info', async () => {
+  if (!scrcpyInfo.version) await probeScrcpyVersion();
+  return {
+    ...scrcpyInfo,
+    path: tools.scrcpy,
+    adbPath: tools.adb,
+    canDock: supportsPlacement(scrcpyInfo.help),
+    barHeight: DOCK_DEFAULTS.barHeight,
+  };
 });
 
 // ---------------------------------------------------------------------------
 // Audio forwarding + media controls
 // ---------------------------------------------------------------------------
 
-const AUDIO_SOURCE = 'output'; // some scrcpy versions use "playback" instead — see README
+// scrcpy 2.0 added audio; the selectable --audio-source landed in 2.2, where
+// "output" means the device's own playback stream.
 let audioProcess = null;
 
-ipcMain.handle('audio:start', (_e, serial) => {
+ipcMain.handle('audio:start', async (_e, serial) => {
   if (audioProcess) return true;
-  audioProcess = spawn(tools.scrcpy, ['-s', serial, '--no-video', '--no-control', `--audio-source=${AUDIO_SOURCE}`], { stdio: 'ignore' });
-  audioProcess.on('exit', () => { audioProcess = null; });
-  audioProcess.on('error', () => { audioProcess = null; });
-  return true;
+  await assertDeviceReady(serial);
+  const hasAudioSupport = hasAudio(scrcpyInfo);
+  if (!hasAudioSupport) {
+    throw new Error(`Audio forwarding needs scrcpy 2.0 or newer (found ${scrcpyInfo.version || 'none'}).`);
+  }
+
+  const args = ['-s', serial, '--no-video', '--no-control'];
+  if (hasAudioSource(scrcpyInfo)) args.push('--audio-source=output');
+
+  const child = spawn(tools.scrcpy, args, {
+    cwd: path.isAbsolute(tools.scrcpy) ? path.dirname(tools.scrcpy) : undefined,
+    env: scrcpyEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let log = '';
+  const collect = (b) => { log = (log + b.toString()).slice(-2000); };
+  child.stdout.on('data', collect);
+  child.stderr.on('data', collect);
+  audioProcess = child;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => { if (!settled) { settled = true; resolve(true); } }, 2500);
+    child.on('exit', (code) => {
+      audioProcess = null;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) return resolve(true);
+      reject(new Error(log.trim().split('\n').filter(Boolean).slice(-4).join('\n') || `scrcpy audio exited with code ${code}`));
+    });
+    child.on('error', (err) => {
+      audioProcess = null;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`Could not start audio forwarding: ${err.message}`));
+    });
+  });
 });
 
 ipcMain.handle('audio:stop', () => {
@@ -522,21 +1242,261 @@ ipcMain.handle('media:key', (_e, { serial, action }) => {
 
 ipcMain.handle('media:nowPlaying', async (_e, serial) => {
   const out = await adb(['-s', serial, 'shell', 'dumpsys', 'media_session']);
-  const descMatch = out.match(/description=([^,\n]+)/);
-  return { description: descMatch ? descMatch[1].trim() : null };
+  const track = parseNowPlaying(out);
+  return {
+    track,
+    // When the snapshot was taken. The renderer advances `position` from this so
+    // the elapsed time moves between polls instead of jumping every few seconds.
+    readAt: Date.now(),
+    // Kept so older callers (and the one-line status) keep working.
+    description: describeTrack(track),
+    sessions: parseAllSessions(out).length,
+  };
 });
 
 // ---------------------------------------------------------------------------
-// Camera preview
+// Camera
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('webcam:launchPreview', (_e, { serial, facing }) => {
-  const args = ['-s', serial, '--video-source=camera', '--no-audio', '--window-title', `Camera — ${serial}`];
-  if (facing) args.push(`--camera-facing=${facing}`);
-  const child = spawn(tools.scrcpy, args, { detached: true, stdio: 'ignore' });
-  child.unref();
+// One camera stream at a time: two scrcpy processes reading the same sensor is
+// refused by Android anyway, and a second window would be indistinguishable.
+let cameraSession = null;
+
+/** Runs scrcpy for its text output, with the same cwd/env a stream would get. */
+function runScrcpyText(args) {
+  return new Promise((resolve) => {
+    execFile(tools.scrcpy, args, {
+      cwd: path.isAbsolute(tools.scrcpy) ? path.dirname(tools.scrcpy) : undefined,
+      env: scrcpyEnv(),
+      timeout: 20000,
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      // Listing exits non-zero on some builds after printing the list, so the
+      // text is what matters, not the exit code.
+      resolve(`${stdout || ''}\n${stderr || ''}`);
+    });
+  });
+}
+
+function assertCameraSupport() {
+  if (!hasCameraSource(scrcpyInfo)) {
+    throw new Error(`Camera streaming needs scrcpy 2.2 or newer (found ${scrcpyInfo.version || 'none'}).`);
+  }
+}
+
+/**
+ * The sensors this phone will actually hand over, with the sizes each one
+ * offers. Asked of scrcpy rather than inferred: a resolution the camera2 API
+ * does not list makes scrcpy exit, so the picker must be built from this.
+ */
+ipcMain.handle('camera:list', async (_e, serial) => {
+  await assertDeviceReady(serial);
+  assertCameraSupport();
+  const out = await runScrcpyText(['-s', serial, '--list-camera-sizes']);
+  const cameras = parseCameraList(out);
+  if (!cameras.length) {
+    throw new Error(cleanScrcpyLog(out) || 'scrcpy listed no cameras for this device.');
+  }
+
+  // The sensor list is only half the answer: the frames still have to go through
+  // the phone's hardware H.264 encoder, which has its own maximum and rejects
+  // anything larger with a MediaCodec stack trace. Read that maximum off the
+  // device so oversized modes can be marked instead of failing at launch.
+  const limits = await readEncoderLimits(serial);
+  for (const cam of cameras) {
+    cam.sizes = annotateSizes(cam.sizes, limits);
+    cam.highSpeedSizes = annotateSizes(cam.highSpeedSizes, limits);
+  }
+
+  return {
+    cameras,
+    limits,
+    mic: supportsMic(scrcpyInfo.help),
+    v4l2: supportsV4l2(scrcpyInfo.help),
+  };
+});
+
+/**
+ * Encoder limits, straight from the device's own codec declarations.
+ *
+ * Both directories are read because vendors split the files, and a failure is
+ * not fatal: with no limits every size stays enabled and the device gets to
+ * refuse for itself, which is the pre-existing behaviour rather than a regression.
+ */
+async function readEncoderLimits(serial) {
+  try {
+    const out = await adb([
+      '-s', serial, 'shell',
+      'cat /vendor/etc/media_codecs*.xml /system/etc/media_codecs*.xml 2>/dev/null',
+    ]);
+    return parseEncoderLimits(out);
+  } catch {
+    return { codecs: {}, maxWidth: null, maxHeight: null };
+  }
+}
+
+/** Last few meaningful lines of scrcpy output, for an error the user can act on. */
+function cleanScrcpyLog(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^INFO:/i.test(l))
+    .slice(-4)
+    .join('\n');
+}
+
+ipcMain.handle('camera:start', async (_e, opts = {}) => {
+  const { serial } = opts;
+  await assertDeviceReady(serial);
+  assertCameraSupport();
+  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
+    throw new Error('A camera stream is already running. Stop it before starting another.');
+  }
+
+  const args = buildCameraArgs(serial, {
+    cameraId: opts.cameraId,
+    facing: opts.facing,
+    size: opts.size,
+    fps: opts.fps,
+    highSpeed: opts.highSpeed,
+    mic: opts.mic,
+    v4l2Device: opts.v4l2Device,
+  }, scrcpyInfo.help);
+
+  const session = { serial, child: null, opts };
+  try {
+    await spawnScrcpy(args, {
+      graceMs: 2500,
+      onSpawn: (child) => { session.child = child; cameraSession = session; },
+      onExit: () => { if (cameraSession === session) cameraSession = null; },
+    });
+  } catch (err) {
+    // scrcpy reports an encoder rejection as a Java stack trace, which is not
+    // something a user can act on. Name the size and the device's own limit
+    // instead; the limit is re-read here because a start can follow a detect
+    // from an earlier session.
+    const limits = await readEncoderLimits(serial);
+    throw new Error(describeCameraFailure(err.message, { size: opts.size, limits }));
+  }
+  return { running: true, size: opts.size || null, mic: !!opts.mic };
+});
+
+ipcMain.handle('camera:stop', () => {
+  if (cameraSession && cameraSession.child) {
+    try { cameraSession.child.kill(); } catch { /* already gone */ }
+  }
+  cameraSession = null;
   return true;
 });
+
+ipcMain.handle('camera:status', () => ({
+  running: !!(cameraSession && cameraSession.child && cameraSession.child.exitCode === null),
+  serial: cameraSession ? cameraSession.serial : null,
+  size: cameraSession ? (cameraSession.opts.size || null) : null,
+  mic: cameraSession ? !!cameraSession.opts.mic : false,
+}));
+
+/**
+ * Flashlight.
+ *
+ * There is no torch command in adb — camera2's torch API is not exposed to the
+ * shell — so this clicks the quick-settings tile, which is a toggle rather than a
+ * settable state. The catch is that `cmd statusbar click-tile` prints nothing
+ * whether it toggled a real tile or silently did nothing, so a bare success from
+ * adb means only "the command ran". Two checks make the reply honest:
+ * the shade's tile list, and a torch-state read-back from the camera service.
+ * When the state cannot be read the reply says so rather than claiming a change.
+ */
+ipcMain.handle('camera:torch', async (_e, serial) => {
+  if (!serial) throw new Error('No device selected.');
+
+  const tiles = parseQsTiles(await adbQuiet([
+    '-s', serial, 'shell', 'settings', 'get', 'secure', 'sysui_qs_tiles',
+  ]));
+  if (tiles.length && !hasTorchTile(tiles)) {
+    throw new Error('This phone\'s quick-settings shade has no flashlight tile, and adb has no other way to reach the torch. Add the Flashlight tile in the notification shade\'s edit screen, then try again.');
+  }
+
+  const before = parseTorchStatus(await adbQuiet(['-s', serial, 'shell', 'dumpsys', 'media.camera']));
+
+  let last = '';
+  let clicked = null;
+  for (const tile of TORCH_TILES) {
+    try {
+      await adb(torchArgs(serial, tile));
+      clicked = tile;
+      break;
+    } catch (err) {
+      last = err.message;
+      if (/Android 11/.test(describeTorchFailure(last))) break; // no point trying tile 2
+    }
+  }
+  if (!clicked) throw new Error(describeTorchFailure(last));
+
+  const after = parseTorchStatus(await adbQuiet(['-s', serial, 'shell', 'dumpsys', 'media.camera']));
+  if (after && before !== after) return { toggled: true, state: after, tile: clicked };
+  if (after && before === after) {
+    throw new Error(`The flashlight tile was clicked but the torch is still ${after}. This ROM is ignoring adb tile clicks — toggle it from the phone's shade instead.`);
+  }
+  // No read-back on this build: report the click, not a state we cannot see.
+  return { toggled: true, state: null, tile: clicked };
+});
+
+/** adb whose failure is data, not an exception — for probes that may not exist. */
+async function adbQuiet(args) {
+  try {
+    return await adb(args);
+  } catch (err) {
+    return err && err.message ? err.message : '';
+  }
+}
+
+/**
+ * Whether other PC apps can select this phone as a camera, and what it would
+ * take. Reported honestly per platform rather than as a status light that is
+ * always green — on Windows nothing we can do from here creates a real camera
+ * device; OBS's signed driver is the only widely available route.
+ */
+ipcMain.handle('camera:bridge', async () => {
+  if (!scrcpyInfo.version) await probeScrcpyVersion();
+  return describeBridge({
+    platform: process.platform,
+    help: scrcpyInfo.help,
+    v4l2Devices: listV4l2Devices(),
+    obsInstalled: hasObsVirtualCamera(),
+  });
+});
+
+/** Loopback sinks scrcpy could write into (Linux only). */
+function listV4l2Devices() {
+  if (process.platform !== 'linux') return [];
+  try {
+    return fs.readdirSync('/dev')
+      .filter((n) => /^video\d+$/.test(n))
+      .map((n) => `/dev/${n}`)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Whether OBS is installed. Only its presence is checked, not that the virtual
+ * camera has been started — that is the user's move, and claiming otherwise
+ * would be the same dishonesty as a permanently green status light.
+ */
+function hasObsVirtualCamera() {
+  const candidates = process.platform === 'win32'
+    ? [
+      path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'obs-studio'),
+      path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'obs-studio'),
+    ]
+    : process.platform === 'darwin'
+      ? ['/Applications/OBS.app']
+      : ['/usr/bin/obs', '/usr/local/bin/obs'];
+  return candidates.some((p) => { try { return fs.existsSync(p); } catch { return false; } });
+}
 
 // ---------------------------------------------------------------------------
 // Fastboot / bootloader
@@ -568,17 +1528,23 @@ ipcMain.handle('fastboot:flashPartitionConfirm', (_e, { serial, partition, fileP
 
 ipcMain.handle('tools:status', async () => {
   const results = [];
-  for (const [name, bin] of [['adb', tools.adb], ['fastboot', tools.fastboot], ['scrcpy', tools.scrcpy]]) {
-    let version = null;
-    try {
-      const out = await run(bin, ['--version']).catch(() => run(bin, ['version']));
-      version = out.split('\n')[0].trim();
-    } catch { /* leave null */ }
+  for (const name of ['adb', 'fastboot', 'scrcpy']) {
+    const bin = tools[name];
+    const text = await probeVersion(bin, VERSION_ARGS[name]);
+    const version = text ? text.split('\n')[0].trim() : null;
     let size = null;
-    try { size = fs.statSync(bin).size; } catch { /* on PATH, no absolute stat available */ }
+    try { size = fs.statSync(bin).size; } catch { /* resolved via PATH, no absolute path to stat */ }
     results.push({ name, path: bin, version, size });
   }
   return results;
+});
+
+// Lets the renderer re-run detection after the user installs a tool manually
+// or a download previously failed, without restarting the app.
+ipcMain.handle('tools:reinit', async (e) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  if (win) await initTools(win);
+  return { ...scrcpyInfo, scrcpyPath: tools.scrcpy, adbPath: tools.adb };
 });
 
 // ---------------------------------------------------------------------------

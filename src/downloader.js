@@ -68,48 +68,94 @@ async function ensurePlatformTools(onProgress) {
 // scrcpy — fetched from its latest GitHub release
 // ---------------------------------------------------------------------------
 
+// Release asset names have drifted between scrcpy majors (scrcpy-win64-v3.3.zip,
+// scrcpy-macos-aarch64-v3.3.tar.gz, …), so match loosely on the platform/arch
+// keywords rather than pinning an exact filename shape. Falls back to a second,
+// even looser pass so a future rename doesn't hard-fail the download.
+function pickScrcpyAsset(assets) {
+  const names = assets.filter((a) => /\.(zip|tar(\.gz)?)$/i.test(a.name));
+  const arm = process.arch === 'arm64';
+
+  const tiers = {
+    win32: [/win.*(64|x86_64)/i, /win/i],
+    darwin: arm ? [/macos.*(aarch64|arm64)/i, /macos/i] : [/macos.*x86_64/i, /macos/i],
+    linux: arm ? [/linux.*(aarch64|arm64)/i, /linux/i] : [/linux.*(x86_64|x64)/i, /linux/i],
+  };
+
+  for (const re of tiers[process.platform] || tiers.linux) {
+    const hit = names.find((a) => re.test(a.name));
+    if (hit) return hit;
+  }
+  return null;
+}
+
 async function latestScrcpyAsset() {
   const res = await fetch('https://api.github.com/repos/Genymobile/scrcpy/releases/latest', {
     headers: { 'User-Agent': 'android-pc-companion' },
   });
-  if (!res.ok) throw new Error('Could not check the latest scrcpy release');
+  if (!res.ok) throw new Error(`Could not check the latest scrcpy release (HTTP ${res.status})`);
   const data = await res.json();
-
-  const patterns = {
-    win32: /^scrcpy-win64-v?[\d.]+\.zip$/,
-    darwin: /^scrcpy-macos-(x86_64|aarch64)-v?[\d.]+\.tar(\.gz)?$/,
-    linux: /^scrcpy-linux-(x86_64|x64)-v?[\d.]+\.tar(\.gz)?$/,
-  };
-  const re = patterns[process.platform] || patterns.linux;
-  const asset = data.assets.find((a) => re.test(a.name));
-  if (!asset) throw new Error(`No matching scrcpy release asset found for ${process.platform}`);
+  const asset = pickScrcpyAsset(data.assets || []);
+  if (!asset) {
+    throw new Error(`No scrcpy release asset matched ${process.platform}/${process.arch}`);
+  }
   return asset;
+}
+
+// The archives contain a top-level versioned directory (scrcpy-win64-v3.3/…),
+// so the executable is never directly at the root of the extraction folder.
+// Walk the tree to find it instead of assuming a fixed path — this was the
+// reason mirroring silently failed: tools.scrcpy pointed at a file that
+// did not exist.
+function findExecutable(root, exeName, depth = 4) {
+  if (depth < 0) return null;
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return null; }
+
+  const direct = entries.find((e) => e.isFile() && e.name.toLowerCase() === exeName.toLowerCase());
+  if (direct) return path.join(root, direct.name);
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const found = findExecutable(path.join(root, entry.name), exeName, depth - 1);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function ensureScrcpy(onProgress) {
   const dir = binDir();
   const scDir = path.join(dir, 'scrcpy');
   const exeName = process.platform === 'win32' ? 'scrcpy.exe' : 'scrcpy';
-  const exePath = path.join(scDir, exeName);
 
-  if (fs.existsSync(exePath)) return exePath;
+  const cached = findExecutable(scDir, exeName);
+  if (cached) return cached;
 
   const asset = await latestScrcpyAsset();
   const archivePath = path.join(dir, asset.name);
   await download(asset.browser_download_url, archivePath, onProgress);
   fs.mkdirSync(scDir, { recursive: true });
 
-  if (asset.name.endsWith('.zip')) {
+  if (/\.zip$/i.test(asset.name)) {
     await extract(archivePath, { dir: scDir });
   } else {
     await tar.x({ file: archivePath, cwd: scDir });
   }
   fs.unlinkSync(archivePath);
 
-  if (process.platform !== 'win32' && fs.existsSync(exePath)) {
-    fs.chmodSync(exePath, 0o755);
+  const exePath = findExecutable(scDir, exeName);
+  if (!exePath) {
+    throw new Error(`Extracted ${asset.name} but could not find ${exeName} inside it`);
+  }
+
+  if (process.platform !== 'win32') {
+    // The tarballs don't always preserve the exec bit, and scrcpy shells out to
+    // its own bundled adb, so make that runnable too.
+    try { fs.chmodSync(exePath, 0o755); } catch { /* best effort */ }
+    const bundledAdb = findExecutable(path.dirname(exePath), 'adb');
+    if (bundledAdb) { try { fs.chmodSync(bundledAdb, 0o755); } catch { /* best effort */ } }
   }
   return exePath;
 }
 
-module.exports = { ensurePlatformTools, ensureScrcpy };
+module.exports = { ensurePlatformTools, ensureScrcpy, findExecutable, pickScrcpyAsset };

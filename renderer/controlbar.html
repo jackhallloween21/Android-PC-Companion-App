@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';" />
+<title>Device controls</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  html { background: transparent; }
+  body {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    padding: 8px 10px;
+    font: 12px/1.2 "Segoe UI", system-ui, sans-serif;
+    color: #e6edf7;
+    background: #0d1220;
+    border: 1px solid #1e2a44;
+    border-radius: 12px;
+    overflow: hidden;
+    /* The strip has no title bar, so the background itself is the drag handle.
+       Buttons opt back out below, or they would only ever move the window. */
+    -webkit-app-region: drag;
+    user-select: none;
+  }
+  /* Wrapping is a safety net: the strip is sized to fit both rows (see
+     minBarWidth in src/dock.js), but on a narrow display it can be clamped to
+     the work area, and wrapping keeps the right-hand buttons reachable instead
+     of clipping them off the edge. */
+  .row { display: flex; align-items: center; justify-content: center; gap: 6px; flex-wrap: wrap; }
+  button {
+    -webkit-app-region: no-drag;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 1px solid #24314e;
+    border-radius: 8px;
+    background: #151d31;
+    color: #dbe4f3;
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: #1d2740; border-color: #33456e; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible { outline: 2px solid #4c8dff; outline-offset: 1px; }
+
+  .nav button { min-width: 54px; height: 34px; justify-content: center; font-size: 15px; }
+  .nav .shade { min-width: 0; padding: 0 10px; font-size: 12px; }
+  .aux button { height: 24px; padding: 0 8px; font-size: 11px; background: #111828; color: #a9b6cd; }
+  .aux button:hover:not(:disabled) { color: #e6edf7; }
+  .aux .danger { color: #ff8b8b; border-color: #4a2331; }
+  .aux .rec-on { color: #fff; background: #7f1d2e; border-color: #a02a3f; }
+
+  .zoom {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding-right: 4px;
+    margin-right: 2px;
+    border-right: 1px solid #222d47;
+  }
+  .zoom button { min-width: 22px; justify-content: center; font-size: 13px; line-height: 1; }
+  #zoom-value {
+    min-width: 34px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    color: #cbd6ea;
+    font-size: 11px;
+  }
+
+  #toast {
+    position: absolute;
+    left: 50%;
+    top: 4px;
+    transform: translateX(-50%);
+    max-width: 92%;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 10.5px;
+    background: #1b2338;
+    color: #9fb0cc;
+    opacity: 0;
+    transition: opacity .15s;
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { color: #ffb3b3; background: #331b22; }
+  #toast.ok { color: #9ff0c4; background: #163024; }
+</style>
+</head>
+<body>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <div class="row nav">
+    <button id="k-back" title="Back">&#9664;</button>
+    <button id="k-home" title="Home">&#9679;</button>
+    <button id="k-recents" title="Recent apps">&#9632;</button>
+    <button id="k-shade" class="shade" title="Pull down the notification shade">Notifications</button>
+    <button id="k-qs" class="shade" title="Open quick settings">Quick settings</button>
+  </div>
+
+  <div class="row aux">
+    <span class="zoom">
+      <button id="z-out" title="Make the mirror smaller">&minus;</button>
+      <span id="zoom-value">100%</span>
+      <button id="z-in" title="Make the mirror bigger">+</button>
+      <button id="z-fit" title="Fill as much of the screen as fits">Fit</button>
+    </span>
+    <button id="a-power" class="danger" title="Long-press the power button">Power</button>
+    <button id="a-vol-down" title="Volume down">Vol &minus;</button>
+    <button id="a-vol-up" title="Volume up">Vol +</button>
+    <button id="a-rotate" title="Rotate the device display">Rotate</button>
+    <button id="a-shot" title="Save a screenshot to this PC">Screenshot</button>
+    <button id="a-record" title="Record the device screen">Record</button>
+    <button id="a-redock" title="Snap this bar back under the video, wherever you have moved it">Re-dock</button>
+    <button id="a-stop" class="danger" title="Stop mirroring and close this bar">Stop</button>
+  </div>
+
+  <script src="controlbar.js"></script>
+</body>
+</html>

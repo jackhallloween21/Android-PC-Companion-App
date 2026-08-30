@@ -33,6 +33,7 @@
       <p id="setup-line" class="muted">Checking for adb…</p>
       <div class="progress-track"><div id="setup-bar" class="progress-fill"></div></div>
       <p id="setup-error" class="muted danger-text hidden"></p>
+      <button id="setup-continue" class="ghost-btn hidden">Continue without it</button>
     </div>
   </div>
 
@@ -189,9 +190,22 @@
         <div class="split-panel">
           <div class="glass-card">
             <h3>Preview window</h3>
-            <p class="muted">Launches scrcpy in its own window with the parameters set here. Use the transport bar below to control the device without touching it directly.</p>
+            <p class="muted">scrcpy draws the video in its own window. With docking on, that window opens at a computed spot with a slim control strip directly underneath it. Drag its title bar to move it and its edges to resize it; the strip's <strong>Re-dock</strong> button then snaps back under wherever it ended up. The strip's &minus; / + / Fit buttons resize it in fixed steps.</p>
             <button id="launch-scrcpy" class="primary-btn">Start mirroring</button>
+            <button id="stop-scrcpy" class="ghost-btn danger-hover">Stop</button>
+            <p id="mirror-status" class="mono mirror-status"></p>
+            <p id="scrcpy-build" class="muted mono"></p>
 
+            <div class="field-label">Navigation</div>
+            <div class="control-bar">
+              <button id="ctrl-back" class="ghost-btn">&#9664; Back</button>
+              <button id="ctrl-home" class="ghost-btn">&#9679; Home</button>
+              <button id="ctrl-recents" class="ghost-btn">&#9632; Recents</button>
+              <button id="ctrl-shade" class="ghost-btn">Notifications</button>
+              <button id="ctrl-qs" class="ghost-btn">Quick settings</button>
+            </div>
+
+            <div class="field-label">Device</div>
             <div class="control-bar">
               <button id="ctrl-power" class="ghost-btn danger-hover">Power (Hold)</button>
               <button id="ctrl-vol-down" class="ghost-btn">Vol –</button>
@@ -221,6 +235,14 @@
               <button class="chip-tab active" data-value="60">60 FPS</button>
               <button class="chip-tab" data-value="30">30 FPS</button>
             </div>
+            <div class="field-label">Mirror window size <span class="muted">(of what fits the screen)</span></div>
+            <div class="chip-tabs" id="zoom-options">
+              <button class="chip-tab" data-value="0.5">50%</button>
+              <button class="chip-tab" data-value="0.75">75%</button>
+              <button class="chip-tab active" data-value="1">Fit</button>
+            </div>
+            <label class="checkbox-row"><input type="checkbox" id="opt-dock" checked /> Dock a control bar under the video</label>
+            <label class="checkbox-row"><input type="checkbox" id="opt-borderless" /> Borderless video window <span class="muted">(no title bar, so it cannot be dragged or resized by hand)</span></label>
             <label class="checkbox-row"><input type="checkbox" id="opt-stay-awake" checked /> Keep device display awake</label>
             <label class="checkbox-row"><input type="checkbox" id="opt-screen-off" /> Turn physical screen off (save battery)</label>
             <label class="checkbox-row"><input type="checkbox" id="opt-show-touches" /> Show physical touch dots</label>
@@ -251,64 +273,214 @@
       </section>
 
       <section id="view-multimedia" class="view hidden">
-        <div class="view-header"><h2>Multimedia Hub</h2></div>
+        <div class="view-header">
+          <h2>Multimedia Hub</h2>
+          <span id="bridge-badge" class="badge">Checking virtual camera…</span>
+        </div>
         <div class="chip-tabs">
           <button class="chip-tab active" data-mm="webcam">Phone as PC webcam</button>
           <button class="chip-tab" data-mm="audio">Audio &amp; music routing</button>
         </div>
 
         <div id="mm-webcam" class="glass-card">
-          <h3>Camera preview</h3>
-          <p class="muted">Streams the phone's camera to a preview window via scrcpy's camera source. Making this feed selectable as a real webcam in Zoom/OBS/browsers needs a signed virtual-camera driver per OS — not built yet. See README.</p>
-          <div class="path-bar">
-            <select id="camera-facing" class="mono">
-              <option value="back">Rear camera</option>
-              <option value="front">Front camera</option>
-            </select>
-            <button id="launch-camera-btn" class="primary-btn" style="margin-top:0;">Start camera stream</button>
+          <div class="card-head">
+            <h3>Camera stream</h3>
+            <span id="camera-state" class="badge-text">Standby</span>
+          </div>
+          <p class="muted">scrcpy reads a camera instead of the screen and draws it in its own window. The lens list and every resolution below come from the phone itself &mdash; a size the sensor does not report would make scrcpy exit, so nothing here is guessed.</p>
+
+          <div class="control-bar">
+            <button id="camera-refresh-btn" class="ghost-btn" style="margin-top:0;">Detect cameras</button>
+            <span id="camera-detect-status" class="muted">Press Detect to read this phone's sensors.</span>
+          </div>
+
+          <div class="field-label">Lens</div>
+          <div id="camera-lens-list" class="file-list" style="max-height:170px;">
+            <div class="muted" style="padding:10px 12px;">Not detected yet.</div>
+          </div>
+
+          <div class="path-bar" style="margin-top:12px;">
+            <select id="camera-size" class="mono"><option value="">Sensor default</option></select>
+            <select id="camera-fps" class="mono"><option value="">Default fps</option></select>
+          </div>
+          <div id="camera-size-note" class="muted" style="margin-top:6px;font-size:12px;"></div>
+
+          <div class="checkbox-list">
+            <label class="checkbox-row"><input type="checkbox" id="camera-mic" /> Forward the phone microphone <span class="muted">(--audio-source=mic)</span></label>
+            <label class="checkbox-row"><input type="checkbox" id="camera-highspeed" /> High-speed mode <span class="muted">(only for sizes listed as high speed)</span></label>
+          </div>
+
+          <div class="control-bar">
+            <button id="camera-start-btn" class="primary-btn" style="margin-top:0;">Start camera stream</button>
+            <button id="camera-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
+            <button id="torch-btn" class="ghost-btn" style="margin-top:0;" title="Toggles the flashlight quick-settings tile — there is no adb torch command">&#128161; Flashlight</button>
+          </div>
+          <p id="camera-status" class="mirror-status"></p>
+
+          <div class="note-strip">
+            <span class="note-icon">&#9432;</span>
+            <div>
+              <strong id="bridge-label">Virtual camera: checking…</strong>
+              <p id="bridge-hint" class="muted" style="margin:4px 0 0;"></p>
+            </div>
           </div>
         </div>
 
         <div id="mm-audio" class="glass-card hidden">
-          <h3>Audio &amp; media controls</h3>
-          <p class="muted">Forwards device audio to PC speakers via scrcpy, and sends media-key commands to the active playback session.</p>
+          <div class="card-head">
+            <h3>Now playing on the phone</h3>
+            <span id="np-state" class="badge-text">&mdash;</span>
+          </div>
+          <p class="muted">Read from the phone's own media session. Fields Android does not report are shown as &mdash; rather than filled in.</p>
+
+          <div class="telemetry-grid">
+            <div class="metric"><div class="metric-label">Track</div><div id="np-title" class="metric-value small">&mdash;</div></div>
+            <div class="metric"><div class="metric-label">Artist</div><div id="np-artist" class="metric-value small">&mdash;</div></div>
+            <div class="metric"><div class="metric-label">Album</div><div id="np-album" class="metric-value small">&mdash;</div></div>
+            <div class="metric"><div class="metric-label">App</div><div id="np-app" class="metric-value small">&mdash;</div></div>
+          </div>
+
+          <div class="bar-row" id="np-bar-row" style="margin-top:14px;">
+            <span id="np-position" class="bar-label mono">&mdash;</span>
+            <div class="progress-track"><div id="np-progress" class="progress-fill" style="width:0%;"></div></div>
+            <span id="np-duration" class="bar-label mono">&mdash;</span>
+          </div>
+          <div id="np-bar-note" class="muted" style="margin-top:8px;font-size:12px;"></div>
+
+          <div class="transport-controls">
+            <button id="media-prev-btn" class="ghost-btn" style="margin-top:0;">&#9198; Prev</button>
+            <button id="media-playpause-btn" class="primary-btn" style="margin-top:0;">&#9199; Play / Pause</button>
+            <button id="media-next-btn" class="ghost-btn" style="margin-top:0;">&#9197; Next</button>
+            <button id="np-refresh-btn" class="ghost-btn" style="margin-top:0;">Refresh</button>
+          </div>
+          <p id="now-playing" class="muted mono" style="margin-top:12px;"></p>
+          <p class="muted" style="font-size:12px;">Album artwork cannot be shown: the notification draws a bitmap that lives inside the player app, and adb has no command that hands that image over &mdash; it never appears in the media-session dump. The elapsed time counts up locally between reads; a full seek bar only appears when the player publishes the track length.</p>
+
+          <div class="card-head" style="margin-top:20px;"><h3>Audio forwarding to this PC</h3></div>
+          <p class="muted">scrcpy forwards the phone's playback stream to whatever this PC already uses as its default output. Choosing a specific speaker or headset is a Windows/PulseAudio setting, not something scrcpy exposes, so there is no device picker here.</p>
           <div class="control-bar">
             <button id="audio-start-btn" class="primary-btn" style="margin-top:0;">Start audio forwarding</button>
             <button id="audio-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
             <span id="audio-status" class="muted">Not forwarding.</span>
           </div>
-          <div class="transport-controls">
-            <button id="media-prev-btn" class="ghost-btn" style="margin-top:0;">&#9198; Prev</button>
-            <button id="media-playpause-btn" class="primary-btn" style="margin-top:0;">&#9199; Play / Pause</button>
-            <button id="media-next-btn" class="ghost-btn" style="margin-top:0;">&#9197; Next</button>
-          </div>
-          <p id="now-playing" class="muted mono" style="margin-top: 12px;"></p>
         </div>
       </section>
 
       <section id="view-hardware" class="view hidden">
-        <div class="view-header"><h2>Hardware &amp; Power</h2></div>
-        <div class="dashboard-grid-static">
-          <div class="card">
-            <div class="card-head"><h3>Battery</h3><span id="hw-batt-status" class="badge"></span></div>
-            <div class="data-grid mono">
-              <div class="data-cell"><span class="k">Level</span><span class="v" id="hw-level">—</span></div>
-              <div class="data-cell"><span class="k">Health</span><span class="v" id="hw-health">—</span></div>
-              <div class="data-cell"><span class="k">Cycle count</span><span class="v" id="hw-cycles">—</span></div>
-              <div class="data-cell"><span class="k">Voltage</span><span class="v" id="hw-voltage">—</span></div>
-              <div class="data-cell"><span class="k">Temperature</span><span class="v" id="hw-temp">—</span></div>
-              <div class="data-cell"><span class="k">Technology</span><span class="v" id="hw-tech">—</span></div>
+        <div class="view-header">
+          <h2>Hardware &amp; Power</h2>
+          <span id="hw-updated" class="muted mono"></span>
+        </div>
+
+        <div class="power-grid">
+          <div class="card power-station">
+            <div class="card-head">
+              <h3><span class="head-icon">&#9211;</span> Battery Power Station</h3>
+              <span id="hw-batt-status" class="badge">—</span>
+            </div>
+            <div class="station-body">
+              <div class="ring-wrap">
+                <div id="hw-ring" class="power-ring" style="--pct:0">
+                  <div class="ring-inner">
+                    <span id="hw-ring-bolt" class="ring-bolt hidden">&#9889;</span>
+                    <span id="hw-level" class="ring-level">—</span>
+                    <span id="hw-eta" class="ring-eta mono"></span>
+                  </div>
+                </div>
+              </div>
+              <div class="station-facts">
+                <div class="fact-box">
+                  <span class="fact-label">Battery Health</span>
+                  <span class="fact-value" id="hw-health">—</span>
+                </div>
+                <div class="fact-box">
+                  <span class="fact-label">Full Charge Capacity</span>
+                  <span class="fact-value" id="hw-capacity">—</span>
+                </div>
+              </div>
+            </div>
+            <div class="station-footer">
+              <div class="footer-pill"><span class="k">Charge Cycles:</span><span class="v" id="hw-cycles">—</span></div>
+              <div class="footer-pill"><span class="k">Chemistry:</span><span class="v" id="hw-tech">—</span></div>
             </div>
           </div>
-          <div class="card">
-            <div class="card-head"><h3>Device specs</h3></div>
-            <div class="data-grid mono">
-              <div class="data-cell"><span class="k">Chipset / hardware</span><span class="v" id="hw-chipset">—</span></div>
-              <div class="data-cell"><span class="k">Display</span><span class="v" id="hw-display">—</span></div>
-              <div class="data-cell"><span class="k">RAM</span><span class="v" id="hw-ram">—</span></div>
-              <div class="data-cell"><span class="k">Storage</span><span class="v" id="hw-storage">—</span></div>
-              <div class="data-cell"><span class="k">Android</span><span class="v" id="hw-android">—</span></div>
-              <div class="data-cell"><span class="k">Security patch</span><span class="v" id="hw-secpatch">—</span></div>
+
+          <div class="card telemetry">
+            <div class="card-head">
+              <h3><span class="head-icon accent">&#9889;</span> Real-Time Electrical &amp; Thermal Telemetry</h3>
+              <span id="hw-rate" class="badge-text">—</span>
+            </div>
+            <div class="telemetry-grid">
+              <div class="metric">
+                <span class="metric-label">Charging Power</span>
+                <span class="metric-value amber"><span id="hw-watts">—</span><em>W</em></span>
+                <span class="metric-sub mono">V × A direct flow</span>
+              </div>
+              <div class="metric">
+                <span class="metric-label">Cell Voltage</span>
+                <span class="metric-value"><span id="hw-voltage">—</span><em>V</em></span>
+                <span class="metric-sub mono" id="hw-voltage-mv"></span>
+              </div>
+              <div class="metric">
+                <span class="metric-label">Charging Current</span>
+                <span class="metric-value green"><span id="hw-current">—</span><em>A</em></span>
+                <span class="metric-sub mono" id="hw-current-ma"></span>
+              </div>
+              <div class="metric">
+                <span class="metric-label">&#127777; Battery Temp</span>
+                <span class="metric-value green"><span id="hw-temp">—</span><em>&deg;C</em></span>
+                <span class="metric-sub mono" id="hw-temp-sub"></span>
+              </div>
+              <div class="metric">
+                <span class="metric-label">&#9673; SoC Temp</span>
+                <span class="metric-value green"><span id="hw-soc-temp">—</span><em>&deg;C</em></span>
+                <span class="metric-sub mono" id="hw-soc-zone">Thermal junction</span>
+              </div>
+              <div class="metric">
+                <span class="metric-label">Protocol</span>
+                <span class="metric-value small" id="hw-protocol">—</span>
+                <span class="metric-sub mono" id="hw-protocol-sub"></span>
+              </div>
+            </div>
+            <div class="note-strip">
+              <span class="note-icon">&#9432;</span>
+              <span id="hw-source-note" class="mono">Power measurements read directly from the Android kernel power-supply subsystem.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card specs-card">
+          <div class="card-head"><h3><span class="head-icon accent">&#9635;</span> Processor Architecture &amp; Device Specs</h3></div>
+          <div class="specs-grid">
+            <div class="spec">
+              <span class="spec-label">Chipset (SoC)</span>
+              <span class="spec-value" id="hw-chipset">—</span>
+              <span class="spec-sub mono" id="hw-chipset-sub"></span>
+            </div>
+            <div class="spec">
+              <span class="spec-label">Display &amp; Resolution</span>
+              <span class="spec-value" id="hw-display">—</span>
+              <span class="spec-sub mono" id="hw-display-sub"></span>
+            </div>
+            <div class="spec">
+              <span class="spec-label">System RAM</span>
+              <span class="spec-value" id="hw-ram">—</span>
+              <span class="spec-sub mono" id="hw-ram-sub"></span>
+            </div>
+            <div class="spec">
+              <span class="spec-label">Internal Storage</span>
+              <span class="spec-value" id="hw-storage">—</span>
+              <span class="spec-sub mono" id="hw-storage-sub"></span>
+            </div>
+            <div class="spec">
+              <span class="spec-label">Android Build</span>
+              <span class="spec-value" id="hw-android">—</span>
+              <span class="spec-sub mono" id="hw-abi"></span>
+            </div>
+            <div class="spec">
+              <span class="spec-label">Security Patch</span>
+              <span class="spec-value" id="hw-secpatch">—</span>
+              <span class="spec-sub mono" id="hw-bootloader"></span>
             </div>
           </div>
         </div>
@@ -383,11 +555,14 @@
   <div id="pair-modal" class="modal hidden">
     <div class="modal-card glass-card">
       <h3>Pair wireless device</h3>
-      <p class="muted">On the phone: Developer options &rarr; Wireless debugging &rarr; Pair device with pairing code.</p>
-      <label class="field-label">Host &amp; port</label>
+      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the two fields below, then read the connect port off the main Wireless debugging screen.</p>
+      <label class="field-label">Pairing host &amp; port <span class="muted">(from the pairing dialog)</span></label>
       <input id="pair-host" placeholder="192.168.1.23:41235" class="mono" spellcheck="false" />
       <label class="field-label">Pairing code</label>
       <input id="pair-code" placeholder="123456" class="mono" spellcheck="false" />
+      <label class="field-label">Connect port <span class="muted">(from "IP address &amp; port" — leave blank to auto-detect)</span></label>
+      <input id="pair-connect-port" placeholder="37123" class="mono" spellcheck="false" />
+      <p id="pair-status" class="mirror-status"></p>
       <div class="modal-actions">
         <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
         <button id="pair-submit-btn" class="primary-btn">Pair</button>
