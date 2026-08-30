@@ -1123,15 +1123,11 @@ el('pair-submit-btn').onclick = async () => {
   btn.disabled = true;
   setPairStatus('Pairing, then connecting…', 'busy');
   try {
-    // Pairing only exchanges keys; the device appears in adb devices after the
-    // separate connect step, which main.js attempts as part of this call.
     const res = await window.api.pairWireless(host, code, connectPort);
     if (res && res.connected) {
       setPairStatus(res.message, 'ok');
       el('pair-modal').classList.add('hidden');
     } else {
-      // Paired but unreachable — keep the modal open so the connect port can be
-      // filled in without redoing the pairing (the code is single-use).
       setPairStatus(res ? res.message : 'Paired, but the connect step did not run.', 'err');
     }
     refreshDevices();
@@ -1141,6 +1137,94 @@ el('pair-submit-btn').onclick = async () => {
     btn.disabled = false;
   }
 };
+
+// ---- QR scan for wireless pairing ------------------------------------------
+
+let qrStream = null;
+let qrRaf = null;
+
+el('pair-scan-qr-btn').onclick = () => {
+  setPairStatus('');
+  el('pair-modal').classList.add('hidden');
+  el('qr-modal').classList.remove('hidden');
+  startQrScan();
+};
+
+el('qr-modal-close').onclick = () => stopQrScan();
+
+async function startQrScan() {
+  const video = el('qr-video');
+  const canvas = el('qr-canvas');
+  const status = el('qr-status');
+
+  try {
+    qrStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  } catch (err) {
+    status.textContent = `Camera not available: ${err.message}`;
+    return;
+  }
+
+  video.srcObject = qrStream;
+  await video.play();
+
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  let scanning = true;
+
+  async function tick() {
+    if (!scanning) return;
+
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      try {
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const qrText = window.api.decodeQR(new Uint8ClampedArray(imageData.data).buffer, imageData.width, imageData.height);
+
+        if (qrText) {
+          status.textContent = 'QR code detected.';
+          const parsed = window.api.parsePairingQR(qrText);
+          if (parsed) {
+            el('pair-host').value = `${parsed.host}:${parsed.port}`;
+            el('pair-code').value = parsed.code;
+            stopQrScan();
+            el('qr-modal').classList.add('hidden');
+            el('pair-modal').classList.remove('hidden');
+            setPairStatus('QR scanned. Review the details and press Pair.', 'ok');
+            return;
+          }
+          status.textContent = 'QR detected but did not contain a valid pairing code.';
+        }
+      } catch {
+        // ignore decode errors and keep scanning
+      }
+    }
+
+    qrRaf = requestAnimationFrame(tick);
+  }
+
+  status.textContent = 'Scanning for QR code…';
+  qrRaf = requestAnimationFrame(tick);
+}
+
+function stopQrScan() {
+  const scanning = qrRaf !== null;
+  if (qrRaf) { cancelAnimationFrame(qrRaf); qrRaf = null; }
+  if (qrStream) {
+    qrStream.getTracks().forEach((t) => t.stop());
+    qrStream = null;
+  }
+  const video = el('qr-video');
+  if (video) video.srcObject = null;
+  if (!scanning) {
+    const qrModal = el('qr-modal');
+    if (qrModal && !qrModal.classList.contains('hidden')) qrModal.classList.add('hidden');
+  }
+}
 
 // ------------------------------------------------------------------- tools modal
 

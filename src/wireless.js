@@ -62,10 +62,46 @@ function connectCandidates(host, connectPort, mdnsOutput) {
   return targets;
 }
 
+// ---------------------------------------------------------------------------
+// QR code parsing for Android wireless debugging pairing.
+//
+// The "Pair device with QR code" dialog generates a WIFI: string whose fields
+// carry the pairing host, port, and code that `adb pair` needs. The format
+// Android uses is:
+//   WIFI:T:adb;H:192.168.1.23:41235;P:123456;S:MyDevice;;
+// ---------------------------------------------------------------------------
+
+const WIFI_FIELD = /([A-Z]):([^;]*)/g;
+
+function parsePairingQR(qrText) {
+  const text = String(qrText || '').trim();
+  if (!text) return null;
+
+  let fields = {};
+  if (text.startsWith('WIFI:')) {
+    const body = text.slice(5).replace(/;$/, '');
+    for (const m of body.matchAll(WIFI_FIELD)) {
+      fields[m[1]] = m[2];
+    }
+  }
+
+  const rawHost = fields.H || '';
+  const code = fields.P || '';
+
+  if (!rawHost) return null;
+
+  const { host, port } = splitHostPort(rawHost);
+
+  if (!host || !code) return null;
+
+  return { host, port: port || '41235', code };
+}
+
 module.exports = {
   splitHostPort,
   isPaired,
   isConnected,
   pickConnectTarget,
   connectCandidates,
+  parsePairingQR,
 };

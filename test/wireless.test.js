@@ -11,6 +11,7 @@ const {
   isConnected,
   pickConnectTarget,
   connectCandidates,
+  parsePairingQR,
 } = require('../src/wireless');
 
 const MDNS = `List of discovered mdns services
@@ -73,4 +74,31 @@ test('an explicit connect port is tried before mDNS discovery', () => {
     [],
     'nothing to try when the port is unknown and mDNS is silent'
   );
+});
+
+test('parse Android wireless debugging pairing QR codes', () => {
+  const standard = 'WIFI:T:adb;H:192.168.1.23:41235;P:123456;S:MyDevice;;';
+  assert.deepStrictEqual(parsePairingQR(standard), {
+    host: '192.168.1.23',
+    port: '41235',
+    code: '123456',
+  });
+
+  assert.deepStrictEqual(parsePairingQR('WIFI:T:adb;H:10.0.0.5:37123;P:654321;;'), {
+    host: '10.0.0.5',
+    port: '37123',
+    code: '654321',
+  });
+
+  assert.deepStrictEqual(parsePairingQR('WIFI:T:adb;H:192.168.1.1:41235;P:000000;;'), {
+    host: '192.168.1.1',
+    port: '41235',
+    code: '000000',
+  });
+
+  assert.strictEqual(parsePairingQR(''), null, 'empty string');
+  assert.strictEqual(parsePairingQR(null), null, 'null');
+  assert.strictEqual(parsePairingQR('WIFI:T:adb;P:123456;;'), null, 'missing host');
+  assert.strictEqual(parsePairingQR('WIFI:T:adb;H:192.168.1.23:41235;;'), null, 'missing code');
+  assert.strictEqual(parsePairingQR('not-a-qr-code'), null, 'plain text without WIFI prefix');
 });

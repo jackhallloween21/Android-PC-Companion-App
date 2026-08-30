@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -122,12 +122,29 @@ const VERSION_ARGS = { adb: ['version'], fastboot: ['--version'], scrcpy: ['--ve
 
 function probeVersion(bin, args) {
   return new Promise((resolve) => {
-    execFile(bin, args, { timeout: 10000, windowsHide: true }, (err, stdout, stderr) => {
-      const text = `${stdout || ''}\n${stderr || ''}`.trim();
-      // Some builds print the banner and still exit non-zero; accept any output
-      // that actually names the tool.
-      if (err && !text) return resolve(null);
-      resolve(text || null);
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { child.kill('SIGKILL'); } catch {}
+        resolve(null);
+      }
+    }, 8000);
+    const child = spawn(bin, args, { windowsHide: true });
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', () => {
+      if (!settled) { settled = true; clearTimeout(timer); resolve(null); }
+    });
+    child.on('exit', () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        const text = `${stdout}\n${stderr}`.trim();
+        resolve(text || null);
+      }
     });
   });
 }
@@ -176,52 +193,82 @@ async function probeScrcpyVersion() {
 async function initTools(win) {
   const send = (payload) => win.webContents.send('setup:progress', payload);
 
-  send({ step: 'adb', status: 'checking' });
-  if (!(await checkOnPath('adb'))) {
-    try {
-      send({ step: 'adb', status: 'downloading', progress: 0 });
-      const { adbPath, fastbootPath } = await ensurePlatformTools((p) => send({ step: 'adb', status: 'downloading', progress: p }));
-      tools.adb = adbPath;
-      tools.fastboot = fastbootPath;
-    } catch (err) {
-      send({ step: 'adb', status: 'error', message: err.message });
-      return;
-    }
-  } else {
-    // Pin the PATH hit to an absolute path now, so scrcpy is handed the very
-    // same adb rather than repeating the lookup with a different cwd.
-    tools.adb = (await resolveOnPath('adb')) || tools.adb;
-    tools.fastboot = (await resolveOnPath('fastboot')) || tools.fastboot;
-  }
-  send({ step: 'adb', status: 'done' });
-
-  send({ step: 'scrcpy', status: 'checking' });
-  if (!(await checkOnPath('scrcpy'))) {
-    try {
-      send({ step: 'scrcpy', status: 'downloading', progress: 0 });
-      tools.scrcpy = await ensureScrcpy((p) => send({ step: 'scrcpy', status: 'downloading', progress: p }));
-    } catch (err) {
-      send({ step: 'scrcpy', status: 'error', message: err.message });
+  // Hard timeout: always complete setup within 20 seconds so the UI never hangs.
+  let completed = false;
+  const completeSetup = () => {
+    if (!completed) {
+      completed = true;
       send({ step: 'all', status: 'ready' });
+    }
+  };
+  const safetyTimer = setTimeout(() => {
+    send({ step: 'adb', status: 'error', message: 'Setup timed out. Click Continue without it to use the app.' });
+    completeSetup();
+  }, 20000);
+
+  try {
+    send({ step: 'adb', status: 'checking' });
+    if (!(await checkOnPath('adb'))) {
+      try {
+        send({ step: 'adb', status: 'downloading', progress: 0 });
+        const { adbPath, fastbootPath } = await ensurePlatformTools((p) => send({ step: 'adb', status: 'downloading', progress: p }));
+        tools.adb = adbPath;
+        tools.fastboot = fastbootPath;
+      } catch (err) {
+        send({ step: 'adb', status: 'error', message: err.message });
+        completeSetup();
+        return;
+      }
+    } else {
+      tools.adb = 'adb';
+      tools.fastboot = 'fastboot';
+      Promise.all([resolveOnPath('adb'), resolveOnPath('fastboot')]).then(([adbPath, fastbootPath]) => {
+        if (adbPath) tools.adb = adbPath;
+        if (fastbootPath) tools.fastboot = fastbootPath;
+      }).catch(() => {});
+    }
+    send({ step: 'adb', status: 'done' });
+
+    send({ step: 'scrcpy', status: 'checking' });
+    if (!(await checkOnPath('scrcpy'))) {
+      try {
+        send({ step: 'scrcpy', status: 'downloading', progress: 0 });
+        tools.scrcpy = await ensureScrcpy((p) => send({ step: 'scrcpy', status: 'downloading', progress: p }));
+      } catch (err) {
+        send({ step: 'scrcpy', status: 'error', message: err.message });
+        completeSetup();
+        return;
+      }
+    } else {
+      tools.scrcpy = 'scrcpy';
+      resolveOnPath('scrcpy').then((scrcpyPath) => {
+        if (scrcpyPath) tools.scrcpy = scrcpyPath;
+      }).catch(() => {});
+    }
+
+    await probeScrcpyVersion();
+    if (!scrcpyInfo.version) {
+      send({ step: 'scrcpy', status: 'error', message: `scrcpy at ${tools.scrcpy} did not respond to --version` });
+      completeSetup();
       return;
     }
-  } else {
-    tools.scrcpy = (await resolveOnPath('scrcpy')) || tools.scrcpy;
+    send({ step: 'scrcpy', status: 'done', message: scrcpyInfo.version });
+    completeSetup();
+  } finally {
+    clearTimeout(safetyTimer);
+    completeSetup();
   }
-
-  // Verify the binary we settled on actually runs before declaring success,
-  // so a broken extraction surfaces here instead of at the first mirror attempt.
-  await probeScrcpyVersion();
-  if (!scrcpyInfo.version) {
-    send({ step: 'scrcpy', status: 'error', message: `scrcpy at ${tools.scrcpy} did not respond to --version` });
-    send({ step: 'all', status: 'ready' });
-    return;
-  }
-  send({ step: 'scrcpy', status: 'done', message: scrcpyInfo.version });
-  send({ step: 'all', status: 'ready' });
 }
 
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    if (permission === 'media' || permission === 'videoCapture' || permission === 'audioCapture') {
+      callback(true);
+      return;
+    }
+    callback(false);
+  });
+
   const win = createWindow();
   win.webContents.once('did-finish-load', () => initTools(win));
   app.on('activate', () => {

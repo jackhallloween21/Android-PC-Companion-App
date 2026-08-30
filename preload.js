@@ -1,4 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const jsQR = require('jsqr');
+const { parsePairingQR } = require('./src/wireless');
 
 contextBridge.exposeInMainWorld('api', {
   // devices / dashboard
@@ -71,7 +73,7 @@ contextBridge.exposeInMainWorld('api', {
   stopAudio: () => ipcRenderer.invoke('audio:stop'),
   audioStatus: () => ipcRenderer.invoke('audio:status'),
   mediaKey: (serial, action) => ipcRenderer.invoke('media:key', { serial, action }),
-  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', serial),
+  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', { serial }),
 
   // camera
   listCameras: (serial) => ipcRenderer.invoke('camera:list', serial),
@@ -98,4 +100,11 @@ contextBridge.exposeInMainWorld('api', {
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
+
+  // QR scan for wireless pairing
+  decodeQR: (data, width, height) => {
+    const result = jsQR(new Uint8ClampedArray(data), width, height);
+    return result ? result.data : null;
+  },
+  parsePairingQR: (text) => parsePairingQR(text),
 });

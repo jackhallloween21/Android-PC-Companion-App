@@ -12,6 +12,7 @@
   "license": "MIT",
   "dependencies": {
     "extract-zip": "^2.0.1",
+    "jsqr": "^1.4.0",
     "tar": "^7.4.3"
   },
   "devDependencies": {
@@ -22,8 +23,16 @@
     "appId": "com.example.androidcompanion",
     "productName": "Companion",
     "publish": false,
-    "win": { "target": "nsis", "icon": "smartphone.ico" },
-    "mac": { "target": "dmg" },
-    "linux": { "target": "AppImage", "icon": "smartphone.png" }
+    "win": {
+      "target": "nsis",
+      "icon": "smartphone.ico"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "smartphone.png"
+    }
   }
 }

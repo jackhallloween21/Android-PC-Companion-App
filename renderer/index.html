@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:;" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; media-src 'self' blob: data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:;" />
 <title>Companion</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -555,7 +555,7 @@
   <div id="pair-modal" class="modal hidden">
     <div class="modal-card glass-card">
       <h3>Pair wireless device</h3>
-      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the two fields below, then read the connect port off the main Wireless debugging screen.</p>
+      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the fields below, then read the connect port off the main Wireless debugging screen. Or scan the QR code if the phone shows one.</p>
       <label class="field-label">Pairing host &amp; port <span class="muted">(from the pairing dialog)</span></label>
       <input id="pair-host" placeholder="192.168.1.23:41235" class="mono" spellcheck="false" />
       <label class="field-label">Pairing code</label>
@@ -565,7 +565,26 @@
       <p id="pair-status" class="mirror-status"></p>
       <div class="modal-actions">
         <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
+        <button id="pair-scan-qr-btn" class="ghost-btn">Scan QR</button>
         <button id="pair-submit-btn" class="primary-btn">Pair</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="qr-modal" class="modal hidden">
+    <div class="modal-card glass-card qr-modal-card">
+      <div class="modal-head">
+        <h3>Scan QR code</h3>
+        <button id="qr-modal-close" class="icon-btn">&times;</button>
+      </div>
+      <p class="muted">Point your webcam at the phone's "Pair device with QR code" screen.</p>
+      <div class="qr-viewer-wrap">
+        <video id="qr-video" autoplay playsinline muted></video>
+        <canvas id="qr-canvas" class="hidden"></canvas>
+        <div id="qr-overlay" class="qr-overlay">
+          <div class="qr-frame"></div>
+        </div>
+        <p id="qr-status" class="qr-status">Starting camera…</p>
       </div>
     </div>
   </div>
