@@ -1326,7 +1326,7 @@ ipcMain.handle('files:preview', async (_e, { serial, remotePath }) => {
     return { kind: 'image', data: `data:image/*;base64,${buf.toString('base64')}` };
   }
   if (TEXT_EXT.test(remotePath)) {
-    const out = await adb(['-s', serial, 'shell', 'head', '-c', '50000', remotePath]);
+    const out = await adb(['-s', serial, 'shell', 'head -c 50000 ' + JSON.stringify(remotePath)]);
     return { kind: 'text', data: out };
   }
   if (VIDEO_EXT.test(remotePath)) {
@@ -1472,7 +1472,7 @@ ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
   return results;
 });
 
-ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm', '-rf', remotePath]));
+ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm -rf ' + JSON.stringify(remotePath)]));
 
 // ---------------------------------------------------------------------------
 // Apps

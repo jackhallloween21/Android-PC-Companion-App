@@ -1067,10 +1067,16 @@ el('file-upload-btn').onclick = async () => {
 el('fi-delete-btn').onclick = async () => {
   if (!state.selectedFile) return;
   if (confirm('Delete ' + state.selectedFile.fullPath + ' from the device?')) {
-    await window.api.deleteFile(state.selected, state.selectedFile.fullPath);
-    el('file-inspector-body').classList.add('hidden');
-    el('file-inspector-empty').classList.remove('hidden');
-    loadFiles();
+    try {
+      await window.api.deleteFile(state.selected, state.selectedFile.fullPath);
+      toast('Deleted ' + state.selectedFile.name);
+      el('file-inspector-body').classList.add('hidden');
+      el('file-inspector-empty').classList.remove('hidden');
+      state.selectedFile = null;
+      loadFiles();
+    } catch (err) {
+      toast('Delete failed: ' + err.message);
+    }
   }
 };
 
