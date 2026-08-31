@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -21,9 +21,17 @@ const {
   splitHostPort,
   isPaired,
   isConnected,
+  listConnectTargets,
   pickConnectTarget,
   connectCandidates,
 } = require('./src/wireless');
+// QR pairing lives here, not in preload.js: the preload runs sandboxed, where
+// `require` is a polyfill that only resolves `electron` and a couple of node
+// builtins. Requiring a third-party module (or a relative file) there throws,
+// the whole preload is discarded, and the renderer is left with no window.api.
+const crypto = require('crypto');
+const { newPairingSession, findPairingEndpoint, mdnsUnavailable } = require('./src/pairing');
+const { encodeQR } = require('./src/qrencode');
 const {
   DEFAULTS: DOCK_DEFAULTS,
   ZOOM_MIN,
@@ -110,6 +118,17 @@ function createWindow() {
   });
 
   win.once('ready-to-show', () => win.show());
+  // A broken preload is otherwise completely silent: the window loads, the
+  // renderer has no window.api, and the setup overlay never moves.
+  win.webContents.on('preload-error', (_e, preloadPath, error) => {
+    console.error(`[preload] failed to load ${preloadPath}: ${error && error.message}`);
+  });
+  // A reload does not destroy the window, so without this an in-flight QR pairing
+  // session survives it and keeps driving the *new* renderer's UI — popping modals
+  // open on its own. Ctrl+R is a live accelerator via the default menu, so this is
+  // reachable by accident.
+  win.webContents.on('did-start-navigation', () => qrPairing.cancel());
+  win.on('closed', () => qrPairing.cancel());
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -122,12 +141,29 @@ const VERSION_ARGS = { adb: ['version'], fastboot: ['--version'], scrcpy: ['--ve
 
 function probeVersion(bin, args) {
   return new Promise((resolve) => {
-    execFile(bin, args, { timeout: 10000, windowsHide: true }, (err, stdout, stderr) => {
-      const text = `${stdout || ''}\n${stderr || ''}`.trim();
-      // Some builds print the banner and still exit non-zero; accept any output
-      // that actually names the tool.
-      if (err && !text) return resolve(null);
-      resolve(text || null);
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { child.kill('SIGKILL'); } catch {}
+        resolve(null);
+      }
+    }, 8000);
+    const child = spawn(bin, args, { windowsHide: true });
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', () => {
+      if (!settled) { settled = true; clearTimeout(timer); resolve(null); }
+    });
+    child.on('exit', () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        const text = `${stdout}\n${stderr}`.trim();
+        resolve(text || null);
+      }
     });
   });
 }
@@ -176,52 +212,82 @@ async function probeScrcpyVersion() {
 async function initTools(win) {
   const send = (payload) => win.webContents.send('setup:progress', payload);
 
-  send({ step: 'adb', status: 'checking' });
-  if (!(await checkOnPath('adb'))) {
-    try {
-      send({ step: 'adb', status: 'downloading', progress: 0 });
-      const { adbPath, fastbootPath } = await ensurePlatformTools((p) => send({ step: 'adb', status: 'downloading', progress: p }));
-      tools.adb = adbPath;
-      tools.fastboot = fastbootPath;
-    } catch (err) {
-      send({ step: 'adb', status: 'error', message: err.message });
-      return;
-    }
-  } else {
-    // Pin the PATH hit to an absolute path now, so scrcpy is handed the very
-    // same adb rather than repeating the lookup with a different cwd.
-    tools.adb = (await resolveOnPath('adb')) || tools.adb;
-    tools.fastboot = (await resolveOnPath('fastboot')) || tools.fastboot;
-  }
-  send({ step: 'adb', status: 'done' });
-
-  send({ step: 'scrcpy', status: 'checking' });
-  if (!(await checkOnPath('scrcpy'))) {
-    try {
-      send({ step: 'scrcpy', status: 'downloading', progress: 0 });
-      tools.scrcpy = await ensureScrcpy((p) => send({ step: 'scrcpy', status: 'downloading', progress: p }));
-    } catch (err) {
-      send({ step: 'scrcpy', status: 'error', message: err.message });
+  // Hard timeout: always complete setup within 20 seconds so the UI never hangs.
+  let completed = false;
+  const completeSetup = () => {
+    if (!completed) {
+      completed = true;
       send({ step: 'all', status: 'ready' });
+    }
+  };
+  const safetyTimer = setTimeout(() => {
+    send({ step: 'adb', status: 'error', message: 'Setup timed out. Click Continue without it to use the app.' });
+    completeSetup();
+  }, 20000);
+
+  try {
+    send({ step: 'adb', status: 'checking' });
+    if (!(await checkOnPath('adb'))) {
+      try {
+        send({ step: 'adb', status: 'downloading', progress: 0 });
+        const { adbPath, fastbootPath } = await ensurePlatformTools((p) => send({ step: 'adb', status: 'downloading', progress: p }));
+        tools.adb = adbPath;
+        tools.fastboot = fastbootPath;
+      } catch (err) {
+        send({ step: 'adb', status: 'error', message: err.message });
+        completeSetup();
+        return;
+      }
+    } else {
+      tools.adb = 'adb';
+      tools.fastboot = 'fastboot';
+      Promise.all([resolveOnPath('adb'), resolveOnPath('fastboot')]).then(([adbPath, fastbootPath]) => {
+        if (adbPath) tools.adb = adbPath;
+        if (fastbootPath) tools.fastboot = fastbootPath;
+      }).catch(() => {});
+    }
+    send({ step: 'adb', status: 'done' });
+
+    send({ step: 'scrcpy', status: 'checking' });
+    if (!(await checkOnPath('scrcpy'))) {
+      try {
+        send({ step: 'scrcpy', status: 'downloading', progress: 0 });
+        tools.scrcpy = await ensureScrcpy((p) => send({ step: 'scrcpy', status: 'downloading', progress: p }));
+      } catch (err) {
+        send({ step: 'scrcpy', status: 'error', message: err.message });
+        completeSetup();
+        return;
+      }
+    } else {
+      tools.scrcpy = 'scrcpy';
+      resolveOnPath('scrcpy').then((scrcpyPath) => {
+        if (scrcpyPath) tools.scrcpy = scrcpyPath;
+      }).catch(() => {});
+    }
+
+    await probeScrcpyVersion();
+    if (!scrcpyInfo.version) {
+      send({ step: 'scrcpy', status: 'error', message: `scrcpy at ${tools.scrcpy} did not respond to --version` });
+      completeSetup();
       return;
     }
-  } else {
-    tools.scrcpy = (await resolveOnPath('scrcpy')) || tools.scrcpy;
+    send({ step: 'scrcpy', status: 'done', message: scrcpyInfo.version });
+    completeSetup();
+  } finally {
+    clearTimeout(safetyTimer);
+    completeSetup();
   }
-
-  // Verify the binary we settled on actually runs before declaring success,
-  // so a broken extraction surfaces here instead of at the first mirror attempt.
-  await probeScrcpyVersion();
-  if (!scrcpyInfo.version) {
-    send({ step: 'scrcpy', status: 'error', message: `scrcpy at ${tools.scrcpy} did not respond to --version` });
-    send({ step: 'all', status: 'ready' });
-    return;
-  }
-  send({ step: 'scrcpy', status: 'done', message: scrcpyInfo.version });
-  send({ step: 'all', status: 'ready' });
 }
 
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    if (permission === 'media' || permission === 'videoCapture' || permission === 'audioCapture') {
+      callback(true);
+      return;
+    }
+    callback(false);
+  });
+
   const win = createWindow();
   win.webContents.once('did-finish-load', () => initTools(win));
   app.on('activate', () => {
@@ -237,10 +303,36 @@ app.on('window-all-closed', () => {
 // Process helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Turns a failed execFile into a message that is safe to show.
+ *
+ * stderr is what we want when there is any, and execFile's own message is what is
+ * left otherwise — but that message is "Command failed: <bin> <args…>", which puts
+ * the entire argv in front of the user and into the logs. On `adb pair` that argv
+ * ends with the pairing code, so the line gets dropped.
+ */
+function failureMessage(err, stderr) {
+  const text = stderr && stderr.toString().trim();
+  // `killed` is set for a `timeout` kill and *not* for a maxBuffer overrun or an
+  // ENOENT, so it is a clean timeout signal — and it has to be checked before
+  // stderr, because adb's routine "* daemon not running; starting now" chatter goes
+  // to stderr and would otherwise be reported as the reason for the failure.
+  if (err && err.killed) return `the command timed out${text ? `: ${text}` : ''}`;
+  if (text) return text;
+  const rest = String((err && err.message) || '')
+    .split('\n')
+    .filter((line) => !/^Command failed:/.test(line.trim()))
+    .join('\n')
+    .trim();
+  if (rest) return rest;
+  const code = err && (err.code ?? err.signal);
+  return `command failed${code == null ? '' : ` (${code})`}`;
+}
+
 function run(bin, args, opts = {}) {
   return new Promise((resolve, reject) => {
     execFile(bin, args, { maxBuffer: 1024 * 1024 * 32, ...opts }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr?.toString().trim() || err.message));
+      if (err) return reject(new Error(failureMessage(err, stderr)));
       resolve(stdout);
     });
   });
@@ -249,7 +341,7 @@ function run(bin, args, opts = {}) {
 function runBuffer(bin, args) {
   return new Promise((resolve, reject) => {
     execFile(bin, args, { maxBuffer: 1024 * 1024 * 64, encoding: 'buffer' }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr?.toString().trim() || err.message));
+      if (err) return reject(new Error(failureMessage(err, stderr)));
       resolve(stdout);
     });
   });
@@ -560,16 +652,16 @@ ipcMain.handle('console:run', async (_e, { serial, command }) => {
 // ---------------------------------------------------------------------------
 
 /** Runs an adb subcommand that signals failure through its output, not its exit code. */
-async function adbText(args) {
+async function adbText(args, opts = {}) {
   try {
-    return (await adb(args)).trim();
+    return (await run(tools.adb, args, opts)).trim();
   } catch (err) {
     return String(err.message || '').trim();
   }
 }
 
-async function adbConnect(target) {
-  const out = await adbText(['connect', target]);
+async function adbConnect(target, opts = {}) {
+  const out = await adbText(['connect', target], opts);
   if (isConnected(out)) return out || `connected to ${target}`;
   throw new Error(out || `Could not connect to ${target}.`);
 }
@@ -619,6 +711,247 @@ ipcMain.handle('wireless:enableTcpip', async (_e, { serial, port }) => {
   const out = await adbText(['-s', serial, 'tcpip', String(port || 5555)]);
   if (/error|failed/i.test(out)) throw new Error(out);
   return out;
+});
+
+// ---------------------------------------------------------------------------
+// QR pairing session
+//
+// Only one can be live at a time. The phone does the scanning, so after the code
+// is on screen there is nothing to do but watch mDNS for the pairing endpoint
+// the phone starts advertising the moment it accepts the code.
+// ---------------------------------------------------------------------------
+
+const QR_POLL_MS = 1000;
+const QR_TIMEOUT_MS = 120000; // the phone's pairing screen gives up around 2 min
+const QR_RENAME_GRACE_MS = 15000; // how long to insist on our own service name
+const QR_CONNECT_ATTEMPTS = 10;
+const QR_ADB_TIMEOUT_MS = 15000; // a wedged adb server can block indefinitely
+
+const qrPairing = {
+  token: 0,
+  timer: null,
+  wake: null,
+
+  cancel() {
+    this.token++;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    // Wake any pending backoff so its loop can notice the token changed and
+    // return, instead of leaving a suspended async frame around forever.
+    if (this.wake) {
+      const wake = this.wake;
+      this.wake = null;
+      wake();
+    }
+  },
+
+  /**
+   * A cancellable sleep: cancel() clears the timer *and* resolves the promise.
+   *
+   * `timer`/`wake` are single shared slots, so a superseded session's loop can
+   * clobber a live session's handle here. That is only harmless because every
+   * resume point re-checks `alive()` — do not remove those checks.
+   */
+  sleep(ms) {
+    return new Promise((resolve) => {
+      this.wake = resolve;
+      this.timer = setTimeout(() => {
+        this.wake = null;
+        this.timer = null;
+        resolve();
+      }, ms);
+    });
+  },
+
+  start(session, win) {
+    this.cancel();
+    const token = ++this.token;
+    const alive = () => token === this.token && win && !win.isDestroyed();
+    const send = (payload) => {
+      if (alive()) win.webContents.send('wireless:qrPairProgress', payload);
+    };
+    // Every adb call here is bounded: cancel() can stop the loop but not a child
+    // process it is already waiting on, and a hung `adb pair` would otherwise
+    // outlive the modal that started it.
+    const adbQr = (args) => adbText(args, { timeout: QR_ADB_TIMEOUT_MS });
+
+    const started = Date.now();
+    let strangerTarget = null; // the unrecognised endpoint currently being waited out
+    let strangerSeenAt = null; // …and when it first showed up
+    let renameTried = false; // an unrecognised endpoint has already been tried once
+
+    const poll = async () => {
+      if (!alive()) return;
+      // Bounding the whole session here, rather than only in the "nothing found"
+      // branch, is what keeps every reschedule path finite — including the ones that
+      // re-poll after a pairing attempt against the wrong endpoint.
+      if (Date.now() - started > QR_TIMEOUT_MS) {
+        send({ phase: 'error', message: 'Timed out waiting for the phone to scan the code.' });
+        return;
+      }
+
+      const mdns = await adbQr(['mdns', 'services']);
+      if (!alive()) return;
+
+      // An unrecognised pairing row is the ambiguous case: it may be our phone
+      // under a ROM-specific service name, or a *different* phone with its own
+      // pairing dialog open — including the "Pair with code" dialog this app's own
+      // instructions tell people to open. Give our own name a chance to appear
+      // first, timed from when that endpoint was first seen rather than from the
+      // start of the session: the user needs half a minute just to walk through the
+      // phone's menus, so a clock started at session time would always have expired
+      // by the time anything was advertised at all.
+      const candidate = findPairingEndpoint(mdns, session.name, { allowRename: !renameTried });
+      let endpoint = null;
+      if (candidate && candidate.name === session.name) {
+        endpoint = candidate;
+      } else if (candidate) {
+        // Keyed to the endpoint, so a *different* stranger appearing later starts its
+        // own grace period instead of inheriting an expired one.
+        if (strangerTarget !== candidate.target) {
+          strangerTarget = candidate.target;
+          strangerSeenAt = Date.now();
+        }
+        if (Date.now() - strangerSeenAt > QR_RENAME_GRACE_MS) endpoint = candidate;
+      }
+
+      if (!endpoint) {
+        reschedule();
+        return;
+      }
+
+      const ours = endpoint.name === session.name;
+      send({ phase: 'pairing', message: `Phone found at ${endpoint.target}. Pairing…` });
+      const paired = await adbQr(['pair', endpoint.target, session.password]);
+      if (!alive()) return;
+      if (!isPaired(paired)) {
+        const timedOut = /timed out/i.test(paired);
+        if (!ours) {
+          // That endpoint was not advertised under our service name and it did not
+          // accept our password, so it was someone else's pairing dialog. Not a
+          // reason to end a session the user's phone may still be about to join —
+          // just stop trying that endpoint. A timeout is not evidence either way, so
+          // it does not disqualify a genuinely renamed ROM.
+          if (!timedOut) renameTried = true;
+          send({
+            phase: 'waiting',
+            message: timedOut
+              ? 'adb did not answer in time. Still waiting for the scan…'
+              : 'Found a different phone pairing, not this code. Still waiting for the scan…',
+          });
+          reschedule();
+          return;
+        }
+        send({ phase: 'error', message: paired || 'adb pair failed without saying why.' });
+        return;
+      }
+
+      // Pairing is only the key exchange; the device shows up in `adb devices`
+      // only after a connect on the separate _adb-tls-connect port. That record
+      // usually lags the pairing one by a second or two, hence the retries.
+      send({ phase: 'connecting', message: 'Paired. Connecting…' });
+      const elsewhere = new Set();
+      let refused = null;
+      for (let attempt = 0; attempt < QR_CONNECT_ATTEMPTS; attempt++) {
+        if (!alive()) return;
+        // One snapshot per attempt, filtered to the host we just paired with.
+        // Accepting any advertised connect port would let the app connect to a
+        // second phone on the network and report it as a success, while the phone
+        // the user actually paired never shows up.
+        const advertised = listConnectTargets(await adbQr(['mdns', 'services']));
+        if (!alive()) return;
+        const match = advertised.find((entry) => entry.host === endpoint.host);
+        for (const entry of advertised) {
+          if (entry.host !== endpoint.host) elsewhere.add(entry.target);
+        }
+        if (match) {
+          refused = match.target;
+          try {
+            const message = await adbConnect(match.target, { timeout: QR_ADB_TIMEOUT_MS });
+            if (!alive()) return;
+            send({ phase: 'connected', message, target: match.target });
+            return;
+          } catch (err) {
+            send({ phase: 'connecting', message: `${match.target}: ${err.message} — retrying…` });
+          }
+        }
+        await this.sleep(QR_POLL_MS);
+      }
+
+      send({
+        phase: 'paired',
+        host: endpoint.host,
+        // Two different failures, and telling them apart matters: a port that was
+        // never advertised is something the user can supply by hand, while a port
+        // that refused the connection is not.
+        message: refused
+          ? `Paired with ${endpoint.host}, but ${refused} kept refusing the connection. `
+            + 'Check the "IP address & port" line on the phone\'s Wireless debugging screen.'
+          : `Paired with ${endpoint.host}, but no connect port was advertised for it. Enter the port `
+            + 'from the "IP address & port" line on the phone\'s Wireless debugging screen — not the '
+            + 'one from the pairing dialog.'
+            // Worth saying out loud: refusing these is deliberate (they belong to
+            // some other device), but going silent looks like nothing was found.
+            + (elsewhere.size ? ` Ignored ports at other addresses: ${[...elsewhere].join(', ')}.` : ''),
+      });
+    };
+
+    // Each poll re-arms itself, which detaches it from runSession()'s catch — so the
+    // catch has to be re-attached every time or a rejection becomes an unhandled one
+    // in the main process and the modal just waits forever.
+    const reschedule = () => {
+      this.timer = setTimeout(() => {
+        poll().catch((err) => send({ phase: 'error', message: err.message }));
+      }, QR_POLL_MS);
+    };
+
+    const runSession = async () => {
+      // `adb mdns check` is the only subcommand that reports on the backend;
+      // `mdns services` stays quiet when the daemon is dead, so checking it would
+      // just turn a broken adb into a two-minute timeout blaming the phone.
+      const check = await adbQr(['mdns', 'check']);
+      if (!alive()) return;
+      if (mdnsUnavailable(check)) {
+        // Deliberately vague about the cause: a dead daemon, an unreachable adb
+        // server and a timed-out check all land here, and all have the same remedy.
+        send({
+          phase: 'error',
+          message: "adb's mDNS service is not responding, so the phone cannot be found after it "
+            + 'scans. Use "Pair with code" instead, or restart the adb server.',
+        });
+        return;
+      }
+      await poll();
+    };
+
+    runSession().catch((err) => send({ phase: 'error', message: err.message }));
+  },
+};
+
+// QR pairing runs here, in main: the renderer only receives a matrix of dark/
+// light modules to draw. The phone is the scanner — see src/pairing.js for the
+// handshake — so the app needs an encoder, not jsqr's decoder.
+ipcMain.handle('wireless:qrPairStart', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  // Without a window there is nowhere to send progress to, and the session would
+  // sit there invisibly until it timed out. Fail the call instead.
+  if (!win) throw new Error('Lost the window that asked for pairing.');
+  qrPairing.cancel();
+
+  const session = newPairingSession(crypto.randomBytes);
+  const qr = encodeQR(session.payload, { ecc: 'M' });
+  qrPairing.start(session, win);
+
+  // The password stays in main. It is inside the rendered matrix by necessity,
+  // but there is no reason to hand the renderer a copy in plain text as well.
+  return { size: qr.size, modules: qr.modules, name: session.name };
+});
+
+ipcMain.handle('wireless:qrPairCancel', async () => {
+  qrPairing.cancel();
+  return true;
 });
 
 // ---------------------------------------------------------------------------

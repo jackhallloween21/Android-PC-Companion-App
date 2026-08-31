@@ -12,21 +12,31 @@ function binDir() {
 
 // Node 18+/Electron ships a global fetch — no extra HTTP dependency needed.
 async function download(url, destFile, onProgress) {
-  const res = await fetch(url, { headers: { 'User-Agent': 'android-pc-companion' } });
-  if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
-  const total = Number(res.headers.get('content-length') || 0);
-  let received = 0;
-  const fileStream = fs.createWriteStream(destFile);
-  const reader = res.body.getReader();
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    received += value.length;
-    fileStream.write(Buffer.from(value));
-    if (onProgress && total) onProgress(received / total);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'android-pc-companion' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
+    const total = Number(res.headers.get('content-length') || 0);
+    let received = 0;
+    const fileStream = fs.createWriteStream(destFile);
+    const reader = res.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.length;
+      fileStream.write(Buffer.from(value));
+      if (onProgress && total) onProgress(received / total);
+    }
+    await new Promise((resolve, reject) => fileStream.end((err) => (err ? reject(err) : resolve())));
+  } catch (err) {
+    clearTimeout(timeout);
+    throw new Error(`Download failed: ${err.message}`);
   }
-  await new Promise((resolve, reject) => fileStream.end((err) => (err ? reject(err) : resolve())));
 }
 
 // ---------------------------------------------------------------------------
@@ -90,16 +100,25 @@ function pickScrcpyAsset(assets) {
 }
 
 async function latestScrcpyAsset() {
-  const res = await fetch('https://api.github.com/repos/Genymobile/scrcpy/releases/latest', {
-    headers: { 'User-Agent': 'android-pc-companion' },
-  });
-  if (!res.ok) throw new Error(`Could not check the latest scrcpy release (HTTP ${res.status})`);
-  const data = await res.json();
-  const asset = pickScrcpyAsset(data.assets || []);
-  if (!asset) {
-    throw new Error(`No scrcpy release asset matched ${process.platform}/${process.arch}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch('https://api.github.com/repos/Genymobile/scrcpy/releases/latest', {
+      headers: { 'User-Agent': 'android-pc-companion' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`Could not check the latest scrcpy release (HTTP ${res.status})`);
+    const data = await res.json();
+    const asset = pickScrcpyAsset(data.assets || []);
+    if (!asset) {
+      throw new Error(`No scrcpy release asset matched ${process.platform}/${process.arch}`);
+    }
+    return asset;
+  } catch (err) {
+    clearTimeout(timeout);
+    throw new Error(`Could not check the latest scrcpy release: ${err.message}`);
   }
-  return asset;
 }
 
 // The archives contain a top-level versioned directory (scrcpy-win64-v3.3/…),

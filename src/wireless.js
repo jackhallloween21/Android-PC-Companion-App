@@ -10,6 +10,9 @@
 //
 // Both commands also report failure on stdout and frequently still exit 0, so
 // their output text has to be classified rather than trusted.
+//
+// QR pairing is a separate flow and lives in src/pairing.js: the PC displays the
+// code and the phone scans it, so there is nothing here that parses a QR.
 // ---------------------------------------------------------------------------
 
 const PAIR_OK = /successfully paired/i;
@@ -34,19 +37,33 @@ function isConnected(output) {
   return CONNECT_OK.test(String(output || ''));
 }
 
+const ADDRESS = /(\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}):(\d+)/i;
+
 /**
- * Pulls the connect target out of `adb mdns services`, whose rows look like
+ * Every _adb-tls-connect endpoint in `adb mdns services`, in the order adb listed
+ * them. Rows look like
  *   adb-39041FDJH00BQZ-vWLnDS  _adb-tls-connect._tcp.  192.168.1.23:37123
- * Only the _adb-tls-connect service is usable; _adb-tls-pairing is the
- * short-lived pairing endpoint and connecting to it fails.
+ * Only _adb-tls-connect is usable; _adb-tls-pairing is the short-lived pairing
+ * endpoint and connecting to it fails.
  */
-function pickConnectTarget(mdnsOutput, host = null) {
+function listConnectTargets(mdnsOutput) {
+  const found = [];
   for (const line of String(mdnsOutput || '').split('\n')) {
     if (!/_adb-tls-connect/.test(line)) continue;
-    const m = line.match(/(\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}):(\d+)/i);
-    if (m && (!host || m[1] === host)) return `${m[1]}:${m[2]}`;
+    const m = line.match(ADDRESS);
+    if (m) found.push({ target: `${m[1]}:${m[2]}`, host: m[1], port: m[2] });
   }
-  return null;
+  return found;
+}
+
+/**
+ * The first advertised connect target, optionally restricted to one host. Filtering
+ * matters after a QR pairing: taking any advertised endpoint could connect to a
+ * different phone on the network and report it as success.
+ */
+function pickConnectTarget(mdnsOutput, host = null) {
+  const match = listConnectTargets(mdnsOutput).find((entry) => !host || entry.host === host);
+  return match ? match.target : null;
 }
 
 /**
@@ -66,6 +83,7 @@ module.exports = {
   splitHostPort,
   isPaired,
   isConnected,
+  listConnectTargets,
   pickConnectTarget,
   connectCandidates,
 };

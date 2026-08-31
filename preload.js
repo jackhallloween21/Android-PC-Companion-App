@@ -1,3 +1,9 @@
+// This preload runs sandboxed (webPreferences.sandbox = true), where `require`
+// is a polyfill that resolves only `electron` and a handful of node builtins.
+// Requiring anything else — a node_module like jsqr, or a relative file like
+// ./src/wireless — throws, Electron discards the entire preload, and the
+// renderer boots with no window.api at all (which looked like the app hanging
+// forever on "Setting up tools"). Keep this file to `electron` only.
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
@@ -71,7 +77,7 @@ contextBridge.exposeInMainWorld('api', {
   stopAudio: () => ipcRenderer.invoke('audio:stop'),
   audioStatus: () => ipcRenderer.invoke('audio:status'),
   mediaKey: (serial, action) => ipcRenderer.invoke('media:key', { serial, action }),
-  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', serial),
+  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', { serial }),
 
   // camera
   listCameras: (serial) => ipcRenderer.invoke('camera:list', serial),
@@ -98,4 +104,12 @@ contextBridge.exposeInMainWorld('api', {
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
+
+  // QR pairing. The PC *shows* the code and the phone scans it, so this returns
+  // a module matrix for the renderer to draw; progress arrives as events while
+  // main watches mDNS for the phone.
+  startQrPairing: () => ipcRenderer.invoke('wireless:qrPairStart'),
+  cancelQrPairing: () => ipcRenderer.invoke('wireless:qrPairCancel'),
+  onQrPairProgress: (callback) =>
+    ipcRenderer.on('wireless:qrPairProgress', (_e, payload) => callback(payload)),
 });

@@ -9,6 +9,7 @@ const {
   splitHostPort,
   isPaired,
   isConnected,
+  listConnectTargets,
   pickConnectTarget,
   connectCandidates,
 } = require('../src/wireless');
@@ -52,6 +53,21 @@ test('mDNS discovery picks the connect service, never the pairing one', () => {
   assert.strictEqual(pickConnectTarget(''), null);
 });
 
+test('every advertised connect endpoint can be listed', () => {
+  // The QR flow only ever connects to the host it just paired with, but it reports
+  // the endpoints it skipped — otherwise refusing them looks like finding nothing.
+  assert.deepStrictEqual(listConnectTargets(MDNS), [
+    { target: '192.168.1.23:37123', host: '192.168.1.23', port: '37123' },
+    { target: '192.168.1.44:45001', host: '192.168.1.44', port: '45001' },
+  ]);
+  assert.deepStrictEqual(listConnectTargets(''), []);
+  assert.deepStrictEqual(
+    listConnectTargets('adb-X\t_adb-tls-pairing._tcp.\t192.168.1.23:41235'),
+    [],
+    'the pairing service is not a connect endpoint'
+  );
+});
+
 test('an explicit connect port is tried before mDNS discovery', () => {
   assert.deepStrictEqual(
     connectCandidates('192.168.1.23', '37123', MDNS),
@@ -74,3 +90,4 @@ test('an explicit connect port is tried before mDNS discovery', () => {
     'nothing to try when the port is unknown and mDNS is silent'
   );
 });
+
