@@ -11,6 +11,33 @@ const state = {
 const el = (id) => document.getElementById(id);
 const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+// Writes text only when it actually changed. The dashboard repaints every
+// second, and reassigning textContent on an unchanged node still invalidates
+// layout — which is visible as flicker on the wide monospace rows.
+function setText(id, text) {
+  const node = el(id);
+  if (!node) return;
+  const next = text === null || text === undefined ? '' : String(text);
+  if (node.textContent !== next) node.textContent = next;
+}
+
+// Transient message. Created on demand so index.html does not need a slot for
+// it, and self-removing so a stack of them cannot build up.
+let toastTimer = null;
+function toast(message) {
+  let node = el('toast');
+  if (!node) {
+    node = document.createElement('div');
+    node.id = 'toast';
+    node.className = 'toast';
+    document.body.appendChild(node);
+  }
+  node.textContent = message;
+  node.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.remove('show'), 6000);
+}
+
 // -------------------------------------------------------------- first-run setup
 
 let setupFailed = false;
@@ -18,7 +45,7 @@ let setupFailed = false;
 function enterShell() {
   el('setup-overlay').classList.add('hidden');
   el('shell').classList.remove('hidden');
-  refreshDevices();
+  refreshDevices().then(autoconnectKnown);
 }
 
 el('setup-continue').onclick = enterShell;
@@ -71,7 +98,7 @@ el('close-btn').onclick = () => window.api.close();
 // ------------------------------------------------------------------ nav
 
 qAll('.nav-item[data-view]').forEach((btn) => (btn.onclick = () => setView(btn.dataset.view)));
-qAll('.launcher[data-view]').forEach((btn) => (btn.onclick = () => setView(btn.dataset.view)));
+qAll('.launcher[data-view], .link-btn[data-view]').forEach((btn) => (btn.onclick = () => setView(btn.dataset.view)));
 el('tools-nav-btn').onclick = () => openToolsModal();
 
 function setView(view) {
@@ -84,8 +111,9 @@ function setView(view) {
 
 function refreshView(view) {
   if (view !== 'hardware') stopHardwarePolling();
+  if (view !== 'dashboard') stopDashboardPolling();
   if (!state.selected) return;
-  if (view === 'dashboard') loadDashboard();
+  if (view === 'dashboard') { loadDashboard(); loadStorage(); startDashboardPolling(); }
   if (view === 'files') loadFiles();
   if (view === 'apps') loadApps();
   if (view === 'hardware') { loadHardware(); startHardwarePolling(); }
@@ -101,9 +129,75 @@ el('device-modal-close').onclick = () => el('device-modal').classList.add('hidde
 async function refreshDevices() {
   const devices = await window.api.listDevices();
   state.devices = devices;
+  // A device that has gone away may come back as a different build (or after an
+  // OTA), so its cached static specs must not survive the disconnect.
+  const present = new Set(devices.map((d) => d.serial));
+  for (const serial of [...specsCache.keys()]) {
+    if (!present.has(serial)) specsCache.delete(serial);
+  }
   renderDeviceList();
   updateTitlebarStatus();
+  renderKnownDevices();
 }
+
+// The remembered list, minus anything already attached — showing a phone as
+// "paired earlier" while it is connected right above would just be confusing.
+async function renderKnownDevices() {
+  const section = el('known-section');
+  const list = el('known-list');
+  let known = [];
+  try { known = await window.api.listKnownDevices(); } catch { /* first run */ }
+
+  const attached = new Set(state.devices.map((d) => d.serial));
+  const offline = known.filter((k) => !attached.has(`${k.host}:${k.port}`));
+  section.classList.toggle('hidden', !offline.length);
+  list.innerHTML = '';
+
+  offline.forEach((k) => {
+    const row = document.createElement('div');
+    row.className = 'known-row';
+    row.innerHTML = `
+      <div class="known-id">
+        <span class="model">${k.label || k.deviceSerial || k.host}</span>
+        <span class="serial mono">${k.host}${k.port ? `:${k.port}` : ''}</span>
+      </div>`;
+    const connect = document.createElement('button');
+    connect.className = 'ghost-btn small';
+    connect.textContent = 'Connect';
+    connect.onclick = async () => {
+      connect.disabled = true;
+      connect.textContent = 'Connecting…';
+      try {
+        // Autoconnect rather than a direct connect to this address: the port may
+        // have changed since it was remembered, and only mDNS knows the new one.
+        const res = await window.api.autoconnect();
+        await refreshDevices();
+        const hit = res.connected.find((c) => c.target.startsWith(`${k.host}:`)) || res.connected[0];
+        if (hit) selectDevice(hit.target);
+        else toast(`Could not reach ${k.host}. Check the phone is on the same network with wireless debugging on.`);
+      } finally {
+        connect.disabled = false;
+        connect.textContent = 'Connect';
+      }
+    };
+    const forget = document.createElement('button');
+    forget.className = 'icon-btn';
+    forget.title = 'Forget this device';
+    forget.textContent = '×';
+    forget.onclick = async () => {
+      await window.api.forgetKnownDevice(k.deviceSerial || k.host);
+      renderKnownDevices();
+    };
+    row.append(connect, forget);
+    list.appendChild(row);
+  });
+}
+
+el('known-reconnect').onclick = async (e) => {
+  e.currentTarget.disabled = true;
+  try { await autoconnectKnown(); } finally { e.currentTarget.disabled = false; }
+  renderKnownDevices();
+};
 
 function renderDeviceList() {
   const list = el('device-list');
@@ -125,6 +219,23 @@ function renderDeviceList() {
     chip.onclick = () => selectDevice(d.serial);
     list.appendChild(chip);
   });
+}
+
+// Re-attaches phones paired in an earlier session. Runs once at startup: the
+// pairing key on the phone is permanent, so all that is needed is `adb connect`
+// at whatever address the device is on now — the user should never have to open
+// the pairing screen for a phone they have already paired.
+async function autoconnectKnown() {
+  let result;
+  try { result = await window.api.autoconnect(); }
+  catch { return; }
+  if (!result || !result.connected.length) return;
+  await refreshDevices();
+  const names = result.connected.map((c) => c.target).join(', ');
+  toast(`Reconnected to ${names} — no pairing needed.`);
+  // Nothing was selected before, so adopt what we just found rather than making
+  // the user open the picker.
+  if (!state.selected) selectDevice(result.connected[0].target);
 }
 
 function selectDevice(serial) {
@@ -152,71 +263,292 @@ function updateTitlebarStatus() {
 
 // -------------------------------------------------------------------- dashboard
 
-async function loadDashboard() {
-  const serial = state.selected;
-  const [info, battery, perf, hw, storage] = await Promise.all([
-    window.api.getDeviceInfo(serial),
-    window.api.getBattery(serial),
-    window.api.getPerformance(serial),
-    window.api.getHardware(serial),
-    window.api.getStorageBreakdown(serial),
-  ]);
+// ---------------------------------------------------------------------------
+// Dashboard
+//
+// The live half (CPU, RAM, battery) comes from one batched `device:telemetry`
+// call and is polled; the static half (model, Android version, patch level) is
+// fetched once per serial. Storage is polled far more slowly than the rest,
+// because `dumpsys diskstats` reads a cache Android refreshes on its own
+// schedule — asking every second would cost an adb round trip for a number that
+// cannot have changed.
+// ---------------------------------------------------------------------------
 
-  el('dash-model').textContent = info['ro.product.model'] || serial;
-  el('dash-serial').textContent = `SN: ${serial}`;
-  el('dash-android').textContent = `Android ${info['ro.build.version.release'] || '?'} (API ${info['ro.build.version.sdk'] || '?'})`;
-  el('dash-ip').textContent = info.ip ? `${info.ip}` : '';
+const LAUNCHERS = [
+  { view: 'mirror', label: 'Scrcpy mirror', sub: 'Start a live session', color: 'var(--cat-apps)', icon: '<rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8"/>' },
+  { view: 'apps', label: 'App debloater', sub: 'Sideload / disable', color: 'var(--cat-photos)', icon: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14.5v6M14.5 17.5h6"/>' },
+  { view: 'multimedia', label: 'Webcam bridge', sub: 'Camera + microphone', color: 'var(--cat-videos)', icon: '<path d="M2.5 7.5h11v9h-11z" /><path d="M13.5 12l8-4v8z"/>' },
+  { view: 'console', label: 'ADB shell', sub: 'Raw commands', color: 'var(--cat-audio)', icon: '<rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="M6.5 9.5l3 2.5-3 2.5M12 15h5"/>' },
+];
 
-  const infoGrid = el('dash-info-grid');
-  infoGrid.innerHTML = '';
-  const rows = [
-    ['Manufacturer', info['ro.product.manufacturer']],
-    ['Bootloader', info.bootloaderLocked === '1' ? 'Locked' : info.bootloaderLocked === '0' ? 'Unlocked' : 'Unknown'],
-    ['Security patch', info['ro.build.version.security_patch']],
-    ['CPU ABI', info['ro.product.cpu.abi']],
-  ];
-  rows.forEach(([k, v]) => {
-    const cell = document.createElement('div');
-    cell.className = 'data-cell';
-    cell.innerHTML = `<span class="k">${k}</span><span class="v">${v || '—'}</span>`;
-    infoGrid.appendChild(cell);
-  });
-
-  const level = Number(battery.level || 0);
-  el('battery-ring').style.setProperty('--pct', level);
-  el('battery-pct').textContent = `${level}%`;
-  el('dash-batt-status').textContent = /2|charg/i.test(battery.status || '') ? 'Charging' : 'On battery';
-  el('dash-health').textContent = battery.health || '—';
-  el('dash-cycles').textContent = battery['cycle count'] || 'N/A';
-  el('dash-temp').textContent = battery.temperature ? `${(Number(battery.temperature) / 10).toFixed(1)}°C` : '—';
-  el('dash-voltage').textContent = battery.voltage ? `${(Number(battery.voltage) / 1000).toFixed(2)} V` : '—';
-
-  el('dash-procs').textContent = perf.processCount ? `${perf.processCount} processes` : '';
-  el('dash-load').textContent = perf.loadavg || '—';
-  const usedGb = Number(hw.ramUsedGb || 0);
-  const totalGb = Number(hw.ramTotalGb || 0);
-  el('dash-mem').textContent = totalGb ? `${usedGb} / ${totalGb} GB` : '—';
-  el('mem-bar').style.width = totalGb ? `${Math.min(100, (usedGb / totalGb) * 100)}%` : '0%';
-
-  const storeUsed = Number(hw.storageUsedGb || 0);
-  const storeTotal = Number(hw.storageTotalGb || 0);
-  el('dash-storage-total').textContent = storeTotal ? `${storeUsed} / ${storeTotal} GB` : '';
-  el('storage-bar').style.width = storeTotal ? `${Math.min(100, (storeUsed / storeTotal) * 100)}%` : '0%';
-
-  const breakdownGrid = el('storage-breakdown-grid');
-  breakdownGrid.innerHTML = '';
-  Object.entries(storage).forEach(([k, v]) => {
-    const cell = document.createElement('div');
-    cell.className = 'data-cell';
-    cell.innerHTML = `<span class="k">${k}</span><span class="v">${v || '—'}</span>`;
-    breakdownGrid.appendChild(cell);
+function renderLaunchers() {
+  const grid = el('dash-launchers');
+  if (!grid || grid.childElementCount) return;
+  LAUNCHERS.forEach((l) => {
+    const btn = document.createElement('button');
+    btn.className = 'launcher';
+    btn.dataset.view = l.view;
+    btn.innerHTML = `
+      <span class="launcher-icon" style="--tile:${l.color}">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round">${l.icon}</svg>
+      </span>
+      <span class="launcher-text">
+        <span class="launcher-label">${l.label}</span>
+        <span class="muted tiny">${l.sub}</span>
+      </span>`;
+    btn.onclick = () => setView(l.view);
+    grid.appendChild(btn);
   });
 }
+
+/** Bytes as a short string. Mirrors src/storage.js formatBytes. */
+function bytesText(bytes) {
+  if (bytes === null || bytes === undefined || !Number.isFinite(Number(bytes)) || Number(bytes) < 0) return '—';
+  const n = Number(bytes);
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u += 1; }
+  return `${v.toFixed(v < 100 ? 1 : 0)} ${units[u]}`;
+}
+
+/**
+ * One volume: a multi-colour bar whose segments are the measured categories,
+ * plus a legend built from the same list so the two cannot disagree.
+ *
+ * Free space is drawn as the remainder of the track rather than as a segment, so
+ * the bar reads as "how full is this" at a glance.
+ */
+function volumeMarkup(vol) {
+  const total = vol.totalBytes || 0;
+  const pct = (b) => (total ? Math.max(0, (b / total) * 100) : 0);
+  const segments = (vol.segments || []).filter((s) => s.bytes > 0);
+  const bars = segments.map((s) => `<span class="seg" style="width:${pct(s.bytes).toFixed(3)}%;background:${s.color}"
+      title="${s.label}: ${bytesText(s.bytes)}"></span>`).join('');
+  const legend = segments.concat(
+    vol.freeBytes ? [{ key: 'free', label: 'Free', color: 'var(--track)', bytes: vol.freeBytes }] : []
+  ).map((s) => `<span class="legend-item"><span class="legend-dot" style="background:${s.color}"></span>${s.label}
+      <span class="mono muted">${bytesText(s.bytes)}</span></span>`).join('');
+
+  const note = vol.categorised
+    ? ''
+    : vol.removable
+      ? 'Android measures categories for internal storage only, so a card shows total usage.'
+      : 'Category sizes are unavailable on this device, so only total usage is shown.';
+
+  return `
+    <div class="volume">
+      <div class="volume-head">
+        <span class="volume-name">${vol.label}${vol.removable ? '' : ''}</span>
+        <span class="mono muted tiny">${bytesText(vol.usedBytes)} of ${bytesText(vol.totalBytes)}
+          · ${bytesText(vol.freeBytes)} free</span>
+      </div>
+      <div class="seg-track">${bars}</div>
+      <div class="legend">${legend}</div>
+      ${note ? `<div class="muted tiny">${note}</div>` : ''}
+    </div>`;
+}
+
+async function loadDashboard() {
+  const serial = state.selected;
+  if (!serial) return;
+  renderLaunchers();
+
+  const [telemetry, specs] = await Promise.all([
+    window.api.getTelemetry(serial).then((t) => t, (e) => ({ error: e.message })),
+    loadSpecs(serial),
+  ]);
+  const { hw, info, soc } = specs;
+  const power = telemetry.error ? {} : (telemetry.power || {});
+  const perf = telemetry.error ? {} : (telemetry.perf || {});
+
+  // --- identity -------------------------------------------------------------
+  const wireless = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+  setText('dash-model', (info['ro.product.model'] || serial).replace(/_/g, ' '));
+  const codename = el('dash-codename');
+  codename.textContent = info['ro.product.manufacturer'] || '';
+  codename.classList.toggle('hidden', !codename.textContent);
+  setText('dash-transport', wireless ? 'Wireless debugging' : 'USB debugging');
+  setText('dash-android', info['ro.build.version.release']
+    ? `Android ${info['ro.build.version.release']} (API ${info['ro.build.version.sdk'] || '?'})`
+    : 'Android ?');
+  setText('dash-serial', `SN: ${info['ro.boot.serialno'] || serial}`);
+  setText('dash-ip', info.ip || '');
+  setText('dash-secpatch', info['ro.build.version.security_patch'] || 'Not reported');
+  setText('dash-selinux', info.selinux || 'Unknown');
+  setText('dash-bootloader', info.bootloaderLocked === '1' ? 'Locked'
+    : info.bootloaderLocked === '0' ? 'Unlocked' : 'Unknown');
+  setText('dash-transport-detail', wireless ? `TCP/IP · ${serial}` : 'USB');
+
+  // --- battery --------------------------------------------------------------
+  const level = power.level ?? 0;
+  const ring = el('battery-ring');
+  ring.style.setProperty('--pct', level);
+  ring.classList.toggle('critical', level <= 15);
+  ring.classList.toggle('warn', level > 15 && level <= 35);
+  setText('battery-pct', power.level === null || power.level === undefined ? '—' : `${power.level}%`);
+  setText('dash-batt-eta', formatEta(power.minutesRemaining, power.charging));
+  const battStatus = el('dash-batt-status');
+  battStatus.textContent = power.charging ? 'Charging' : 'On battery';
+  battStatus.classList.toggle('badge-online', !!power.charging);
+
+  // A measured draw when the gauge publishes one; otherwise the negotiated
+  // ceiling, marked "≤" so it is never read as a measurement.
+  setText('dash-watts', power.watts ? `${power.watts.toFixed(1)} W`
+    : power.maxChargeWatts ? `≤ ${power.maxChargeWatts.toFixed(0)} W` : '—');
+  setText('dash-temp', power.batteryTemp === null || power.batteryTemp === undefined
+    ? '—' : `${power.batteryTemp.toFixed(1)}°C`);
+  const health = healthLabel(power);
+  const healthEl = el('dash-health');
+  healthEl.textContent = health.text;
+  healthEl.className = 'v' + (health.pct === null ? ''
+    : health.pct >= 85 ? ' good' : health.pct >= 70 ? ' warn' : ' bad');
+  setText('dash-cycles', power.cycleCount ?? 'Not counted');
+  el('dash-cycles').title = (power.notes || {}).cycleCount || '';
+
+  // --- CPU ------------------------------------------------------------------
+  setText('dash-procs', perf.processCount ? `${perf.processCount} processes` : '');
+  const load = perf.cpuOverallPct;
+  setText('dash-load', load === null || load === undefined ? '—' : `${load}%`);
+  el('dash-load-bar').style.width = `${load || 0}%`;
+  const socTemp = perf.socTempC ?? power.socTemp ?? null;
+  setText('dash-soc-temp', socTemp === null ? '—' : `${socTemp.toFixed(1)}°C`);
+
+  const cores = perf.cores || [];
+  setText('dash-cores-label', cores.length
+    ? `${cores.length}-core cluster frequencies${soc.clusterSummary ? ` · ${soc.clusterSummary}` : ''}`
+    : 'Per-core load is not readable on this device');
+  const coreGrid = el('dash-cores');
+  coreGrid.innerHTML = cores.map((c) => {
+    const pct = c.pct === null || c.pct === undefined ? null : c.pct;
+    const hue = pct === null ? 'var(--track)' : pct >= 80 ? 'var(--cat-system)'
+      : pct >= 45 ? 'var(--cat-videos)' : 'var(--cat-photos)';
+    return `<div class="core${c.online ? '' : ' offline'}" title="${
+      c.online ? `Core ${c.index}` : `Core ${c.index} — offline (parked by the kernel)`}">
+      <div class="core-bar"><span style="height:${pct === null ? 0 : pct}%;background:${hue}"></span></div>
+      <span class="core-pct mono">${pct === null ? '—' : `${pct}%`}</span>
+      <span class="core-name mono muted">C${c.index}</span>
+      <span class="core-ghz mono muted">${c.curGhz ? `${c.curGhz.toFixed(2)}` : '—'}</span>
+    </div>`;
+  }).join('');
+
+  // --- RAM ------------------------------------------------------------------
+  setText('dash-ram-title', soc.ddrType ? `${soc.ddrType} system memory` : 'System memory');
+  const memPct = perf.memUsedPct;
+  const memBadge = el('dash-mem-pct');
+  memBadge.textContent = memPct === null || memPct === undefined ? '' : `${memPct}% utilised`;
+  memBadge.className = 'badge' + (memPct >= 90 ? ' badge-bad' : memPct >= 75 ? ' badge-warn' : '');
+  setText('dash-mem', perf.memTotalBytes
+    ? `${bytesText(perf.memUsedBytes)} / ${bytesText(perf.memTotalBytes)}`
+    : (hw.ramTotalGb ? `${hw.ramUsedGb || '?'} / ${hw.ramTotalGb} GB` : '—'));
+  el('mem-bar').style.width = `${memPct || 0}%`;
+  // kernel vs app PSS, which only `dumpsys meminfo` knows. Absent on some builds,
+  // so the cells are only drawn when the split was actually measured.
+  const split = [
+    ['Android OS &amp; system', perf.kernelBytes],
+    ['Foreground apps', perf.appBytes],
+    ['Swap in use', perf.swapUsedBytes],
+    ['Available', perf.memAvailableBytes],
+  ].filter(([, v]) => Number.isFinite(v) && v > 0);
+  el('dash-mem-split').innerHTML = split
+    .map(([k, v]) => `<div class="data-cell"><span class="k">${k}</span><span class="v">${bytesText(v)}</span></div>`)
+    .join('');
+
+  if (telemetry.error) setText('dash-storage-note', `Telemetry unavailable: ${telemetry.error}`);
+}
+
+// Storage is polled on a much longer cycle than CPU/RAM: `df` is cheap but the
+// category split behind it comes from a cache Android rebuilds on its own
+// schedule, so a 1 s poll would spend adb round trips on a number that cannot
+// have moved.
+let storageInFlight = false;
+
+async function loadStorage() {
+  const serial = state.selected;
+  if (!serial || storageInFlight) return;
+  storageInFlight = true;
+  try {
+    const report = await window.api.getStorage(serial);
+    const volumes = report.volumes || [];
+    el('dash-volumes').innerHTML = volumes.length
+      ? volumes.map(volumeMarkup).join('')
+      : '<div class="muted">Storage could not be read from this device.</div>';
+    setText('dash-storage-note', volumes.length
+      ? [
+        report.diskstatsAvailable ? 'Category sizes from dumpsys diskstats' : 'Totals from df',
+        report.sdPresent ? 'SD card mounted'
+          : report.sdDetected ? 'SD card detected but not mounted' : 'No removable card',
+      ].join(' · ')
+      : '');
+  } catch (e) {
+    el('dash-volumes').innerHTML = `<div class="muted">Storage unavailable: ${e.message}</div>`;
+  } finally {
+    storageInFlight = false;
+  }
+}
+
+let dashboardTimer = null;
+let dashboardInFlight = false;
+let dashboardTicks = 0;
+
+function startDashboardPolling() {
+  stopDashboardPolling();
+  dashboardTicks = 0;
+  dashboardTimer = setInterval(async () => {
+    if (state.activeView !== 'dashboard' || !state.selected) { stopDashboardPolling(); return; }
+    // A device on a slow link can take longer than the interval to answer.
+    // Without this the ticks would queue and every one of them would time out.
+    if (dashboardInFlight) return;
+    dashboardInFlight = true;
+    try {
+      await loadDashboard();
+      dashboardTicks += 1;
+      if (dashboardTicks % 30 === 0) await loadStorage();
+    } finally {
+      dashboardInFlight = false;
+    }
+  }, 1000);
+}
+
+function stopDashboardPolling() {
+  if (dashboardTimer) clearInterval(dashboardTimer);
+  dashboardTimer = null;
+}
+
+el('dash-refresh').onclick = async (e) => {
+  const btn = e.currentTarget;
+  btn.classList.add('spinning');
+  // Drop the cached static specs too, so this button is a genuine re-read rather
+  // than a repaint of the same numbers.
+  specsCache.delete(state.selected);
+  try {
+    await refreshDevices();
+    if (state.selected) { await loadDashboard(); await loadStorage(); }
+  } finally {
+    btn.classList.remove('spinning');
+  }
+};
+
+el('dash-disconnect').onclick = async () => {
+  const serial = state.selected;
+  if (!serial) return;
+  const res = await window.api.disconnectDevice(serial);
+  specsCache.delete(serial);
+  if (res.disconnected) {
+    stopDashboardPolling();
+    state.selected = null;
+  }
+  // A USB device stays attached until the cable comes out, so say so rather than
+  // pretending the button did something.
+  if (res.message) toast(res.message);
+  await refreshDevices();
+};
 
 // ---------------------------------------------------------------- hardware view
 
 const fmt = (v, digits = 2) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? '—' : Number(v).toFixed(digits));
-const setText = (id, value) => { el(id).textContent = value; };
 
 function formatEta(minutes, charging) {
   if (!minutes) return '';
@@ -238,26 +570,55 @@ function healthLabel(power) {
   if (power.healthPct !== null && power.healthPct !== undefined) {
     return { text: `${power.healthPct}%${name ? ` (${name})` : ''}`, pct: power.healthPct };
   }
+  // Derived from charge_counter rather than a published charge_full, so it is
+  // shown with a "≈" — the number is real arithmetic on real readings, but its
+  // input is the level, which the gauge rounds to a whole percent.
+  if (power.estimatedHealthPct !== null && power.estimatedHealthPct !== undefined) {
+    return {
+      text: `≈ ${power.estimatedHealthPct}%${name ? ` (${name})` : ''}`,
+      pct: power.estimatedHealthPct,
+    };
+  }
   return { text: name || '—', pct: null };
 }
 
 let hardwareTimer = null;
+// Model name, chipset, display and Android version cannot change while a device
+// stays connected, so they are fetched once per serial instead of on every tick.
+// Re-fetching them was most of the lag the user was seeing: `device:info` alone
+// used to be nine sequential adb round trips.
+const specsCache = new Map();
+
+async function loadSpecs(serial) {
+  if (specsCache.has(serial)) return specsCache.get(serial);
+  const [hw, info, soc] = await Promise.all([
+    window.api.getHardware(serial).catch(() => ({})),
+    window.api.getDeviceInfo(serial).catch(() => ({})),
+    window.api.getSoc(serial).catch(() => ({})),
+  ]);
+  const specs = { hw, info, soc };
+  specsCache.set(serial, specs);
+  return specs;
+}
 
 async function loadHardware() {
   const serial = state.selected;
   if (!serial) return;
 
-  const [power, hw, info, soc] = await Promise.all([
-    window.api.getPower(serial).catch((e) => ({ error: e.message })),
-    window.api.getHardware(serial).catch(() => ({})),
-    window.api.getDeviceInfo(serial).catch(() => ({})),
-    window.api.getSoc(serial).catch(() => ({})),
+  // The live half is one IPC call and one batched adb round trip; the static
+  // half resolves from cache after the first load.
+  const [telemetry, specs] = await Promise.all([
+    window.api.getTelemetry(serial).then((t) => t, (e) => ({ error: e.message })),
+    loadSpecs(serial),
   ]);
 
-  if (power.error) {
-    setText('hw-source-note', `Could not read power telemetry: ${power.error}`);
+  if (telemetry.error) {
+    setText('hw-source-note', `Could not read power telemetry: ${telemetry.error}`);
     return;
   }
+  const power = telemetry.power || {};
+  const perf = telemetry.perf || {};
+  const { hw, info, soc } = specs;
 
   // --- battery power station -------------------------------------------------
   const level = power.level ?? 0;
@@ -284,11 +645,20 @@ async function loadHardware() {
     health.pct === null ? '' : health.pct >= 85 ? ' good' : health.pct >= 70 ? ' warn' : ' bad'
   );
 
+  const notes = power.notes || {};
+
+  // Full capacity: a measured charge_full when the gauge publishes one, else the
+  // value implied by charge_counter at the current level — labelled "≈" so an
+  // estimate is never mistaken for a reading.
   setText('hw-capacity', power.chargeFullMah
     ? `${power.chargeFullMah} / ${power.chargeDesignMah || '?'} mAh`
-    : (power.chargeDesignMah ? `${power.chargeDesignMah} mAh design` : '—'));
+    : power.estimatedFullMah
+      ? `≈ ${power.estimatedFullMah} / ${power.chargeDesignMah || '?'} mAh`
+      : (power.chargeDesignMah ? `${power.chargeDesignMah} mAh design` : '—'));
+  el('hw-capacity').title = notes.chargeFullMah || '';
 
-  setText('hw-cycles', power.cycleCount ?? 'Not exposed');
+  setText('hw-cycles', power.cycleCount ?? 'Not counted');
+  el('hw-cycles').title = notes.cycleCount || '';
   setText('hw-tech', power.technology || '—');
 
   // --- electrical & thermal telemetry ---------------------------------------
@@ -296,15 +666,23 @@ async function loadHardware() {
   setText('hw-voltage', fmt(power.voltage, 2));
   setText('hw-voltage-mv', power.voltageMv ? `${power.voltageMv} mV` : '');
   setText('hw-current', fmt(power.current, 2));
-  setText('hw-current-ma', power.currentMa ? `${power.charging ? '+' : '−'}${power.currentMa} mA` : '');
+  setText('hw-current-ma', power.currentMa
+    ? `${power.charging ? '+' : '−'}${power.currentMa} mA`
+    // With no measured draw, show the negotiated ceiling instead — clearly
+    // marked, because a ceiling is what the charger *allows*, not what flows.
+    : power.maxChargeWatts ? `up to ${fmt(power.maxChargeWatts, 0)} W negotiated` : '');
+  el('hw-watts').title = notes.watts || '';
+  el('hw-current').title = notes.current || '';
 
   setText('hw-temp', fmt(power.batteryTemp, 1));
   setText('hw-temp-sub', power.batteryTemp === null
     ? ''
     : `${(power.batteryTemp * 9 / 5 + 32).toFixed(1)}°F · ${power.batteryTemp >= 43 ? 'Hot' : power.batteryTemp >= 38 ? 'Warm' : 'Normal'}`);
 
-  setText('hw-soc-temp', fmt(power.socTemp, 1));
-  setText('hw-soc-zone', power.socZone ? `zone: ${power.socZone}` : 'Not exposed');
+  const socTemp = power.socTemp ?? perf.socTempC ?? null;
+  setText('hw-soc-temp', fmt(socTemp, 1));
+  setText('hw-soc-zone', power.socZone ? `zone: ${power.socZone}` : 'No SoC thermal zone');
+  el('hw-soc-temp').title = notes.socTemp || '';
 
   setText('hw-protocol', power.protocol || (power.charging ? 'USB (unreported)' : 'Not charging'));
   const inputBits = [
@@ -318,9 +696,14 @@ async function loadHardware() {
   rate.textContent = power.watts ? `${power.watts >= 15 ? 'Fast charge' : 'Charging'} (${fmt(power.watts, 1)} W)` : '';
   rate.style.color = power.watts >= 15 ? 'var(--accent)' : 'var(--signal)';
 
-  setText('hw-source-note', power.sysfsAvailable
-    ? `Power measurements read directly from the Android kernel power-supply subsystem (${power.source}).`
-    : 'Kernel power-supply nodes are not readable on this device — values fall back to "dumpsys battery", so current and wattage may be missing.');
+  // Name the source that actually answered rather than assuming sysfs, and only
+  // apologise for what is genuinely missing.
+  const sourceBits = [];
+  if (power.sysfsAvailable) sourceBits.push('kernel power-supply nodes');
+  if (power.healthHal) sourceBits.push(power.healthHal);
+  if (!sourceBits.length) sourceBits.push('dumpsys battery');
+  const gaps = Object.values(notes);
+  setText('hw-source-note', `Read from ${sourceBits.join(' + ')}.${gaps.length ? ` ${gaps[0]}` : ''}`);
 
   // --- processor & device specs --------------------------------------------
   setText('hw-chipset', soc.socName || info['ro.board.platform'] || '—');
@@ -332,10 +715,14 @@ async function loadHardware() {
   setText('hw-display', hw.resolution ? `${hw.resolution} pixels` : '—');
   setText('hw-display-sub', hw.density ? `${hw.density} dpi` : '');
 
-  setText('hw-ram', hw.ramTotalGb ? `${hw.ramTotalGb} GB` : '—');
+  // RAM total is static, but "in use" is not — take it from the live telemetry
+  // so it moves with the 1 s poll instead of sitting at the first reading.
+  const gb = (bytes) => (bytes ? (bytes / 1073741824).toFixed(1) : null);
+  setText('hw-ram', gb(perf.memTotalBytes) ? `${gb(perf.memTotalBytes)} GB` : (hw.ramTotalGb ? `${hw.ramTotalGb} GB` : '—'));
   setText('hw-ram-sub', [
     soc.ddrType ? `DDR type ${soc.ddrType}` : null,
-    hw.ramUsedGb ? `${hw.ramUsedGb} GB in use` : null,
+    gb(perf.memUsedBytes) ? `${gb(perf.memUsedBytes)} GB in use` : (hw.ramUsedGb ? `${hw.ramUsedGb} GB in use` : null),
+    perf.cpuOverallPct === null || perf.cpuOverallPct === undefined ? null : `CPU ${perf.cpuOverallPct}%`,
   ].filter(Boolean).join(' · '));
 
   setText('hw-storage', hw.storageTotalGb ? `${hw.storageTotalGb} GB` : '—');
@@ -359,12 +746,22 @@ async function loadHardware() {
 
 // Telemetry is only meaningful live, so poll while the view is on screen and
 // stop as soon as the user navigates away.
+//
+// 1 s rather than 3 s: the live half is now a single batched adb round trip
+// (~250 ms including the 0.4 s on-device sampling sleep for /proc/stat), so a
+// 3 s gap was mostly idle waiting. `inFlight` keeps a slow device from stacking
+// up overlapping reads, which would make the display lag further behind rather
+// than catch up.
+let hardwareInFlight = false;
+
 function startHardwarePolling() {
   stopHardwarePolling();
-  hardwareTimer = setInterval(() => {
-    if (state.activeView === 'hardware' && state.selected) loadHardware();
-    else stopHardwarePolling();
-  }, 3000);
+  hardwareTimer = setInterval(async () => {
+    if (state.activeView !== 'hardware' || !state.selected) { stopHardwarePolling(); return; }
+    if (hardwareInFlight) return;
+    hardwareInFlight = true;
+    try { await loadHardware(); } finally { hardwareInFlight = false; }
+  }, 1000);
 }
 
 function stopHardwarePolling() {

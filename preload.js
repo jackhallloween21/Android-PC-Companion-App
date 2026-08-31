@@ -16,6 +16,17 @@ contextBridge.exposeInMainWorld('api', {
   getHardware: (serial) => ipcRenderer.invoke('device:hardware', serial),
   getPerformance: (serial) => ipcRenderer.invoke('device:performance', serial),
   getStorageBreakdown: (serial) => ipcRenderer.invoke('device:storageBreakdown', serial),
+  // One round trip for everything that changes while the phone is connected, so
+  // the dashboard can poll at 1 s without queueing six adb calls per tick.
+  getTelemetry: (serial) => ipcRenderer.invoke('device:telemetry', serial),
+  getStorage: (serial) => ipcRenderer.invoke('device:storage', serial),
+  disconnectDevice: (serial) => ipcRenderer.invoke('device:disconnect', serial),
+
+  // Remembered wireless devices. `autoconnect` re-attaches phones that were
+  // paired in an earlier session, so pairing is a one-time step.
+  listKnownDevices: () => ipcRenderer.invoke('devices:known'),
+  autoconnect: (opts) => ipcRenderer.invoke('devices:autoconnect', opts),
+  forgetKnownDevice: (hostOrSerial) => ipcRenderer.invoke('devices:forget', hostOrSerial),
   rebootBootloader: (serial) => ipcRenderer.invoke('device:rebootBootloader', serial),
   rebootSystem: (serial) => ipcRenderer.invoke('device:rebootSystem', serial),
 

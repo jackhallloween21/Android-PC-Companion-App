@@ -10,7 +10,22 @@ const {
   buildPowerReport,
   parseCpuTopology,
   formatClusters,
+  HEALTH_SOURCES,
+  parseHealthDump,
+  healthDumpUseful,
+  explainMissing,
 } = require('./src/power');
+const {
+  PERF_SCRIPT,
+  parsePerfDump,
+  parseDumpsysMeminfo,
+  buildPerfReport,
+} = require('./src/perf');
+const {
+  STORAGE_SCRIPT,
+  parseStorageDump,
+  buildStorageReport,
+} = require('./src/storage');
 const {
   buildMirrorArgs: buildScrcpyMirrorArgs,
   hasAudio,
@@ -25,6 +40,14 @@ const {
   pickConnectTarget,
   connectCandidates,
 } = require('./src/wireless');
+const {
+  listAdvertised,
+  isWirelessSerial,
+  rememberDevice,
+  forgetKnownDevice,
+  pruneKnown,
+  planReconnect,
+} = require('./src/autoconnect');
 // QR pairing lives here, not in preload.js: the preload runs sandboxed, where
 // `require` is a polyfill that only resolves `electron` and a couple of node
 // builtins. Requiring a third-party module (or a relative file) there throws,
@@ -375,7 +398,16 @@ ipcMain.handle('devices:list', async () => {
     });
 });
 
+// Static device properties, cached per serial. None of these can change while
+// the device stays connected, and reading them was costing nine sequential adb
+// round trips on every dashboard refresh. The cache is dropped when a device
+// disconnects (see forgetDevice).
+const infoCache = new Map();
+
 ipcMain.handle('device:info', async (_e, serial) => {
+  const cached = infoCache.get(serial);
+  if (cached) return cached;
+
   const props = [
     'ro.product.model',
     'ro.product.manufacturer',
@@ -386,17 +418,148 @@ ipcMain.handle('device:info', async (_e, serial) => {
     'ro.board.platform',
     'ro.hardware',
     'ro.boot.serialno',
+    'ro.boot.flash.locked',
   ];
+  // One `getprop` with no argument dumps every property at once, which is a
+  // single round trip instead of ten. The per-prop reads stay as a fallback for
+  // builds where the bulk dump is truncated or unreadable.
   const info = {};
-  for (const p of props) {
-    try { info[p] = (await adb(['-s', serial, 'shell', 'getprop', p])).trim(); }
-    catch { info[p] = null; }
+  let bulk = null;
+  try { bulk = await adb(['-s', serial, 'shell', 'getprop']); } catch { /* fall back below */ }
+  if (bulk) {
+    const map = new Map();
+    // Lines look like: [ro.product.model]: [Pixel 8]
+    for (const line of bulk.split('\n')) {
+      const m = line.match(/^\[([^\]]+)\]:\s*\[(.*)\]\s*$/);
+      if (m) map.set(m[1], m[2]);
+    }
+    for (const p of props) info[p] = map.has(p) ? (map.get(p) || null) : null;
   }
-  try { info.bootloaderLocked = (await adb(['-s', serial, 'shell', 'getprop', 'ro.boot.flash.locked'])).trim(); }
-  catch { info.bootloaderLocked = null; }
-  try { info.ip = (await adb(['-s', serial, 'shell', 'ip', 'route'])).match(/src (\S+)/)?.[1] || null; }
-  catch { info.ip = null; }
+  const missing = props.filter((p) => !info[p]);
+  if (missing.length === props.length) {
+    await Promise.all(missing.map(async (p) => {
+      try { info[p] = (await adb(['-s', serial, 'shell', 'getprop', p])).trim() || null; }
+      catch { info[p] = null; }
+    }));
+  }
+  info.bootloaderLocked = info['ro.boot.flash.locked'] ?? null;
+  // `getenforce` is not a property, so it needs its own read. Batched with the
+  // route lookup because both are single-line shell commands.
+  const [route, selinux] = await Promise.all([
+    adb(['-s', serial, 'shell', 'ip', 'route']).catch(() => null),
+    adb(['-s', serial, 'shell', 'getenforce']).catch(() => null),
+  ]);
+  info.ip = route ? (route.match(/src (\S+)/)?.[1] || null) : null;
+  info.selinux = selinux ? selinux.trim() || null : null;
+
+  infoCache.set(serial, info);
   return info;
+});
+
+/** Drops every per-serial cache, so a reconnected device is re-read. */
+function forgetDevice(serial) {
+  infoCache.delete(serial);
+  socCache.delete(serial);
+  healthSourceCache.delete(serial);
+}
+
+// ---------------------------------------------------------------------------
+// Autoconnect
+//
+// `adb pair` writes a key the phone keeps until it is revoked, so a device only
+// ever needs pairing once. What it needs every time is `adb connect`, at an
+// address Android changes whenever wireless debugging is toggled. Remembering
+// the device lets that second step happen without the user opening the pairing
+// screen again — see src/autoconnect.js for how the address is re-found.
+// ---------------------------------------------------------------------------
+
+const KNOWN_FILE = () => path.join(app.getPath('userData'), 'known-devices.json');
+
+function loadKnown() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(KNOWN_FILE(), 'utf8'));
+    return pruneKnown(Array.isArray(parsed) ? parsed : parsed.devices);
+  } catch {
+    // Absent on first run, and a corrupt file must not stop the app booting.
+    return [];
+  }
+}
+
+function saveKnown(list) {
+  try { fs.writeFileSync(KNOWN_FILE(), JSON.stringify(pruneKnown(list), null, 2)); }
+  catch { /* a read-only profile is not worth failing a connection over */ }
+}
+
+/** Serials adb currently has attached. */
+async function attachedSerials() {
+  try {
+    const out = await adb(['devices']);
+    return out.split('\n').slice(1)
+      .map((l) => l.trim().split(/\s+/))
+      .filter((p) => p[0] && p[1] === 'device')
+      .map((p) => p[0]);
+  } catch { return []; }
+}
+
+/**
+ * Records a device we just connected to wirelessly. The mDNS instance name is
+ * consulted for the device serial, because that — not the address — is what
+ * identifies the phone again after its IP or port changes.
+ */
+async function rememberConnected(target, label = null) {
+  let deviceSerial = null;
+  try {
+    const { host } = splitHostPort(target);
+    const ad = listAdvertised(await adbText(['mdns', 'services'])).find((a) => a.host === host);
+    deviceSerial = ad ? ad.deviceSerial : null;
+  } catch { /* mDNS is often blocked; the host:port alone is still worth keeping */ }
+  saveKnown(rememberDevice(loadKnown(), { target, deviceSerial, label }));
+}
+
+let autoconnectRun = null;
+
+/**
+ * Tries the remembered devices once. Attempts run sequentially rather than in
+ * parallel: `adb connect` to a host that is not listening blocks for the TCP
+ * timeout, and firing several at once makes the adb server queue them anyway.
+ */
+async function runAutoconnect({ includeNew = false } = {}) {
+  const known = loadKnown();
+  if (!known.length && !includeNew) return { attempted: [], connected: [] };
+
+  const mdns = await adbText(['mdns', 'services']).catch(() => '');
+  const plan = planReconnect({ known, mdns, connected: await attachedSerials(), includeNew });
+
+  const attempted = [];
+  const connected = [];
+  for (const step of plan) {
+    // Once a device is attached there is no point trying its other addresses.
+    if (step.deviceSerial && connected.some((c) => c.deviceSerial === step.deviceSerial)) continue;
+    let out = null;
+    try { out = await adbText(['connect', step.target]); } catch { /* treated as a failure below */ }
+    attempted.push({ ...step, ok: isConnected(out) });
+    if (!isConnected(out)) continue;
+    connected.push(step);
+    await rememberConnected(step.target);
+  }
+  return { attempted, connected };
+}
+
+ipcMain.handle('devices:known', async () => loadKnown());
+
+ipcMain.handle('devices:autoconnect', async (_e, opts) => {
+  // A single shared promise, so a renderer reload during startup cannot start a
+  // second sweep and race the first one's writes to known-devices.json.
+  if (!autoconnectRun) {
+    autoconnectRun = runAutoconnect(opts || {}).finally(() => { autoconnectRun = null; });
+  }
+  return autoconnectRun;
+});
+
+ipcMain.handle('devices:forget', async (_e, hostOrSerial) => {
+  forgetDevice(hostOrSerial);
+  saveKnown(forgetKnownDevice(loadKnown(), hostOrSerial));
+  return loadKnown();
 });
 
 ipcMain.handle('device:battery', async (_e, serial) => {
@@ -422,27 +585,95 @@ ipcMain.handle('device:battery', async (_e, serial) => {
 // captured device output without booting Electron.
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('device:power', async (_e, serial) => {
-  // dumpsys is the reliable floor; the sysfs sweep is the detail layer.
-  let dump = {};
-  try {
-    dump = parseDumpsysBattery(await adb(['-s', serial, 'shell', 'dumpsys', 'battery']));
-  } catch { /* keep going — sysfs may still work */ }
+// Which HEALTH_SOURCES entry answered for a given serial, so the probe only
+// happens once per device rather than on every 1 s poll. `null` means "probed
+// and none of them answered"; `undefined` means "not probed yet".
+const healthSourceCache = new Map();
 
-  let supplies = {};
-  let zones = [];
-  try {
-    ({ supplies, zones } = parsePowerDump(await adb(['-s', serial, 'shell', POWER_SCRIPT])));
-  } catch { /* power-supply nodes unreadable on this device */ }
+/**
+ * Reads the battery values the kernel is withholding, via the health HAL.
+ *
+ * On many devices (MediaTek especially) SELinux denies the `shell` user
+ * /sys/class/power_supply even though the DAC permission bits look fine — which
+ * is why the `[ -r ]` guards in POWER_SCRIPT pass and then `cat` returns
+ * nothing. The health HAL itself runs privileged and prints the same counters,
+ * and the shell user *is* allowed to ask it for a debug dump. That is the only
+ * non-root route to current draw, charge_full and cycle count on such a device.
+ */
+async function readHealthHal(serial) {
+  const cached = healthSourceCache.get(serial);
 
-  if (!Object.keys(dump).length && !Object.keys(supplies).length) {
-    throw new Error('Neither "dumpsys battery" nor /sys/class/power_supply could be read.');
+  // Re-run only the source that worked last time.
+  if (cached) {
+    try {
+      const parsed = parseHealthDump(await adb(['-s', serial, 'shell', cached.command]));
+      if (healthDumpUseful(parsed)) return { health: parsed, healthSource: cached.label };
+    } catch { /* fall through and re-probe: the HAL may have been restarted */ }
+    healthSourceCache.delete(serial);
+  } else if (cached === null) {
+    return { health: {}, healthSource: null };
   }
 
-  return buildPowerReport({ dump, supplies, zones });
+  for (const source of HEALTH_SOURCES) {
+    let parsed;
+    try {
+      parsed = parseHealthDump(await adb(['-s', serial, 'shell', source.command]));
+    } catch { continue; }
+    if (!healthDumpUseful(parsed)) continue;
+    healthSourceCache.set(serial, source);
+    return { health: parsed, healthSource: source.label };
+  }
+
+  // Remember the failure too, so a device with no health HAL does not pay for
+  // four dumpsys round trips on every single poll.
+  healthSourceCache.set(serial, null);
+  return { health: {}, healthSource: null };
+}
+
+// The fields the UI shows a dash for, each with a sentence explaining *why* it
+// is missing. This matters because the two reasons need different responses: an
+// unreadable node is an access problem, while a gauge that never counts cycles
+// is a hardware fact the user cannot do anything about.
+const EXPLAINED_FIELDS = ['current', 'watts', 'cycleCount', 'chargeFullMah', 'socTemp'];
+
+function withNotes(report) {
+  const notes = {};
+  for (const field of EXPLAINED_FIELDS) {
+    const note = explainMissing(report, field);
+    if (note) notes[field] = note;
+  }
+  return { ...report, notes };
+}
+
+ipcMain.handle('device:power', async (_e, serial) => {
+  // Three sources, fetched concurrently because each is a separate adb round
+  // trip and the poll interval is 1 s: dumpsys is the reliable floor, the sysfs
+  // sweep is the detail layer, and the health HAL covers what sysfs withholds.
+  const settle = (p) => p.then((v) => v, () => null);
+  const [dumpRaw, sweep, hal] = await Promise.all([
+    settle(adb(['-s', serial, 'shell', 'dumpsys', 'battery'])),
+    settle(adb(['-s', serial, 'shell', POWER_SCRIPT])),
+    settle(readHealthHal(serial)),
+  ]);
+
+  const dump = dumpRaw ? parseDumpsysBattery(dumpRaw) : {};
+  const { supplies, zones } = sweep ? parsePowerDump(sweep) : { supplies: {}, zones: [] };
+  const { health, healthSource } = hal || { health: {}, healthSource: null };
+
+  if (!Object.keys(dump).length && !Object.keys(supplies).length && !Object.keys(health).length) {
+    throw new Error('Neither "dumpsys battery", /sys/class/power_supply nor the health HAL could be read.');
+  }
+
+  return withNotes(buildPowerReport({ dump, supplies, zones, health, healthSource }));
 });
 
+// SoC identity and CPU topology never change either, so this is cached as well.
+const socCache = new Map();
+
 ipcMain.handle('device:soc', async (_e, serial) => {
+  const cached = socCache.get(serial);
+  if (cached) return cached;
+
   const getprop = async (key) => {
     try { return (await adb(['-s', serial, 'shell', 'getprop', key])).trim() || null; }
     catch { return null; }
@@ -474,7 +705,7 @@ ipcMain.handle('device:soc', async (_e, serial) => {
     storageModel = out.split('\n').map((l) => l.trim()).find(Boolean) || null;
   } catch { /* not exposed */ }
 
-  return {
+  const soc = {
     socName: [socMfr, socModel].filter(Boolean).join(' ') || platform || hardware || null,
     socModel,
     socManufacturer: socMfr,
@@ -488,6 +719,61 @@ ipcMain.handle('device:soc', async (_e, serial) => {
     ddrType: ddrType || null,
     storageModel: storageModel || ufsProp || null,
   };
+  socCache.set(serial, soc);
+  return soc;
+});
+
+// ---------------------------------------------------------------------------
+// Live telemetry: one handler, one poll, everything that actually changes.
+//
+// The old dashboard polled `device:power`, `device:hardware`, `device:info` and
+// `device:soc` separately every 3 s. `device:info` alone is nine sequential
+// `getprop` calls, and none of what it returns can change while the phone is
+// plugged in — so most of the perceived lag was the UI waiting on static data.
+// Here the live reads are batched into as few round trips as possible and run
+// concurrently, and the static specs are cached per serial (see device:specs).
+// ---------------------------------------------------------------------------
+
+const settled = (p) => p.then((v) => v, () => null);
+
+ipcMain.handle('device:telemetry', async (_e, serial) => {
+  const [perfRaw, meminfoRaw, psRaw, sweep, dumpRaw, hal] = await Promise.all([
+    settled(adb(['-s', serial, 'shell', PERF_SCRIPT])),
+    // Only for the app-PSS vs kernel split; the totals come from /proc/meminfo,
+    // which is exact rather than pre-rounded.
+    settled(adb(['-s', serial, 'shell', 'dumpsys', 'meminfo'])),
+    settled(adb(['-s', serial, 'shell', 'ps -A -o PID 2>/dev/null | wc -l'])),
+    settled(adb(['-s', serial, 'shell', POWER_SCRIPT])),
+    settled(adb(['-s', serial, 'shell', 'dumpsys', 'battery'])),
+    settled(readHealthHal(serial)),
+  ]);
+
+  const { supplies, zones } = sweep ? parsePowerDump(sweep) : { supplies: {}, zones: [] };
+  const { health, healthSource } = hal || { health: {}, healthSource: null };
+
+  // `wc -l` counts the header row too.
+  const processCount = psRaw ? Math.max(0, Number(String(psRaw).trim()) - 1) || null : null;
+
+  return {
+    perf: buildPerfReport({
+      perf: perfRaw ? parsePerfDump(perfRaw) : null,
+      dumpsys: meminfoRaw ? parseDumpsysMeminfo(meminfoRaw) : null,
+      processCount,
+      zones,
+    }),
+    power: withNotes(buildPowerReport({
+      dump: dumpRaw ? parseDumpsysBattery(dumpRaw) : {},
+      supplies,
+      zones,
+      health,
+      healthSource,
+    })),
+  };
+});
+
+ipcMain.handle('device:storage', async (_e, serial) => {
+  const raw = await adb(['-s', serial, 'shell', STORAGE_SCRIPT]);
+  return buildStorageReport(parseStorageDump(raw));
 });
 
 ipcMain.handle('device:hardware', async (_e, serial) => {
@@ -681,7 +967,12 @@ ipcMain.handle('wireless:pair', async (_e, { hostPort, code, connectPort }) => {
   const attempts = [];
   for (const target of targets) {
     try {
-      return { paired, connected: true, target, message: await adbConnect(target) };
+      const message = await adbConnect(target);
+      // Remembered here rather than in the renderer, so the device is on the
+      // autoconnect list from the moment the pairing succeeds — that is what
+      // makes the next launch skip the pairing screen entirely.
+      await rememberConnected(target);
+      return { paired, connected: true, target, message };
     } catch (err) {
       attempts.push(`${target}: ${err.message}`);
     }
@@ -702,10 +993,30 @@ ipcMain.handle('wireless:pair', async (_e, { hostPort, code, connectPort }) => {
 
 ipcMain.handle('wireless:connect', async (_e, hostPort) => {
   const { host, port } = splitHostPort(hostPort);
-  return adbConnect(`${host}:${port || 5555}`);
+  const target = `${host}:${port || 5555}`;
+  const message = await adbConnect(target);
+  await rememberConnected(target);
+  return message;
 });
 
 ipcMain.handle('wireless:discover', async () => pickConnectTarget(await adbText(['mdns', 'services'])));
+
+// Drops a device. A wireless serial is `host:port`, which adb can genuinely
+// disconnect; a USB serial cannot be detached from this end, so the caches are
+// cleared and the renderer just deselects it.
+ipcMain.handle('device:disconnect', async (_e, serial) => {
+  forgetDevice(serial);
+  // The device stays on the autoconnect list: disconnecting is temporary, and
+  // the pairing key on the phone is untouched. Use devices:forget to drop it.
+  if (isWirelessSerial(serial)) {
+    return { disconnected: true, message: await adbText(['disconnect', serial]) };
+  }
+  return {
+    disconnected: false,
+    message: 'USB devices stay attached until the cable is unplugged — unplug it, '
+      + 'or turn off USB debugging on the phone.',
+  };
+});
 
 ipcMain.handle('wireless:enableTcpip', async (_e, { serial, port }) => {
   const out = await adbText(['-s', serial, 'tcpip', String(port || 5555)]);
@@ -871,6 +1182,9 @@ const qrPairing = {
           try {
             const message = await adbConnect(match.target, { timeout: QR_ADB_TIMEOUT_MS });
             if (!alive()) return;
+            // A QR pairing is exactly the case autoconnect exists for: the user
+            // will not want to re-scan a code on every launch.
+            await rememberConnected(match.target);
             send({ phase: 'connected', message, target: match.target });
             return;
           } catch (err) {

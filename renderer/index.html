@@ -68,56 +68,115 @@
         </section>
 
         <div id="dashboard-grid" class="hidden">
-          <div class="card">
-            <div class="card-head">
-              <h3 id="dash-model">Device</h3>
-              <span id="dash-online" class="badge badge-online">Online</span>
+          <!-- Device identity, state and the two actions the user needs most. -->
+          <section class="card dash-header span-2">
+            <div class="dash-header-top">
+              <div class="dash-identity">
+                <div class="dash-title-row">
+                  <span class="dash-avatar" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 19h3"/>
+                    </svg>
+                  </span>
+                  <h3 id="dash-model">Device</h3>
+                  <span class="chip subtle hidden" id="dash-codename"></span>
+                  <span id="dash-online" class="badge badge-online">Online</span>
+                </div>
+                <div class="chip-row" id="dash-chip-row">
+                  <span class="chip mono" id="dash-transport"></span>
+                  <span class="chip mono" id="dash-android"></span>
+                  <span class="chip mono" id="dash-serial"></span>
+                  <span class="chip mono" id="dash-ip"></span>
+                </div>
+              </div>
+              <div class="dash-actions">
+                <button id="dash-refresh" class="round-btn" title="Refresh device data" aria-label="Refresh device data">
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4.5V11h-6"/>
+                  </svg>
+                </button>
+                <button id="dash-disconnect" class="danger-btn">Disconnect</button>
+              </div>
             </div>
-            <div class="chip-row">
-              <span class="chip mono" id="dash-serial"></span>
-              <span class="chip mono" id="dash-android"></span>
-              <span class="chip mono" id="dash-ip"></span>
+            <div class="spec-row">
+              <div class="spec-cell"><span class="k">Security patch</span><span class="v mono" id="dash-secpatch">—</span></div>
+              <div class="spec-cell"><span class="k">SELinux policy</span><span class="v mono" id="dash-selinux">—</span></div>
+              <div class="spec-cell"><span class="k">Bootloader</span><span class="v mono" id="dash-bootloader">—</span></div>
+              <div class="spec-cell"><span class="k">ADB transport</span><span class="v mono" id="dash-transport-detail">—</span></div>
             </div>
-            <div class="data-grid mono compact" id="dash-info-grid"></div>
-          </div>
+          </section>
 
-          <div class="card">
-            <div class="card-head"><h3>Battery station</h3><span id="dash-batt-status" class="badge"></span></div>
+          <!-- Battery -->
+          <section class="card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-apps)"></span>Battery station</h3>
+              <span id="dash-batt-status" class="badge"></span>
+            </div>
             <div class="battery-row">
               <div class="battery-ring-wrap">
                 <div id="battery-ring" class="battery-ring"><span id="battery-pct">—</span></div>
+                <span class="muted tiny" id="dash-batt-eta"></span>
               </div>
               <div class="data-grid mono compact">
+                <div class="data-cell"><span class="k">Power</span><span class="v" id="dash-watts">—</span></div>
+                <div class="data-cell"><span class="k">Temp</span><span class="v" id="dash-temp">—</span></div>
                 <div class="data-cell"><span class="k">Health</span><span class="v" id="dash-health">—</span></div>
                 <div class="data-cell"><span class="k">Cycles</span><span class="v" id="dash-cycles">—</span></div>
-                <div class="data-cell"><span class="k">Temp</span><span class="v" id="dash-temp">—</span></div>
-                <div class="data-cell"><span class="k">Voltage</span><span class="v" id="dash-voltage">—</span></div>
               </div>
             </div>
-          </div>
+            <button class="link-btn" data-view="hardware">Deep battery analytics →</button>
+          </section>
 
-          <div class="card">
-            <div class="card-head"><h3>CPU &amp; memory</h3><span id="dash-procs" class="muted mono"></span></div>
-            <div class="bar-row"><span class="bar-label">Load average</span><span class="mono" id="dash-load">—</span></div>
-            <div class="bar-row"><span class="bar-label">Memory</span><span class="mono" id="dash-mem">—</span></div>
-            <div class="progress-track"><div id="mem-bar" class="progress-fill"></div></div>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h3>Storage</h3><span class="mono muted" id="dash-storage-total"></span></div>
-            <div class="progress-track"><div id="storage-bar" class="progress-fill signal"></div></div>
-            <div class="data-grid mono compact" id="storage-breakdown-grid"></div>
-          </div>
-
-          <div class="card span-2">
-            <div class="card-head"><h3>Quick launchers</h3></div>
-            <div class="launcher-grid">
-              <button class="launcher" data-view="mirror"><span>Screen mirror</span><span class="muted">Start a live session</span></button>
-              <button class="launcher" data-view="apps"><span>App debloat</span><span class="muted">Sideload / disable</span></button>
-              <button class="launcher" data-view="multimedia"><span>Webcam bridge</span><span class="muted">Camera + mic</span></button>
-              <button class="launcher" data-view="console"><span>ADB shell</span><span class="muted">Raw commands</span></button>
+          <!-- CPU -->
+          <section class="card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-videos)"></span>CPU performance &amp; cores</h3>
+              <span id="dash-procs" class="muted mono tiny"></span>
             </div>
-          </div>
+            <div class="metric-row">
+              <div>
+                <span class="metric-label">Overall load</span>
+                <span class="metric-big" id="dash-load">—</span>
+              </div>
+              <div class="metric-right">
+                <span class="metric-label">SoC temp</span>
+                <span class="metric-big" id="dash-soc-temp">—</span>
+              </div>
+            </div>
+            <div class="progress-track"><div id="dash-load-bar" class="progress-fill"></div></div>
+            <div class="cores-label muted tiny" id="dash-cores-label">Cluster frequencies</div>
+            <div class="core-grid" id="dash-cores"></div>
+          </section>
+
+          <!-- RAM -->
+          <section class="card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-audio)"></span><span id="dash-ram-title">System memory</span></h3>
+              <span id="dash-mem-pct" class="badge"></span>
+            </div>
+            <div class="metric-row">
+              <div>
+                <span class="metric-label">Memory footprint</span>
+                <span class="metric-big" id="dash-mem">—</span>
+              </div>
+            </div>
+            <div class="progress-track"><div id="mem-bar" class="progress-fill"></div></div>
+            <div class="data-grid mono compact" id="dash-mem-split"></div>
+          </section>
+
+          <!-- Storage: one card per volume, internal first, then any card. -->
+          <section class="card span-2" id="dash-storage-card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-photos)"></span>Storage</h3>
+              <span class="muted mono tiny" id="dash-storage-note"></span>
+            </div>
+            <div id="dash-volumes"></div>
+          </section>
+
+          <section class="card span-2">
+            <div class="card-head"><h3>Quick workstation launchers</h3></div>
+            <div class="launcher-grid" id="dash-launchers"></div>
+          </section>
         </div>
       </section>
 
@@ -548,6 +607,15 @@
         <button id="device-modal-close" class="icon-btn">&times;</button>
       </div>
       <div id="device-list" class="device-list"></div>
+      <!-- Devices paired in an earlier session. The pairing key lives on the
+           phone until it is revoked, so these only ever need reconnecting. -->
+      <div id="known-section" class="known-section hidden">
+        <div class="known-head">
+          <span class="field-label">Paired earlier</span>
+          <button id="known-reconnect" class="ghost-btn small">Reconnect all</button>
+        </div>
+        <div id="known-list" class="known-list"></div>
+      </div>
       <button id="pair-btn" class="ghost-btn">+ Pair wireless</button>
     </div>
   </div>

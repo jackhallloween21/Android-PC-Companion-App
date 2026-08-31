@@ -13,6 +13,20 @@
   --danger-dim: rgba(244, 91, 105, 0.14);
   --radius-lg: 16px;
   --radius-md: 10px;
+
+  /* Storage categories. These are the single source of truth for the segmented
+     bar, its legend and the card accent dots, so a colour can never drift
+     between the bar and the label next to it. Kept in step with CATEGORIES in
+     src/storage.js. */
+  --cat-apps: #3b82f6;
+  --cat-photos: #34d399;
+  --cat-videos: #fbbf24;
+  --cat-audio: #a855f7;
+  --cat-downloads: #38bdf8;
+  --cat-documents: #f472b6;
+  --cat-system: #f87171;
+  --cat-other: #64748b;
+  --track: rgba(255, 255, 255, 0.08);
   --font-ui: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
 }
@@ -348,6 +362,132 @@ select:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
 .empty-title { font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0; }
 
 .hidden { display: none !important; }
+
+/* ------------------------------------------------------------------ dashboard */
+
+.tiny { font-size: 10.5px; }
+.chip.subtle { background: transparent; border-color: var(--panel-border); color: var(--text-muted); }
+.head-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; }
+.badge-warn { background: var(--accent-dim); color: var(--accent); }
+.badge-bad { background: var(--danger-dim); color: var(--danger); }
+.data-cell .v.good { color: var(--signal); }
+.data-cell .v.warn { color: var(--accent); }
+.data-cell .v.bad { color: var(--danger); }
+
+/* device header */
+
+.dash-header-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.dash-identity { min-width: 0; }
+.dash-title-row { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; flex-wrap: wrap; }
+.dash-title-row h3 { margin: 0; font-size: 19px; font-weight: 800; letter-spacing: -0.01em; }
+.dash-avatar {
+  width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--signal-dim); color: var(--signal);
+}
+.dash-header .chip-row { margin-bottom: 0; }
+.dash-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.round-btn {
+  width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--panel-strong); border: 1px solid var(--panel-border); color: var(--text-muted);
+}
+.round-btn:hover { color: var(--text-primary); border-color: var(--accent); }
+/* Spins only while a refresh is actually in flight, so the animation is feedback
+   rather than decoration. */
+.round-btn.spinning svg { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.danger-btn {
+  padding: 8px 14px; border-radius: 9px; font-size: 12.5px; font-weight: 700;
+  background: var(--danger-dim); border: 1px solid rgba(244,91,105,0.35); color: var(--danger);
+}
+.danger-btn:hover { background: var(--danger); color: #fff; }
+
+.spec-row {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--panel-border);
+}
+.spec-cell .k { display: block; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 3px; }
+.spec-cell .v { font-size: 12.5px; }
+
+/* metrics */
+
+.metric-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.metric-right { text-align: right; }
+.metric-label { display: block; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 2px; }
+.metric-big { font-size: 22px; font-weight: 800; font-family: var(--font-mono); letter-spacing: -0.02em; }
+.cores-label { margin-top: 12px; }
+.link-btn {
+  margin-top: 12px; padding: 0; background: none; border: none;
+  color: var(--accent); font-size: 12px; font-weight: 700;
+}
+.link-btn:hover { text-decoration: underline; }
+
+/* per-core load. Eight little vertical gauges, one per CPU, so a single pegged
+   core is visible even when the overall figure looks calm. */
+
+.core-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin-top: 8px; }
+.core {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--panel-border);
+  border-radius: 8px; padding: 7px 3px 6px;
+}
+.core-bar {
+  width: 100%; height: 34px; border-radius: 4px; background: var(--track);
+  display: flex; align-items: flex-end; overflow: hidden;
+}
+.core-bar span { width: 100%; transition: height 0.3s ease; border-radius: 3px; }
+.core-pct { font-size: 10px; font-weight: 700; }
+.core-name, .core-ghz { font-size: 9px; }
+/* A core the kernel has parked is dimmed rather than hidden, so the cluster
+   layout does not reflow every time the scheduler idles one. */
+.core.offline { opacity: 0.4; }
+
+/* storage volumes */
+
+.volume { padding: 12px 0; border-bottom: 1px solid var(--panel-border); }
+.volume:last-child { border-bottom: none; padding-bottom: 0; }
+.volume:first-child { padding-top: 0; }
+.volume-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.volume-name { font-size: 13.5px; font-weight: 700; }
+.seg-track {
+  display: flex; height: 12px; border-radius: 6px; overflow: hidden;
+  background: var(--track); gap: 1px;
+}
+.seg { transition: width 0.4s ease; min-width: 2px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: 11.5px; }
+.legend-item { display: flex; align-items: center; gap: 6px; color: var(--text-muted); }
+.legend-item .mono { color: var(--text-primary); font-size: 11px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+/* toast */
+
+.toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 14px);
+  max-width: 520px; padding: 11px 16px; border-radius: 10px;
+  background: #161c26; border: 1px solid var(--panel-border);
+  color: var(--text-primary); font-size: 12.5px; line-height: 1.5;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+  opacity: 0; pointer-events: none; transition: opacity 0.2s ease, transform 0.2s ease;
+  z-index: 60;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* remembered wireless devices */
+
+.known-section { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--panel-border); }
+.known-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.known-list { display: flex; flex-direction: column; gap: 6px; }
+.known-row {
+  display: flex; align-items: center; gap: 10px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md); padding: 8px 10px;
+}
+.known-id { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.known-id .model { font-size: 12.5px; font-weight: 700; }
+.known-id .serial { font-size: 10.5px; color: var(--text-muted); }
+.ghost-btn.small { padding: 5px 10px; font-size: 11.5px; }
+
 .mono { font-family: var(--font-mono); }
 .muted { color: var(--text-muted); font-size: 12.5px; line-height: 1.6; }
 .danger-text { color: #e69aa2; }
@@ -378,13 +518,16 @@ select:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
 /* battery ring */
 
 .battery-row { display: flex; align-items: center; gap: 18px; }
-.battery-ring-wrap { flex-shrink: 0; }
+.battery-ring-wrap { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .battery-ring {
   width: 96px; height: 96px; border-radius: 50%;
-  background: conic-gradient(var(--signal) 0deg, var(--signal) calc(var(--pct, 0) * 3.6deg), rgba(255,255,255,0.06) 0deg);
+  background: conic-gradient(var(--ring, var(--signal)) 0deg, var(--ring, var(--signal)) calc(var(--pct, 0) * 3.6deg), rgba(255,255,255,0.06) 0deg);
   display: flex; align-items: center; justify-content: center;
   position: relative;
 }
+/* A low battery should be readable as low without reading the number. */
+.battery-ring.warn { --ring: var(--accent); }
+.battery-ring.critical { --ring: var(--danger); }
 .battery-ring::before {
   content: ''; position: absolute; inset: 8px; border-radius: 50%; background: var(--bg-base);
 }
@@ -397,11 +540,21 @@ select:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
 
 .launcher-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .launcher {
-  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
+  display: flex; align-items: center; gap: 10px; text-align: left;
   background: rgba(255,255,255,0.03); border: 1px solid var(--panel-border);
   border-radius: var(--radius-md); padding: 12px; color: var(--text-primary);
   font-size: 13px; font-weight: 700;
 }
+.launcher-icon {
+  flex-shrink: 0; width: 34px; height: 34px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  /* colour-mix keeps the tint and the glyph in the same hue family from a single
+     variable, so adding a launcher means picking one colour, not three. */
+  background: color-mix(in srgb, var(--tile) 18%, transparent);
+  color: var(--tile);
+}
+.launcher-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.launcher-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .launcher:hover { border-color: var(--accent); }
 .launcher .muted { font-size: 11px; font-weight: 500; }
 
