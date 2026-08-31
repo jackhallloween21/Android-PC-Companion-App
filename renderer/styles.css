@@ -584,42 +584,39 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* QR scanner */
+/* QR pairing — the code is displayed here for the phone to scan */
 
 .qr-modal-card { width: 420px; }
 
 .qr-viewer-wrap {
   position: relative;
   margin-top: 12px;
+  padding: 16px;
   border-radius: var(--radius-lg);
-  overflow: hidden;
   background: rgba(0, 0, 0, 0.4);
   border: 1px solid var(--panel-border);
-}
-
-#qr-video {
-  display: block;
-  width: 100%;
-  height: auto;
-  max-height: 320px;
-  object-fit: cover;
-}
-
-.qr-overlay {
-  position: absolute;
-  inset: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  pointer-events: none;
 }
 
-.qr-frame {
-  width: 60%;
-  aspect-ratio: 1 / 1;
-  border: 2px solid var(--signal);
-  border-radius: 18px;
-  box-shadow: 0 0 0 9999px rgba(4, 6, 10, 0.45);
+/* A camera reads contrast, not theme: the symbol stays black-on-white and keeps
+   its own light quiet zone regardless of the surrounding dark UI. */
+.qr-canvas {
+  display: block;
+  max-width: 100%;
+  /* The canvas is sized in whole modules by the renderer; forcing a CSS size
+     would rescale it by a fraction and blur the module edges. */
+  image-rendering: pixelated;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.qr-code-text {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 .qr-status {

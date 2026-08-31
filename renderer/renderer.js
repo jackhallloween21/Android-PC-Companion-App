@@ -1128,15 +1128,39 @@ el('pair-submit-btn').onclick = async () => {
   const host = el('pair-host').value.trim();
   const code = el('pair-code').value.trim();
   const connectPort = el('pair-connect-port').value.trim();
-  if (!host || !code) {
-    setPairStatus('Enter the host:port and the 6-digit code from the pairing dialog.', 'err');
+  // A device that is already paired only needs the connect step, and re-running
+  // `adb pair` with a spent single-use code would just fail. So a port with no code
+  // means "connect only" — that is the way out of "paired but not reachable".
+  const connectOnly = !code && !!connectPort;
+  if (!host) {
+    setPairStatus('Enter the phone\'s host:port.', 'err');
+    return;
+  }
+  if (!code && !connectPort) {
+    setPairStatus('Enter the pairing code — or, if this phone is already paired, '
+      + 'just its connect port.', 'err');
     return;
   }
 
   const btn = el('pair-submit-btn');
   btn.disabled = true;
-  setPairStatus('Pairing, then connecting…', 'busy');
+  setPairStatus(connectOnly ? 'Connecting…' : 'Pairing, then connecting…', 'busy');
   try {
+    if (connectOnly) {
+      // The host field may already carry the pairing port; the connect port is a
+      // different one, so drop any port that is already there. A bare IPv6 literal
+      // has to be bracketed or adb cannot tell the address from the port.
+      const bare = host.replace(/^adb:\/\//, '');
+      const hostOnly = /^[0-9a-f]*:[0-9a-f:]+$/i.test(bare)
+        ? `[${bare}]`
+        : bare.replace(/^(\[[^\]]+\]|[^:]+):\d+$/, '$1');
+      // The modal stays open on success: this is the recovery path out of "paired but
+      // not reachable", and hiding the only place the result is shown would leave the
+      // user guessing whether it worked.
+      setPairStatus(await window.api.connectWireless(`${hostOnly}:${connectPort}`), 'ok');
+      refreshDevices();
+      return;
+    }
     const res = await window.api.pairWireless(host, code, connectPort);
     if (res && res.connected) {
       setPairStatus(res.message, 'ok');
@@ -1152,99 +1176,110 @@ el('pair-submit-btn').onclick = async () => {
   }
 };
 
-// ---- QR scan for wireless pairing ------------------------------------------
+// ---- QR pairing ------------------------------------------------------------
+//
+// The direction is: this PC displays the code, the phone's "Pair device with QR
+// code" screen scans it. Android never shows a pairing QR of its own, so there
+// is nothing here for a webcam to read.
 
-let qrStream = null;
-let qrRaf = null;
+const QR_QUIET = 4; // quiet zone in modules; 4 is the spec minimum
+const QR_TARGET_PX = 320; // the canvas is sized down to a whole number of modules
 
 el('pair-scan-qr-btn').onclick = () => {
   setPairStatus('');
   el('pair-modal').classList.add('hidden');
   el('qr-modal').classList.remove('hidden');
-  startQrScan();
+  startQrPairing();
 };
 
-el('qr-modal-close').onclick = () => stopQrScan();
+el('qr-modal-close').onclick = () => closeQrPairing();
 
-async function startQrScan() {
-  const video = el('qr-video');
-  const canvas = el('qr-canvas');
-  const status = el('qr-status');
+function drawQrMatrix(canvas, size, modules) {
+  const total = size + QR_QUIET * 2;
+  // Integer module size keeps every module the same width; a fractional scale is
+  // what makes a rendered QR unreadable at small sizes.
+  const scale = Math.max(2, Math.floor(QR_TARGET_PX / total));
+  const dim = total * scale;
+  canvas.width = dim;
+  canvas.height = dim;
 
-  try {
-    qrStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false,
-    });
-  } catch (err) {
-    status.textContent = `Camera not available: ${err.message}`;
-    return;
-  }
-
-  video.srcObject = qrStream;
-  await video.play();
-
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  let scanning = true;
-
-  // Decoding is an async IPC round-trip now, so a frame can come back after the
-  // modal was closed. `stopQrScan` nulls qrRaf; treat that as the stop signal.
-  const stopped = () => !scanning || qrRaf === null;
-
-  async function tick() {
-    if (!scanning) return;
-
-    if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      try {
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const qrText = await window.api.decodeQR(new Uint8ClampedArray(imageData.data).buffer, imageData.width, imageData.height);
-        if (stopped()) return;
-
-        if (qrText) {
-          status.textContent = 'QR code detected.';
-          const parsed = await window.api.parsePairingQR(qrText);
-          if (stopped()) return;
-          if (parsed) {
-            el('pair-host').value = `${parsed.host}:${parsed.port}`;
-            el('pair-code').value = parsed.code;
-            stopQrScan();
-            el('qr-modal').classList.add('hidden');
-            el('pair-modal').classList.remove('hidden');
-            setPairStatus('QR scanned. Review the details and press Pair.', 'ok');
-            return;
-          }
-          status.textContent = 'QR detected but did not contain a valid pairing code.';
-        }
-      } catch {
-        // ignore decode errors and keep scanning
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff'; // the quiet zone has to be light even in a dark UI
+  ctx.fillRect(0, 0, dim, dim);
+  ctx.fillStyle = '#000000';
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (modules[y][x]) {
+        ctx.fillRect((x + QR_QUIET) * scale, (y + QR_QUIET) * scale, scale, scale);
       }
     }
-
-    qrRaf = requestAnimationFrame(tick);
-  }
-
-  status.textContent = 'Scanning for QR code…';
-  qrRaf = requestAnimationFrame(tick);
-}
-
-function stopQrScan() {
-  const scanning = qrRaf !== null;
-  if (qrRaf) { cancelAnimationFrame(qrRaf); qrRaf = null; }
-  if (qrStream) {
-    qrStream.getTracks().forEach((t) => t.stop());
-    qrStream = null;
-  }
-  const video = el('qr-video');
-  if (video) video.srcObject = null;
-  if (!scanning) {
-    const qrModal = el('qr-modal');
-    if (qrModal && !qrModal.classList.contains('hidden')) qrModal.classList.add('hidden');
   }
 }
+
+async function startQrPairing() {
+  const status = el('qr-status');
+  const codeText = el('qr-code-text');
+  const canvas = el('qr-canvas');
+  status.textContent = 'Generating code…';
+  status.classList.remove('danger-text');
+  codeText.classList.add('hidden');
+  // Wipe the previous session's code. Leaving it up means the user can scan a
+  // code whose service name main is no longer watching for — and if this session
+  // fails to start, the dead code sits there under the error message.
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+
+  try {
+    const qr = await window.api.startQrPairing();
+    drawQrMatrix(canvas, qr.size, qr.modules);
+    status.textContent = 'Waiting for the phone to scan…';
+    codeText.textContent = `Pairing name ${qr.name}`;
+    codeText.classList.remove('hidden');
+  } catch (err) {
+    status.textContent = `Could not start pairing: ${cleanIpcError(err.message)}`;
+    status.classList.add('danger-text');
+  }
+}
+
+function closeQrPairing() {
+  window.api.cancelQrPairing().catch(() => {});
+  el('qr-modal').classList.add('hidden');
+}
+
+window.api.onQrPairProgress(({ phase, message, host }) => {
+  const status = el('qr-status');
+  status.textContent = message;
+  status.classList.toggle('danger-text', phase === 'error');
+
+  if (phase === 'error') {
+    // Don't leave a dead code on screen next to the error: it can no longer be
+    // paired with, and scanning it just makes the phone advertise a name nothing
+    // is watching for.
+    const canvas = el('qr-canvas');
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // Both terminal phases close through closeQrPairing() rather than hiding the
+  // modal directly: main's loop has already finished in these cases, but relying
+  // on that is exactly how a stray session ends up polling behind a closed modal.
+  if (phase === 'connected') {
+    closeQrPairing();
+    setPairStatus(message, 'ok');
+    refreshDevices();
+  }
+  if (phase === 'paired') {
+    // Paired but not reachable. The pairing code is single-use, so redoing the
+    // pairing is the wrong move — all that's missing is the connect port. Prefill
+    // the host and leave the code blank; the form connects without pairing when
+    // only a port is given.
+    closeQrPairing();
+    if (host) el('pair-host').value = host;
+    el('pair-code').value = '';
+    el('pair-modal').classList.remove('hidden');
+    setPairStatus(message, 'err');
+    el('pair-connect-port').focus();
+    refreshDevices();
+  }
+});
 
 // ------------------------------------------------------------------- tools modal
 

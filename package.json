@@ -12,12 +12,12 @@
   "license": "MIT",
   "dependencies": {
     "extract-zip": "^2.0.1",
-    "jsqr": "^1.4.0",
     "tar": "^7.4.3"
   },
   "devDependencies": {
     "electron": "^31.0.0",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^24.13.3",
+    "jsqr": "^1.4.0"
   },
   "build": {
     "appId": "com.example.androidcompanion",

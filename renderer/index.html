@@ -555,17 +555,17 @@
   <div id="pair-modal" class="modal hidden">
     <div class="modal-card glass-card">
       <h3>Pair wireless device</h3>
-      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the fields below, then read the connect port off the main Wireless debugging screen. Or scan the QR code if the phone shows one.</p>
+      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the fields below, then read the connect port off the main Wireless debugging screen. To pair by QR instead, use "Pair with QR code" — the phone scans a code shown here.</p>
       <label class="field-label">Pairing host &amp; port <span class="muted">(from the pairing dialog)</span></label>
       <input id="pair-host" placeholder="192.168.1.23:41235" class="mono" spellcheck="false" />
-      <label class="field-label">Pairing code</label>
+      <label class="field-label">Pairing code <span class="muted">(leave blank if already paired — a connect port alone just connects)</span></label>
       <input id="pair-code" placeholder="123456" class="mono" spellcheck="false" />
-      <label class="field-label">Connect port <span class="muted">(from "IP address &amp; port" — leave blank to auto-detect)</span></label>
+      <label class="field-label">Connect port <span class="muted">(from "IP address &amp; port" — blank auto-detects, but only when pairing)</span></label>
       <input id="pair-connect-port" placeholder="37123" class="mono" spellcheck="false" />
       <p id="pair-status" class="mirror-status"></p>
       <div class="modal-actions">
         <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
-        <button id="pair-scan-qr-btn" class="ghost-btn">Scan QR</button>
+        <button id="pair-scan-qr-btn" class="ghost-btn">Pair with QR code</button>
         <button id="pair-submit-btn" class="primary-btn">Pair</button>
       </div>
     </div>
@@ -574,17 +574,14 @@
   <div id="qr-modal" class="modal hidden">
     <div class="modal-card glass-card qr-modal-card">
       <div class="modal-head">
-        <h3>Scan QR code</h3>
+        <h3>Pair with QR code</h3>
         <button id="qr-modal-close" class="icon-btn">&times;</button>
       </div>
-      <p class="muted">Point your webcam at the phone's "Pair device with QR code" screen.</p>
+      <p class="muted">On the phone: Developer options &rarr; Wireless debugging &rarr; <strong>Pair device with QR code</strong>, then point the phone's camera at the code below. The phone and this PC must be on the same network.</p>
       <div class="qr-viewer-wrap">
-        <video id="qr-video" autoplay playsinline muted></video>
-        <canvas id="qr-canvas" class="hidden"></canvas>
-        <div id="qr-overlay" class="qr-overlay">
-          <div class="qr-frame"></div>
-        </div>
-        <p id="qr-status" class="qr-status">Starting camera…</p>
+        <canvas id="qr-canvas" class="qr-canvas" width="320" height="320"></canvas>
+        <p id="qr-status" class="qr-status">Generating code…</p>
+        <p id="qr-code-text" class="qr-code-text mono hidden"></p>
       </div>
     </div>
   </div>

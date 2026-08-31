@@ -105,8 +105,11 @@ contextBridge.exposeInMainWorld('api', {
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
 
-  // QR scan for wireless pairing. Both are async now: the decoding happens in
-  // the main process (see the sandbox note at the top of this file).
-  decodeQR: (data, width, height) => ipcRenderer.invoke('qr:decode', { data, width, height }),
-  parsePairingQR: (text) => ipcRenderer.invoke('qr:parsePairing', text),
+  // QR pairing. The PC *shows* the code and the phone scans it, so this returns
+  // a module matrix for the renderer to draw; progress arrives as events while
+  // main watches mDNS for the phone.
+  startQrPairing: () => ipcRenderer.invoke('wireless:qrPairStart'),
+  cancelQrPairing: () => ipcRenderer.invoke('wireless:qrPairCancel'),
+  onQrPairProgress: (callback) =>
+    ipcRenderer.on('wireless:qrPairProgress', (_e, payload) => callback(payload)),
 });

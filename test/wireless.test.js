@@ -9,9 +9,9 @@ const {
   splitHostPort,
   isPaired,
   isConnected,
+  listConnectTargets,
   pickConnectTarget,
   connectCandidates,
-  parsePairingQR,
 } = require('../src/wireless');
 
 const MDNS = `List of discovered mdns services
@@ -53,6 +53,21 @@ test('mDNS discovery picks the connect service, never the pairing one', () => {
   assert.strictEqual(pickConnectTarget(''), null);
 });
 
+test('every advertised connect endpoint can be listed', () => {
+  // The QR flow only ever connects to the host it just paired with, but it reports
+  // the endpoints it skipped — otherwise refusing them looks like finding nothing.
+  assert.deepStrictEqual(listConnectTargets(MDNS), [
+    { target: '192.168.1.23:37123', host: '192.168.1.23', port: '37123' },
+    { target: '192.168.1.44:45001', host: '192.168.1.44', port: '45001' },
+  ]);
+  assert.deepStrictEqual(listConnectTargets(''), []);
+  assert.deepStrictEqual(
+    listConnectTargets('adb-X\t_adb-tls-pairing._tcp.\t192.168.1.23:41235'),
+    [],
+    'the pairing service is not a connect endpoint'
+  );
+});
+
 test('an explicit connect port is tried before mDNS discovery', () => {
   assert.deepStrictEqual(
     connectCandidates('192.168.1.23', '37123', MDNS),
@@ -76,29 +91,3 @@ test('an explicit connect port is tried before mDNS discovery', () => {
   );
 });
 
-test('parse Android wireless debugging pairing QR codes', () => {
-  const standard = 'WIFI:T:adb;H:192.168.1.23:41235;P:123456;S:MyDevice;;';
-  assert.deepStrictEqual(parsePairingQR(standard), {
-    host: '192.168.1.23',
-    port: '41235',
-    code: '123456',
-  });
-
-  assert.deepStrictEqual(parsePairingQR('WIFI:T:adb;H:10.0.0.5:37123;P:654321;;'), {
-    host: '10.0.0.5',
-    port: '37123',
-    code: '654321',
-  });
-
-  assert.deepStrictEqual(parsePairingQR('WIFI:T:adb;H:192.168.1.1:41235;P:000000;;'), {
-    host: '192.168.1.1',
-    port: '41235',
-    code: '000000',
-  });
-
-  assert.strictEqual(parsePairingQR(''), null, 'empty string');
-  assert.strictEqual(parsePairingQR(null), null, 'null');
-  assert.strictEqual(parsePairingQR('WIFI:T:adb;P:123456;;'), null, 'missing host');
-  assert.strictEqual(parsePairingQR('WIFI:T:adb;H:192.168.1.23:41235;;'), null, 'missing code');
-  assert.strictEqual(parsePairingQR('not-a-qr-code'), null, 'plain text without WIFI prefix');
-});

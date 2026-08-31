@@ -106,6 +106,29 @@ polished OS-level API, and are worth knowing about before you rely on them:
   <img>` — it will happily brick a device if given the wrong image for the
   wrong partition. The confirmation dialog is there for a reason.
 
+## Wireless pairing over QR
+
+Android's "Pair device with QR code" screen opens the *phone's* camera, so the
+code has to be on the computer's screen — the phone is the scanner, never the
+other way around. The app renders it locally (`src/qrencode.js` is a small
+byte-mode QR encoder; the tests round-trip every symbol it produces through a
+decoder) from a payload of the form `WIFI:T:ADB;S:<name>;P:<password>;;`, where
+both the service name and the password are generated per session.
+
+Once the phone accepts the code it starts advertising `_adb-tls-pairing._tcp`
+over mDNS under that same service name, which is how the app knows *which* phone
+scanned it. It then runs `adb pair` against that endpoint. Pairing is only a key
+exchange, so the device still won't appear in `adb devices` until a second step
+connects to the separate `_adb-tls-connect._tcp` port, which usually shows up a
+second or two later.
+
+The weak link is adb's own mDNS backend — most often on Windows, where it may
+simply not be running. The app checks it with `adb mdns check` before it starts
+waiting, because `adb mdns services` stays silent in that case and the failure
+would otherwise look like the phone never scanned. When the backend is dead the
+"Pair with code" form is the fallback: it needs the pairing code and both ports
+typed in by hand, but it doesn't depend on discovery.
+
 ## Camera as a virtual webcam — what's missing
 
 The Webcam tab captures and displays the phone's camera feed, which is the same
