@@ -364,6 +364,22 @@ function buildPowerReport({ dump = {}, supplies = {}, zones = [], health = {}, h
     ? Math.round((estimatedFullMah / designMah) * 100)
     : null;
 
+  // The number to divide the present charge by: what the cell actually holds
+  // today when the gauge publishes it, and only failing that what it held new.
+  // Design capacity is the last choice deliberately — dividing today's charge by
+  // a worn battery's factory rating understates how full it is.
+  const capacityMah = fullMah || estimatedFullMah || designMah;
+
+  // How much charge is in the cell right now. Most gauges publish it outright.
+  // Where charge_now, charge_counter and dumpsys' counter are all hidden, the
+  // level is still a real reading of the same quantity — just quantised to a
+  // whole percent — so it is scaled by the capacity and flagged as an estimate.
+  // Note this can only fire when nowMah is absent, which is also the only case
+  // where estimatedFullMah is null, so the two estimates never feed each other.
+  const estimatedNowMah = !nowMah && capacityMah && level !== null
+    ? Math.round(capacityMah * (level / 100))
+    : null;
+
   // What the charger and phone negotiated, which dumpsys reports even where the
   // kernel nodes are locked down. It is a ceiling, not a measurement — the phone
   // may be drawing far less — so it is kept in its own fields and the UI must
@@ -379,7 +395,6 @@ function buildPowerReport({ dump = {}, supplies = {}, zones = [], health = {}, h
 
   // Minutes remaining, from the measured current and the charge gap.
   let minutesRemaining = null;
-  const capacityMah = fullMah || estimatedFullMah || designMah;
   if (amps && amps > 0.01 && level !== null && capacityMah) {
     const remainingMah = charging
       ? capacityMah * ((100 - level) / 100)
@@ -427,6 +442,8 @@ function buildPowerReport({ dump = {}, supplies = {}, zones = [], health = {}, h
     estimatedFullMah,
     chargeDesignMah: designMah,
     chargeNowMah: nowMah,
+    estimatedNowMah,
+    capacityMah,
     batteryTemp,
     socTemp,
     socZone: socZone ? socZone.type : null,
@@ -466,6 +483,10 @@ function explainMissing(report, field) {
   if (field === 'chargeFullMah') {
     return `Full-charge capacity is not published through ${via}, so wear cannot be `
       + 'measured against the design capacity.';
+  }
+  if (field === 'chargeNowMah') {
+    return `The present charge in mAh is not published through ${via}. It is estimated `
+      + 'from the charge level instead, which the gauge rounds to a whole percent.';
   }
   if (field === 'current' || field === 'watts') {
     return `No instantaneous current is published through ${via}. The charging `

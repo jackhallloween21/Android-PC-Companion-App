@@ -4,7 +4,7 @@
 // ./src/wireless — throws, Electron discards the entire preload, and the
 // renderer boots with no window.api at all (which looked like the app hanging
 // forever on "Setting up tools"). Keep this file to `electron` only.
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   // devices / dashboard
@@ -61,8 +61,18 @@ contextBridge.exposeInMainWorld('api', {
 
   // apps
   listAppsDetailed: (serial) => ipcRenderer.invoke('apps:listDetailed', serial),
-  getAppDetail: (serial, pkg) => ipcRenderer.invoke('apps:detail', { serial, pkg }),
+  getAppDetail: (serial, pkg, app) => ipcRenderer.invoke('apps:detail', { serial, pkg, app }),
   installApk: (serial) => ipcRenderer.invoke('apps:install', serial),
+  // Drag-and-drop sideloading. A dropped File has no usable path in the
+  // renderer any more, so the path is resolved here and only the string crosses
+  // the bridge — the renderer never gets to invent a path of its own.
+  installApkFiles: (serial, filePaths) => ipcRenderer.invoke('apps:installFiles', { serial, filePaths }),
+  pathForFile: (file) => {
+    try {
+      if (webUtils && typeof webUtils.getPathForFile === 'function') return webUtils.getPathForFile(file);
+    } catch { /* falls through to the legacy property below */ }
+    return (file && file.path) || null;
+  },
   uninstallApp: (serial, pkg) => ipcRenderer.invoke('apps:uninstall', { serial, pkg }),
   disableApp: (serial, pkg) => ipcRenderer.invoke('apps:disable', { serial, pkg }),
   enableApp: (serial, pkg) => ipcRenderer.invoke('apps:enable', { serial, pkg }),

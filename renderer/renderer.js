@@ -841,79 +841,401 @@ el('fi-delete-btn').onclick = async () => {
 };
 
 // ------------------------------------------------------------------------ apps
+//
+// Everything a row shows is decided in src/apps.js before it crosses IPC —
+// readable label, monogram, avatar colour, type, status, bloat verdict — because
+// the sandboxed renderer cannot require a CommonJS module out of src/. Only the
+// tab predicates are mirrored here; APP_FILTERS in src/apps.js is the source of
+// truth for them and is unit-tested there, so the two have to stay in step.
 
 let appFilter = 'all';
 let appSearch = '';
 let allApps = [];
 
-qAll('#app-category-tabs .chip-tab').forEach((tab) => {
-  tab.onclick = () => {
-    qAll('#app-category-tabs .chip-tab').forEach((t) => t.classList.remove('active'));
-    tab.classList.add('active');
-    appFilter = tab.dataset.filter;
-    renderApps();
-  };
-});
-el('app-search').oninput = (e) => { appSearch = e.target.value.toLowerCase(); renderApps(); };
-el('install-apk-btn').onclick = async () => { await window.api.installApk(state.selected); loadApps(); };
+const APP_TABS = [
+  { key: 'all', label: 'All', test: () => true },
+  { key: 'user', label: 'User', test: (a) => a.type === 'user' },
+  { key: 'system', label: 'System', test: (a) => a.type === 'system' || a.type === 'carrier' },
+  { key: 'bloat', label: 'Bloatware', test: (a) => a.bloat, danger: true },
+  { key: 'disabled', label: 'Frozen', test: (a) => a.status === 'disabled' },
+];
 
-async function loadApps() {
-  const container = el('app-list');
-  container.innerHTML = '<span class="muted">Loading…</span>';
-  try {
-    allApps = await window.api.listAppsDetailed(state.selected);
-    renderApps();
-  } catch (err) {
-    container.innerHTML = `<span class="muted">${err.message}</span>`;
-  }
+// Labels come off the device (a build that prints applicationLabel= is trusted
+// for it), so nothing device-derived is interpolated without escaping.
+const esc = (value) => String(value === null || value === undefined ? '' : value)
+  .replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+const TYPE_LABELS = { user: 'User', system: 'System', carrier: 'Carrier' };
+const STATUS_LABELS = { active: 'Active', disabled: 'Frozen', idle: 'Idle' };
+
+const DERIVED_HINT = 'Name worked out from the package id — Android does not hand app labels to adb.';
+
+// Mirrors isApkPath in src/apps.js. A bundle is still an APK drop even though
+// adb install cannot take one; main.js says so per file rather than the drop
+// being silently ignored.
+const APK_DROP = /\.(apk|apks|apkm|xapk)$/i;
+const baseName = (p) => String(p || '').split(/[\\/]/).pop();
+
+function visibleApps() {
+  const rule = APP_TABS.find((t) => t.key === appFilter) || APP_TABS[0];
+  const q = appSearch.trim().toLowerCase();
+  return allApps.filter((a) => {
+    if (!rule.test(a)) return false;
+    if (!q) return true;
+    return a.pkg.toLowerCase().includes(q) || String(a.label || '').toLowerCase().includes(q);
+  });
+}
+
+// The count lives on the chip and is computed with the very predicate the chip
+// filters by, so a tab can never promise a number its list does not deliver.
+function renderAppTabs() {
+  const host = el('app-category-tabs');
+  host.innerHTML = APP_TABS.map((tab) => {
+    const n = allApps.filter(tab.test).length;
+    const cls = ['chip-tab', tab.danger ? 'chip-bloat' : '', tab.key === appFilter ? 'active' : ''];
+    return `<button class="${cls.filter(Boolean).join(' ')}" data-filter="${tab.key}">${tab.label}
+      <span class="chip-count">${n}</span></button>`;
+  }).join('');
+  qAll('#app-category-tabs .chip-tab').forEach((btn) => {
+    btn.onclick = () => { appFilter = btn.dataset.filter; renderApps(); };
+  });
+}
+
+function appRowMarkup(app) {
+  const guess = app.labelSource === 'derived'
+    ? `<span class="guess-mark" title="${esc(DERIVED_HINT)}">◇</span>` : '';
+  const bloat = app.bloat
+    ? `<span class="bloat-tag" title="${esc(app.bloatReason || 'Preinstalled')}">Bloat</span>` : '';
+  const size = app.apkBytes === null || app.apkBytes === undefined
+    ? '<span class="size-cell num unknown" title="No stat line came back for this APK">—</span>'
+    : `<span class="size-cell num">${bytesText(app.apkBytes)}</span>`;
+  const frozen = app.status === 'disabled';
+  return `
+    <div class="app-ident">
+      <div class="app-avatar" style="background:${esc(app.color)}">${esc(app.monogram)}</div>
+      <div class="app-names">
+        <div class="app-name-line"><span class="app-name">${esc(app.label)}</span>${guess}${bloat}</div>
+        <span class="app-pkg">${esc(app.pkg)}</span>
+      </div>
+    </div>
+    <span class="type-cell type-${esc(app.type)}">${TYPE_LABELS[app.type] || esc(app.type)}</span>
+    <span><span class="status-pill st-${frozen ? 'disabled' : esc(app.status)}">${STATUS_LABELS[app.status] || esc(app.status)}</span></span>
+    ${size}
+    <span class="row-actions actions">
+      <button class="row-icon-btn ${frozen ? 'good' : 'warn'}" data-act="${frozen ? 'enable' : 'disable'}"
+        title="${frozen ? 'Re-enable this app' : 'Freeze (disable for user 0)'}">
+        ${frozen
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>'}
+      </button>
+      <button class="row-icon-btn danger" data-act="uninstall" title="Uninstall via adb">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M10 4h4l1 2H9z"/><path d="M6 6l1 14h10l1-14"/></svg>
+      </button>
+    </span>`;
 }
 
 function renderApps() {
+  renderAppTabs();
   const container = el('app-list');
-  const filtered = allApps.filter((a) => {
-    if (appFilter === 'user' && a.type !== 'user') return false;
-    if (appFilter === 'system' && a.type !== 'system') return false;
-    if (appFilter === 'disabled' && a.status !== 'disabled') return false;
-    if (appSearch && !a.pkg.toLowerCase().includes(appSearch)) return false;
-    return true;
-  });
+  const rows = visibleApps();
+
+  const total = allApps.length;
+  const bloat = allApps.filter((a) => a.bloat).length;
+  setText('apps-summary', total
+    ? `${total} packages · ${bloat} look preinstalled junk · showing ${rows.length}`
+    : '');
+
   container.innerHTML = '';
-  filtered.forEach((app) => {
+  if (!total) {
+    container.innerHTML = '<span class="muted">No packages came back.</span>';
+    return;
+  }
+  if (!rows.length) {
+    container.innerHTML = '<span class="muted">Nothing matches that filter.</span>';
+    return;
+  }
+
+  for (const app of rows) {
     const row = document.createElement('div');
-    row.className = 'list-row';
-    row.innerHTML = `<span class="name">${app.pkg}</span><span class="meta">${app.type} · ${app.status}</span>`;
+    row.className = 'app-row';
+    if (app.status === 'disabled') row.classList.add('is-disabled');
+    if (state.selectedApp && state.selectedApp.pkg === app.pkg) row.classList.add('selected');
+    row.dataset.pkg = app.pkg;
+    row.innerHTML = appRowMarkup(app);
     row.onclick = () => selectApp(app);
+    qAll('.row-icon-btn', row).forEach((btn) => {
+      btn.onclick = (e) => { e.stopPropagation(); runAppAction(btn.dataset.act, app); };
+    });
     container.appendChild(row);
+  }
+}
+
+async function loadApps() {
+  const container = el('app-list');
+  container.innerHTML = '<span class="muted">Reading the package list…</span>';
+  try {
+    allApps = await window.api.listAppsDetailed(state.selected);
+    renderApps();
+    // The inspector is showing a snapshot from before the sweep; refresh it so a
+    // just-frozen app does not keep offering to be frozen.
+    const still = state.selectedApp && allApps.find((a) => a.pkg === state.selectedApp.pkg);
+    if (still) selectApp(still);
+  } catch (err) {
+    allApps = [];
+    container.innerHTML = `<span class="muted">${esc(cleanIpcError(err.message))}</span>`;
+  }
+}
+
+// ---- sideloading
+
+function renderInstallLog(lines) {
+  const log = el('apk-install-log');
+  if (!lines || !lines.length) {
+    log.classList.add('hidden');
+    log.innerHTML = '';
+    return;
+  }
+  log.classList.remove('hidden');
+  log.innerHTML = lines.map((l) => `<div class="install-line ${l.cls}">
+    <span class="il-icon">${l.icon}</span>
+    ${l.file ? `<span class="il-file" title="${esc(l.file)}">${esc(l.file)}</span>` : ''}
+    <span class="il-msg">${esc(l.message)}</span>
+  </div>`).join('');
+}
+
+async function sideload(paths) {
+  const files = (paths || []).filter(Boolean);
+  if (!files.length) return;
+  if (!state.selected) {
+    renderInstallLog([{ cls: 'bad', icon: '✕', file: '', message: 'Connect a device first.' }]);
+    return;
+  }
+
+  const apks = files.filter((p) => APK_DROP.test(p));
+  const rejected = files.filter((p) => !APK_DROP.test(p));
+  if (!apks.length) {
+    renderInstallLog(rejected.map((p) => ({
+      cls: 'bad', icon: '✕', file: baseName(p), message: 'Not an APK.',
+    })));
+    return;
+  }
+
+  const zone = el('apk-dropzone');
+  zone.classList.add('busy');
+  renderInstallLog(apks.map((p) => ({ cls: 'pending', icon: '⋯', file: baseName(p), message: 'Installing…' })));
+  try {
+    // adb reports install failures on stdout and can still exit 0, so main
+    // classifies the output and hands back one verdict per file.
+    const results = await window.api.installApkFiles(state.selected, apks);
+    renderInstallLog((results || []).map((r) => ({
+      cls: r.ok ? 'ok' : 'bad', icon: r.ok ? '✓' : '✕', file: r.file, message: r.message,
+    })).concat(rejected.map((p) => ({
+      cls: 'bad', icon: '✕', file: baseName(p), message: 'Not an APK.',
+    }))));
+    if ((results || []).some((r) => r.ok)) loadApps();
+  } catch (err) {
+    renderInstallLog([{ cls: 'bad', icon: '✕', file: '', message: cleanIpcError(err.message) }]);
+  } finally {
+    zone.classList.remove('busy');
+  }
+}
+
+el('install-apk-btn').onclick = async () => {
+  if (!state.selected) { toast('Connect a device first.'); return; }
+  el('install-apk-btn').disabled = true;
+  try {
+    const results = await window.api.installApk(state.selected);
+    if (!results) return; // dialog cancelled
+    renderInstallLog(results.map((r) => ({
+      cls: r.ok ? 'ok' : 'bad', icon: r.ok ? '✓' : '✕', file: r.file, message: r.message,
+    })));
+    if (results.some((r) => r.ok)) loadApps();
+  } catch (err) {
+    renderInstallLog([{ cls: 'bad', icon: '✕', file: '', message: cleanIpcError(err.message) }]);
+  } finally {
+    el('install-apk-btn').disabled = false;
+  }
+};
+
+// A drop anywhere else in the window would make Electron navigate to the file,
+// which throws the whole UI away, so the default is cancelled document-wide and
+// only the banner acts on it.
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => e.preventDefault());
+
+{
+  const zone = el('apk-dropzone');
+  // dragenter/dragleave fire for every child element the pointer crosses, so the
+  // highlight is reference-counted instead of toggled.
+  let depth = 0;
+  zone.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    depth += 1;
+    zone.classList.add('dragging');
   });
-  if (!filtered.length) container.innerHTML = '<span class="muted">No apps match.</span>';
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  zone.addEventListener('dragleave', () => {
+    depth = Math.max(0, depth - 1);
+    if (!depth) zone.classList.remove('dragging');
+  });
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    depth = 0;
+    zone.classList.remove('dragging');
+    // A dropped File no longer carries a usable path in the renderer; only the
+    // preload can turn it back into one.
+    const paths = Array.from(e.dataTransfer.files || [])
+      .map((f) => window.api.pathForFile(f))
+      .filter(Boolean);
+    sideload(paths);
+  });
+}
+
+el('app-search').oninput = (e) => { appSearch = e.target.value; renderApps(); };
+
+// ---- inspector
+
+function chip(text, kind = '', title = '') {
+  return `<span class="chip${kind ? ` ${kind}` : ''}"${title ? ` title="${esc(title)}"` : ''}>${esc(text)}</span>`;
+}
+
+function footprintMarkup(detail) {
+  // Data and cache both come back unmeasured for the same reason, and printing
+  // that reason twice reads as a stutter — the first row to hit it explains it.
+  const seen = new Set();
+  const rows = (detail.footprint || []).map((f) => {
+    const note = f.note && !seen.has(f.note) ? f.note : null;
+    if (f.note) seen.add(f.note);
+    return `<div class="fp-row">
+    <span class="fp-label">${esc(f.label)}${note ? `<span class="fp-note">${esc(note)}</span>` : ''}</span>
+    <span class="fp-value${f.bytes === null ? ' unknown' : ''}">${f.bytes === null ? '—' : bytesText(f.bytes)}</span>
+  </div>`;
+  }).join('');
+  // A sum of two rows out of three is not the total, and saying so is the whole
+  // point of tracking which rows were measured.
+  const total = `<div class="fp-row fp-total">
+    <span class="fp-label">${detail.totalComplete ? 'Total on device' : 'Measured so far'}</span>
+    <span class="fp-value${detail.totalBytes === null ? ' unknown' : ''}">${detail.totalBytes === null ? '—' : bytesText(detail.totalBytes)}</span>
+  </div>`;
+  return rows + total;
+}
+
+const PERM_MARK = { true: '✓', false: '✕', null: '·' };
+
+function permissionsMarkup(detail) {
+  const groups = detail.permissionGroups || [];
+  if (!groups.length) return '<div class="perm-empty">No declared permissions came back for this package.</div>';
+  return groups.map((g) => `<div class="perm-group">
+    <div class="perm-group-head">
+      <span class="perm-dot" style="background:${esc(g.color)}"></span>
+      <span class="perm-group-name">${esc(g.label)}</span>
+      <span class="perm-group-count">${g.grantedCount}/${g.items.length}</span>
+    </div>
+    <div class="perm-items">${g.items.map((p) => {
+    const cls = p.granted === true ? 'granted' : p.granted === false ? 'denied' : 'undecided';
+    const hint = p.granted === true ? 'Granted' : p.granted === false ? 'Denied' : 'Declared, never decided on';
+    return `<div class="perm-item ${cls}${p.known ? '' : ' unknown-perm'}" title="${esc(p.id)} — ${hint}">
+        <span class="pi-mark">${PERM_MARK[String(p.granted)]}</span>
+        <span class="pi-name">${esc(p.label)}</span>
+      </div>`;
+  }).join('')}</div>
+  </div>`).join('');
+}
+
+function renderInspector(detail) {
+  const avatar = el('ai-avatar');
+  avatar.textContent = detail.monogram || '?';
+  avatar.style.background = detail.color || 'var(--panel-strong)';
+  setText('ai-label', detail.label || detail.pkg);
+  setText('ai-pkg', detail.pkg);
+
+  const frozen = detail.status === 'disabled';
+  const tags = [
+    detail.versionName ? chip(`v${detail.versionName}`) : '',
+    chip(TYPE_LABELS[detail.type] || detail.type || 'Unknown'),
+    chip(frozen ? 'Frozen' : 'Active', frozen ? 'bad' : 'good'),
+    detail.targetSdk ? chip(`Target API ${detail.targetSdk}`) : '',
+    detail.bloat ? chip(detail.bloatReason || 'Preinstalled', 'warn', 'Why this is flagged as bloat') : '',
+    detail.installer ? chip(`via ${detail.installer}`, '', 'Installer package') : '',
+    detail.labelSource === 'derived' ? chip('Name is a guess', '', DERIVED_HINT) : '',
+    detail.debuggable ? chip('Debuggable', 'warn', 'Its data directory can be read over adb') : '',
+  ].filter(Boolean).join('');
+  el('ai-tags').innerHTML = tags;
+
+  el('ai-footprint').innerHTML = footprintMarkup(detail);
+
+  const s = detail.permissionSummary || { granted: 0, denied: 0, declared: 0, total: 0 };
+  setText('ai-perm-summary', s.total
+    ? `— ${s.granted} granted, ${s.denied} denied, ${s.declared} not asked`
+    : '');
+  el('ai-permissions').innerHTML = permissionsMarkup(detail);
+
+  el('ai-disable-btn').classList.toggle('hidden', frozen);
+  el('ai-enable-btn').classList.toggle('hidden', !frozen);
+  const system = detail.type !== 'user';
+  const uninstall = el('ai-uninstall-btn');
+  uninstall.title = system
+    ? 'adb usually refuses to remove a preinstalled app — freezing it is the reliable way'
+    : 'Removes the app and its data';
+
+  const notes = [];
+  if (detail.bloat && detail.bloatReason) notes.push(`Flagged as bloat: ${detail.bloatReason.toLowerCase()}.`);
+  if (system) notes.push('Preinstalled apps normally survive an uninstall; freeze them instead.');
+  if (detail.lastUpdate) notes.push(`Last updated ${detail.lastUpdate.slice(0, 10)}.`);
+  setText('ai-note', notes.join(' '));
 }
 
 async function selectApp(app) {
   state.selectedApp = app;
-  qAll('#app-list .list-row').forEach((r) => r.classList.remove('selected'));
+  qAll('#app-list .app-row').forEach((r) => r.classList.toggle('selected', r.dataset.pkg === app.pkg));
   el('app-inspector-empty').classList.add('hidden');
   el('app-inspector-body').classList.remove('hidden');
-  el('ai-pkg').textContent = app.pkg;
-  el('ai-size').textContent = 'Loading…';
-  el('ai-permissions').innerHTML = '';
 
-  const detail = await window.api.getAppDetail(state.selected, app.pkg);
-  el('ai-size').textContent = detail.sizeBytes ? `${(detail.sizeBytes / 1048576).toFixed(1)} MB` : 'Unknown';
-  el('ai-permissions').innerHTML = detail.permissions.length
-    ? detail.permissions.map((p) => `<div>✓ ${p.replace('android.permission.', '')}</div>`).join('')
-    : '<div class="muted">No declared permissions found.</div>';
+  // Draw what the list already knows straight away — the dumpsys round trip takes
+  // a moment and an empty panel reads as a broken click.
+  renderInspector({ ...app, footprint: [], totalBytes: null, totalComplete: false, permissionGroups: [] });
+  setText('ai-note', 'Reading permissions and sizes…');
+
+  try {
+    const detail = await window.api.getAppDetail(state.selected, app.pkg, app);
+    if (state.selectedApp && state.selectedApp.pkg === app.pkg) renderInspector(detail);
+  } catch (err) {
+    setText('ai-note', cleanIpcError(err.message));
+  }
 }
 
-el('ai-clear-btn').onclick = () => state.selectedApp && window.api.clearAppData(state.selected, state.selectedApp.pkg);
-el('ai-disable-btn').onclick = () => state.selectedApp && window.api.disableApp(state.selected, state.selectedApp.pkg).then(loadApps);
-el('ai-enable-btn').onclick = () => state.selectedApp && window.api.enableApp(state.selected, state.selectedApp.pkg).then(loadApps);
-el('ai-uninstall-btn').onclick = async () => {
-  if (!state.selectedApp) return;
-  if (confirm(`Uninstall ${state.selectedApp.pkg}?`)) {
-    await window.api.uninstallApp(state.selected, state.selectedApp.pkg);
+async function runAppAction(action, app) {
+  const target = app || state.selectedApp;
+  if (!target || !state.selected) return;
+  try {
+    if (action === 'disable') {
+      await window.api.disableApp(state.selected, target.pkg);
+      toast(`${target.label} frozen. It stays installed and can be re-enabled.`);
+    } else if (action === 'enable') {
+      await window.api.enableApp(state.selected, target.pkg);
+      toast(`${target.label} re-enabled.`);
+    } else if (action === 'clear') {
+      if (!confirm(`Erase all data and cache for ${target.label}?\n\n${target.pkg}`)) return;
+      await window.api.clearAppData(state.selected, target.pkg);
+      toast(`${target.label} reset to a fresh install.`);
+    } else if (action === 'uninstall') {
+      if (!confirm(`Uninstall ${target.label}?\n\n${target.pkg}`)) return;
+      const out = await window.api.uninstallApp(state.selected, target.pkg);
+      // `adb uninstall` prints Failure on stdout for a preinstalled app.
+      toast(/failure/i.test(String(out || ''))
+        ? `Could not uninstall ${target.label}: ${String(out).trim()}`
+        : `${target.label} uninstalled.`);
+    }
     loadApps();
+  } catch (err) {
+    toast(cleanIpcError(err.message));
   }
-};
+}
+
+el('ai-clear-btn').onclick = () => runAppAction('clear');
+el('ai-disable-btn').onclick = () => runAppAction('disable');
+el('ai-enable-btn').onclick = () => runAppAction('enable');
+el('ai-uninstall-btn').onclick = () => runAppAction('uninstall');
 
 // ---------------------------------------------------------------------- mirror
 

@@ -48,6 +48,16 @@ const {
   pruneKnown,
   planReconnect,
 } = require('./src/autoconnect');
+const {
+  APPS_SCRIPT,
+  parseAppsDump,
+  buildAppList,
+  parsePackageDump,
+  buildAppDetail,
+  parseDuBytes,
+  isInstallable,
+  parseInstallResult,
+} = require('./src/apps');
 // QR pairing lives here, not in preload.js: the preload runs sandboxed, where
 // `require` is a polyfill that only resolves `electron` and a couple of node
 // builtins. Requiring a third-party module (or a relative file) there throws,
@@ -634,7 +644,7 @@ async function readHealthHal(serial) {
 // is missing. This matters because the two reasons need different responses: an
 // unreadable node is an access problem, while a gauge that never counts cycles
 // is a hardware fact the user cannot do anything about.
-const EXPLAINED_FIELDS = ['current', 'watts', 'cycleCount', 'chargeFullMah', 'socTemp'];
+const EXPLAINED_FIELDS = ['current', 'watts', 'cycleCount', 'chargeFullMah', 'chargeNowMah', 'socTemp'];
 
 function withNotes(report) {
   const notes = {};
@@ -1303,62 +1313,121 @@ ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial
 
 // ---------------------------------------------------------------------------
 // Apps
+//
+// The inventory is one shell round trip (src/apps.js explains the script and why
+// the label has to be layered). Doing it per-app would be ~1200 adb invocations
+// on a phone with 300 packages, which takes minutes.
 // ---------------------------------------------------------------------------
 
-async function listPackageSet(serial, flag) {
-  const out = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '--user', '0', flag]);
-  return new Set(out.split('\n').map((l) => l.replace('package:', '').trim()).filter(Boolean));
+// A package id only ever contains letters, digits, dots and underscores. Every
+// id that reaches a shell string is checked against this, so a crafted name
+// cannot smuggle a `;` into the batched script.
+const PKG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.]*$/;
+
+function assertPackage(pkg) {
+  const id = String(pkg || '').trim();
+  if (!PKG_RE.test(id)) throw new Error(`Not a package name: ${pkg}`);
+  return id;
 }
 
 ipcMain.handle('apps:listDetailed', async (_e, serial) => {
-  const [thirdParty, system, disabled] = await Promise.all([
-    listPackageSet(serial, '-3'),
-    listPackageSet(serial, '-s'),
-    listPackageSet(serial, '-d'),
-  ]);
-  const all = new Set([...thirdParty, ...system]);
-  return Array.from(all).map((pkg) => ({
-    pkg,
-    type: thirdParty.has(pkg) ? 'user' : 'system',
-    status: disabled.has(pkg) ? 'disabled' : 'active',
-  }));
+  const raw = await adb(['-s', serial, 'shell', APPS_SCRIPT]);
+  return buildAppList(parseAppsDump(raw));
 });
 
-ipcMain.handle('apps:detail', async (_e, { serial, pkg }) => {
-  let sizeBytes = null;
-  try {
-    const pathOut = await adb(['-s', serial, 'shell', 'pm', 'path', pkg]);
-    const apkPath = pathOut.split('\n')[0].replace('package:', '').trim();
-    if (apkPath) {
-      const stat = await adb(['-s', serial, 'shell', 'stat', '-c%s', apkPath]);
-      sizeBytes = Number(stat.trim()) || null;
+/**
+ * Everything the inspector shows, in one round trip.
+ *
+ * The two `du` attempts are both expected to fail on a normal device: /data/data
+ * is unreadable from the adb shell, and `run-as` only works for a debuggable
+ * app. They are still worth making — when one does succeed the panel shows real
+ * numbers instead of "unavailable" — and when both fail the parse returns null,
+ * which is what the UI renders as a dash.
+ */
+function detailScript(pkg) {
+  const dataDir = `/data/data/${pkg}`;
+  return [
+    'echo "@@DUMP@@";', `dumpsys package ${pkg} 2>/dev/null;`,
+    'echo "@@DATA@@";', `du -sk ${dataDir} 2>/dev/null;`,
+    `run-as ${pkg} du -sk ${dataDir} 2>/dev/null;`,
+    'echo "@@CACHE@@";', `du -sk ${dataDir}/cache 2>/dev/null;`,
+    `run-as ${pkg} du -sk ${dataDir}/cache 2>/dev/null;`,
+    'exit 0',
+  ].join(' ');
+}
+
+function splitDetail(raw) {
+  const out = { dump: '', data: '', cache: '' };
+  let current = null;
+  for (const line of String(raw || '').split('\n')) {
+    const text = line.replace(/\r$/, '').trim();
+    if (text === '@@DUMP@@') { current = 'dump'; continue; }
+    if (text === '@@DATA@@') { current = 'data'; continue; }
+    if (text === '@@CACHE@@') { current = 'cache'; continue; }
+    if (current) out[current] += `${line.replace(/\r$/, '')}\n`;
+  }
+  return out;
+}
+
+ipcMain.handle('apps:detail', async (_e, { serial, pkg, app = null }) => {
+  const id = assertPackage(pkg);
+  const raw = await adb(['-s', serial, 'shell', detailScript(id)]);
+  const { dump, data, cache } = splitDetail(raw);
+  return buildAppDetail({
+    app: app || { pkg: id },
+    dump: parsePackageDump(dump),
+    apkBytes: app ? app.apkBytes : null,
+    dataBytes: parseDuBytes(data),
+    cacheBytes: parseDuBytes(cache),
+  });
+});
+
+/**
+ * Installs one or more APKs, reporting per file.
+ *
+ * `adb install` announces failure on stdout and, depending on the version, still
+ * exits 0 — the same trap as `adb pair` — so the output is classified rather
+ * than the exit status trusted. Files are installed one at a time: a batch that
+ * stopped at the first failure would leave the user guessing which of five
+ * dropped APKs actually landed.
+ */
+async function installApks(serial, filePaths) {
+  const results = [];
+  for (const filePath of (Array.isArray(filePaths) ? filePaths : []).filter(Boolean)) {
+    const name = path.basename(filePath);
+    if (!isInstallable(filePath)) {
+      results.push({
+        file: name,
+        ok: false,
+        code: null,
+        message: 'Only a single .apk can be installed over adb. Split bundles (.apks/.xapk) need their own installer.',
+      });
+      continue;
     }
-  } catch { /* ignore */ }
-
-  let permissions = [];
-  try {
-    const dump = await adb(['-s', serial, 'shell', 'dumpsys', 'package', pkg]);
-    const block = dump.split('requested permissions:')[1]?.split(/\n\s*\n/)[0] || '';
-    permissions = block.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('android.permission') || l.includes('.permission.'));
-  } catch { /* ignore */ }
-
-  return { sizeBytes, permissions };
-});
+    const out = await adbText(['-s', serial, 'install', '-r', filePath]);
+    results.push({ file: name, ...parseInstallResult(out) });
+  }
+  return results;
+}
 
 ipcMain.handle('apps:install', async (_e, serial) => {
   const { canceled, filePaths } = await dialog.showOpenDialog({
-    properties: ['openFile'],
-    filters: [{ name: 'APK', extensions: ['apk'] }],
+    title: 'Choose APKs to sideload',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Android package', extensions: ['apk'] }],
   });
   if (canceled || !filePaths.length) return null;
-  await adb(['-s', serial, 'install', '-r', filePaths[0]]);
-  return filePaths[0];
+  return installApks(serial, filePaths);
 });
 
-ipcMain.handle('apps:uninstall', (_e, { serial, pkg }) => adb(['-s', serial, 'uninstall', pkg]));
-ipcMain.handle('apps:disable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg]));
-ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'enable', pkg]));
-ipcMain.handle('apps:clearData', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'clear', pkg]));
+// Drag-and-drop hands over paths the renderer already resolved, so there is no
+// dialog to show.
+ipcMain.handle('apps:installFiles', async (_e, { serial, filePaths }) => installApks(serial, filePaths));
+
+ipcMain.handle('apps:uninstall', (_e, { serial, pkg }) => adb(['-s', serial, 'uninstall', assertPackage(pkg)]));
+ipcMain.handle('apps:disable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', assertPackage(pkg)]));
+ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'enable', assertPackage(pkg)]));
+ipcMain.handle('apps:clearData', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'clear', assertPackage(pkg)]));
 
 // ---------------------------------------------------------------------------
 // Backup

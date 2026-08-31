@@ -213,32 +213,84 @@
       </section>
 
       <section id="view-apps" class="view hidden">
-        <div class="view-header"><h2>App Management</h2></div>
-        <div class="chip-tabs" id="app-category-tabs">
-          <button class="chip-tab active" data-filter="all">All</button>
-          <button class="chip-tab" data-filter="user">User</button>
-          <button class="chip-tab" data-filter="system">System</button>
-          <button class="chip-tab" data-filter="disabled">Disabled</button>
+        <div class="view-header">
+          <h2>App Management</h2>
+          <span id="apps-summary" class="muted tiny"></span>
         </div>
-        <div class="apps-toolbar">
-          <input id="app-search" class="mono" placeholder="Search package name…" spellcheck="false" />
-          <button id="install-apk-btn" class="primary-btn">Sideload APK</button>
-        </div>
-        <div class="split-panel">
-          <div class="glass-card">
-            <div id="app-list" class="mono app-list"></div>
+
+        <!-- Sideloading. The whole banner is the drop target, not just the icon,
+             and it stays visible after a drop so the per-file result has
+             somewhere to appear. -->
+        <div id="apk-dropzone" class="dropzone">
+          <div class="dropzone-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v8a2 2 0 0 1-1 1.73l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.73l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="M3.3 7 12 12l8.7-5"/><path d="M12 22V12"/></svg>
           </div>
+          <div class="dropzone-text">
+            <strong>Drag &amp; drop an APK to sideload</strong>
+            <span class="muted tiny">Installed straight onto the device with <span class="mono">adb install -r</span>. Drop several at once — each one is reported on its own.</span>
+          </div>
+          <button id="install-apk-btn" class="primary-btn">Browse APK file</button>
+        </div>
+        <div id="apk-install-log" class="install-log hidden"></div>
+
+        <div class="apps-toolbar">
+          <div class="chip-tabs" id="app-category-tabs"></div>
+          <label class="search-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="app-search" placeholder="Search app or package name…" spellcheck="false" />
+          </label>
+        </div>
+
+        <div class="split-panel apps-panel">
+          <div class="glass-card app-table-card">
+            <div class="app-row app-table-head">
+              <span>Application &amp; package</span>
+              <span>Type</span>
+              <span>Status</span>
+              <span class="num">Size</span>
+              <span class="actions">Actions</span>
+            </div>
+            <div id="app-list" class="app-table"></div>
+          </div>
+
           <div class="glass-card inspector">
-            <h3>App diagnostics</h3>
-            <div id="app-inspector-empty" class="muted">Select an app to see details.</div>
+            <h3>App diagnostics &amp; permissions</h3>
+            <div id="app-inspector-empty" class="muted">Pick an app on the left to see its footprint and what it is allowed to do.</div>
             <div id="app-inspector-body" class="hidden">
-              <div class="data-cell"><span class="k">Package</span><span class="v mono" id="ai-pkg"></span></div>
-              <div class="data-cell"><span class="k">APK size</span><span class="v mono" id="ai-size"></span></div>
-              <div id="ai-permissions" class="permission-list mono"></div>
-              <button id="ai-clear-btn" class="ghost-btn">Clear app cache &amp; data</button>
-              <button id="ai-disable-btn" class="ghost-btn">Disable</button>
-              <button id="ai-enable-btn" class="ghost-btn">Enable</button>
-              <button id="ai-uninstall-btn" class="danger-btn">Uninstall via ADB</button>
+              <div class="ai-head">
+                <div id="ai-avatar" class="app-avatar lg"></div>
+                <div class="ai-head-text">
+                  <div id="ai-label" class="ai-label"></div>
+                  <div id="ai-pkg" class="mono tiny muted"></div>
+                </div>
+              </div>
+              <div id="ai-tags" class="ai-tags"></div>
+
+              <div class="field-label">Storage footprint</div>
+              <div id="ai-footprint" class="footprint"></div>
+
+              <div class="field-label">Declared app permissions <span id="ai-perm-summary" class="muted tiny"></span></div>
+              <div id="ai-permissions" class="permission-groups"></div>
+
+              <div class="ai-actions">
+                <button id="ai-clear-btn" class="act-btn act-neutral">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/><path d="M10 11v5M14 11v5"/></svg>
+                  Clear app cache &amp; data
+                </button>
+                <button id="ai-disable-btn" class="act-btn act-warn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18"/><path d="m5.6 5.6 12.8 12.8M18.4 5.6 5.6 18.4"/></svg>
+                  Freeze / disable (debloat)
+                </button>
+                <button id="ai-enable-btn" class="act-btn act-good">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                  Re-enable app
+                </button>
+                <button id="ai-uninstall-btn" class="act-btn act-danger">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M10 4h4l1 2H9z"/><path d="M6 6l1 14h10l1-14"/></svg>
+                  Uninstall via ADB
+                </button>
+              </div>
+              <div id="ai-note" class="muted tiny"></div>
             </div>
           </div>
         </div>

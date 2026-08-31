@@ -89,8 +89,9 @@ select:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
   box-shadow: 0 0 8px 1px var(--accent-dim);
 }
 
-.app-name {
-  font-size: 12px; letter-spacing: 0.14em; text-transform: lowercase;
+/* Scoped to the titlebar: the app table has its own .app-name, and this rule's
+   lowercasing would otherwise rewrite every app name on the phone. */
+#titlebar .app-name {
   color: var(--text-muted); font-weight: 600;
 }
 
@@ -629,13 +630,11 @@ button:disabled { opacity: 0.4; cursor: not-allowed; filter: none !important; }
 .path-bar button:hover { border-color: var(--accent); color: var(--accent); }
 .prompt { color: var(--signal); font-weight: 700; }
 
-.apps-toolbar { display: flex; gap: 10px; align-items: center; }
-.apps-toolbar input {
-  flex: 1; background: rgba(255,255,255,0.03); border: 1px solid var(--panel-border);
-  border-radius: var(--radius-md); padding: 8px 10px; color: var(--text-primary); font-size: 12.5px;
-}
+/* The filter chips and the search box share this row and it has to survive a
+   narrow window, so it wraps instead of squeezing the chips into ellipses. */
+.apps-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
-.file-list, .app-list { margin-top: 14px; display: flex; flex-direction: column; gap: 2px; font-size: 12px; max-height: 460px; overflow-y: auto; }
+.file-list { margin-top: 14px; display: flex; flex-direction: column; gap: 2px; font-size: 12px; max-height: 460px; overflow-y: auto; }
 
 .list-row {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -778,4 +777,278 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   color: var(--text-muted);
   text-align: center;
   min-height: 18px;
+}
+
+/* ------------------------------------------------------- app manager */
+
+/* The apps view is the one screen that is mostly a dense list, so its rows use a
+   real grid instead of the flex `.list-row` the files view uses: with 300 rows
+   the columns have to line up exactly or the eye cannot scan down them. Every
+   colour in here is decided in src/apps.js — the avatar tint is hashed from the
+   package id and the permission tint comes from the group — so a given app is
+   always the same colour on every device and every launch. */
+
+/* sideloading: the whole banner is the drop target, not just the icon */
+
+.dropzone {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 16px;
+  border: 1.5px dashed var(--panel-border);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  transition: border-color .15s ease, background .15s ease;
+}
+.dropzone.dragging { border-color: var(--accent); background: var(--accent-dim); }
+.dropzone.busy { opacity: .6; pointer-events: none; }
+
+.dropzone-icon {
+  flex-shrink: 0; width: 42px; height: 42px; border-radius: 12px;
+  display: grid; place-items: center;
+  background: var(--accent-dim); color: var(--accent);
+}
+.dropzone-icon svg { width: 22px; height: 22px; }
+.dropzone.dragging .dropzone-icon { background: rgba(245,165,36,0.26); }
+
+.dropzone-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.dropzone-text strong { font-size: 13px; color: var(--text-primary); }
+.dropzone button { flex-shrink: 0; }
+
+/* One line per dropped file: adb install reports a failure per APK, and a batch
+   where three worked and one was a downgrade has to say exactly that. */
+.install-log { display: flex; flex-direction: column; gap: 5px; }
+.install-line {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 7px 11px; border-radius: var(--radius-md);
+  border: 1px solid var(--panel-border); background: rgba(255,255,255,0.03);
+  font-size: 11.5px;
+}
+.install-line .il-icon { flex-shrink: 0; font-weight: 700; font-size: 12px; }
+.install-line .il-file {
+  flex-shrink: 0; font-family: var(--font-mono); font-size: 11px; color: var(--text-primary);
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.install-line .il-msg { color: var(--text-muted); min-width: 0; }
+.install-line.ok { border-color: rgba(45,212,191,0.35); background: var(--signal-dim); }
+.install-line.ok .il-icon { color: var(--signal); }
+.install-line.bad { border-color: rgba(244,91,105,0.35); background: var(--danger-dim); }
+.install-line.bad .il-icon { color: var(--danger); }
+.install-line.pending .il-icon { color: var(--accent); }
+
+/* toolbar: chips carry their own count so the tab and the list agree */
+
+.chip-count {
+  margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+  font-size: 10px; font-weight: 700;
+  background: rgba(255,255,255,0.08); color: var(--text-muted);
+}
+.chip-tab.active .chip-count { background: rgba(245,165,36,0.22); color: var(--accent); }
+.chip-tab.chip-bloat.active { background: var(--danger-dim); border-color: rgba(244,91,105,0.4); color: var(--danger); }
+.chip-tab.chip-bloat.active .chip-count { background: rgba(244,91,105,0.22); color: var(--danger); }
+
+.search-wrap {
+  flex: 1; min-width: 190px; height: 34px;
+  display: flex; align-items: center; gap: 8px; padding: 0 11px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md); color: var(--text-muted);
+}
+.search-wrap:focus-within { border-color: var(--accent); color: var(--accent); }
+.search-wrap svg { width: 14px; height: 14px; flex-shrink: 0; }
+.search-wrap input {
+  flex: 1; min-width: 0; border: 0; outline: none; background: none;
+  color: var(--text-primary); font-family: var(--font-ui); font-size: 12.5px;
+}
+
+/* the table */
+
+.apps-panel { align-items: stretch; }
+.app-table-card { display: flex; flex-direction: column; min-width: 0; padding: 14px 16px; }
+
+.app-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px 82px 66px 62px;
+  align-items: center; gap: 10px;
+  padding: 7px 8px; border-radius: 9px;
+}
+.app-row .num { text-align: right; }
+.app-row .actions { text-align: right; }
+
+.app-table-head {
+  padding-bottom: 8px; margin-bottom: 4px;
+  /* The list below scrolls, and its scrollbar eats 8px off the row width. The
+     header pays the same 8px whether the bar is there or not (the list reserves
+     its gutter), so the columns cannot shift as rows are filtered in and out. */
+  padding-right: 16px;
+  border-bottom: 1px solid var(--panel-border);
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--text-muted);
+  border-radius: 0;
+}
+
+.app-table {
+  display: flex; flex-direction: column; gap: 1px;
+  max-height: 460px; overflow-y: auto; scrollbar-gutter: stable;
+}
+.app-table .app-row { cursor: default; }
+.app-table .app-row:hover { background: rgba(255,255,255,0.035); }
+.app-table .app-row.selected { background: var(--accent-dim); }
+.app-table .app-row.is-disabled .app-name { color: var(--text-muted); }
+
+/* Real launcher icons cannot be had over adb — `pm` returns ids and dumpsys
+   prints a numeric labelRes, so an icon would mean unpacking resources.arsc off
+   the device. A monogram tile keyed to the package id is honest and still gives
+   the row something to aim the eye at. */
+.app-avatar {
+  flex-shrink: 0; width: 30px; height: 30px; border-radius: 9px;
+  display: grid; place-items: center;
+  font-size: 11.5px; font-weight: 800; letter-spacing: 0.02em;
+  color: #0a0e14;
+}
+.app-avatar.lg { width: 42px; height: 42px; border-radius: 12px; font-size: 16px; }
+
+.app-ident { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.app-names { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.app-name-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.app-name {
+  font-size: 12.5px; font-weight: 600; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.app-pkg {
+  font-family: var(--font-mono); font-size: 10px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* A guessed name has to look guessed, or the catalogue's authority leaks onto
+   names that were pulled out of the package id. */
+.guess-mark { flex-shrink: 0; font-size: 9px; color: var(--text-muted); opacity: .75; cursor: help; }
+
+.bloat-tag {
+  flex-shrink: 0; padding: 1px 6px; border-radius: 5px;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+  background: var(--danger-dim); color: var(--danger);
+}
+
+.type-cell { font-size: 10.5px; color: var(--text-muted); text-transform: capitalize; }
+.type-cell.type-user { color: var(--signal); }
+.type-cell.type-carrier { color: var(--accent); }
+/* Stated rather than left to the default, so "system" reads as a deliberate
+   quiet grey next to the two colours above it. */
+.type-cell.type-system { color: var(--text-muted); }
+
+.status-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  background: rgba(255,255,255,0.06); color: var(--text-muted);
+}
+.status-pill.st-active { background: var(--signal-dim); color: var(--signal); }
+.status-pill.st-idle { background: rgba(255,255,255,0.07); color: var(--text-muted); }
+.status-pill.st-disabled { background: var(--danger-dim); color: var(--danger); }
+
+.size-cell { font-family: var(--font-mono); font-size: 11px; color: var(--text-primary); }
+.size-cell.unknown { color: var(--text-muted); }
+
+.app-row .row-actions { justify-content: flex-end; }
+.row-icon-btn {
+  width: 24px; height: 24px; border-radius: 7px; padding: 0;
+  display: grid; place-items: center;
+  border: 1px solid transparent; background: rgba(255,255,255,0.05); color: var(--text-muted);
+}
+.row-icon-btn svg { width: 13px; height: 13px; }
+.row-icon-btn:hover { background: var(--panel-strong); color: var(--text-primary); }
+.row-icon-btn.warn:hover { border-color: rgba(245,165,36,0.45); color: var(--accent); }
+.row-icon-btn.good:hover { border-color: rgba(45,212,191,0.45); color: var(--signal); }
+.row-icon-btn.danger:hover { border-color: rgba(244,91,105,0.45); color: var(--danger); }
+
+/* diagnostics panel */
+
+.apps-panel .inspector { display: flex; flex-direction: column; min-width: 0; }
+/* The action buttons sit at the bottom of the panel however long the permission
+   list turns out to be, which needs the body to be a column that fills. .hidden
+   uses !important, so toggling the panel still wins over this. */
+.apps-panel #app-inspector-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+
+.ai-head { display: flex; align-items: center; gap: 12px; margin: 12px 0 8px; min-width: 0; }
+.ai-head-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ai-label { font-size: 15px; font-weight: 700; color: var(--text-primary); line-height: 1.15; }
+.ai-head-text .mono { overflow-wrap: anywhere; }
+
+.ai-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 12px; }
+.ai-tags .chip { font-size: 10px; padding: 3px 8px; }
+.ai-tags .chip.good { background: var(--signal-dim); border-color: rgba(45,212,191,0.3); color: var(--signal); }
+.ai-tags .chip.warn { background: var(--accent-dim); border-color: rgba(245,165,36,0.3); color: var(--accent); }
+.ai-tags .chip.bad { background: var(--danger-dim); border-color: rgba(244,91,105,0.3); color: var(--danger); }
+
+/* Three rows, and two of them are usually unknown: /data/data is 0700 root:root
+   with SELinux over the top, so the note explaining *why* matters more than the
+   number would. A dash is honest; a 0 B would not be. */
+.footprint { display: flex; flex-direction: column; gap: 2px; margin: 6px 0 14px; }
+.fp-row {
+  display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 10px;
+  padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.fp-row:last-child { border-bottom: 0; }
+.fp-row.fp-total { border-top: 1px solid var(--panel-border); border-bottom: 0; margin-top: 4px; padding-top: 8px; }
+.fp-label { font-size: 11.5px; color: var(--text-primary); }
+.fp-row.fp-total .fp-label { font-weight: 700; }
+.fp-note { display: block; font-size: 10px; color: var(--text-muted); margin-top: 2px; line-height: 1.35; }
+.fp-value { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-primary); text-align: right; }
+.fp-value.unknown { color: var(--text-muted); }
+
+/* permissions, grouped and colour-keyed by what they actually reach */
+
+.permission-groups { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 14px; }
+
+.perm-group { display: flex; flex-direction: column; gap: 4px; }
+.perm-group-head { display: flex; align-items: center; gap: 7px; }
+.perm-dot { width: 8px; height: 8px; border-radius: 3px; flex-shrink: 0; }
+.perm-group-name {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--text-primary);
+}
+.perm-group-count { font-size: 9.5px; color: var(--text-muted); margin-left: auto; font-family: var(--font-mono); }
+
+.perm-items { display: flex; flex-direction: column; gap: 2px; padding-left: 15px; }
+.perm-item { display: flex; align-items: center; gap: 7px; font-size: 11.5px; }
+.perm-item .pi-mark { flex-shrink: 0; width: 12px; text-align: center; font-weight: 700; font-size: 11px; }
+.perm-item .pi-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perm-item.granted .pi-mark { color: var(--signal); }
+.perm-item.granted .pi-name { color: var(--text-primary); }
+.perm-item.denied .pi-mark { color: var(--danger); }
+.perm-item.denied .pi-name { color: var(--text-muted); text-decoration: line-through; text-decoration-color: rgba(244,91,105,0.5); }
+/* Declared but never decided on. Showing this as denied would be a lie — the
+   app simply has not asked yet. */
+.perm-item.undecided .pi-mark { color: var(--text-muted); }
+.perm-item.undecided .pi-name { color: var(--text-muted); }
+.perm-item.unknown-perm .pi-name { font-style: italic; }
+
+.perm-empty { font-size: 11.5px; color: var(--text-muted); margin: 6px 0 14px; }
+
+/* actions: each one gets its own colour because the consequences differ wildly */
+
+.ai-actions { display: flex; flex-direction: column; gap: 7px; margin-top: auto; padding-top: 4px; }
+.act-btn {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 9px 12px; border-radius: var(--radius-md);
+  border: 1px solid var(--panel-border); background: var(--panel-strong);
+  color: var(--text-primary); font-size: 12px; font-weight: 600; text-align: left;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.act-btn svg { width: 15px; height: 15px; flex-shrink: 0; }
+.act-btn:disabled { opacity: .4; cursor: not-allowed; }
+.act-btn.act-neutral svg { color: var(--text-muted); }
+.act-btn.act-neutral:hover:not(:disabled) { border-color: rgba(255,255,255,0.22); }
+.act-btn.act-neutral:hover:not(:disabled) svg { color: var(--text-primary); }
+.act-btn.act-warn { border-color: rgba(245,165,36,0.28); background: var(--accent-dim); color: var(--accent); }
+.act-btn.act-warn:hover:not(:disabled) { background: rgba(245,165,36,0.22); border-color: var(--accent); }
+.act-btn.act-good { border-color: rgba(45,212,191,0.28); background: var(--signal-dim); color: var(--signal); }
+.act-btn.act-good:hover:not(:disabled) { background: rgba(45,212,191,0.22); border-color: var(--signal); }
+.act-btn.act-danger { border-color: rgba(244,91,105,0.28); background: var(--danger-dim); color: var(--danger); }
+.act-btn.act-danger:hover:not(:disabled) { background: rgba(244,91,105,0.22); border-color: var(--danger); }
+
+#ai-note { margin-top: 8px; line-height: 1.45; }
+
+/* The table and the inspector are both tall; below this width the two-column
+   split leaves neither enough room to be readable. */
+@media (max-width: 1080px) {
+  .apps-panel { grid-template-columns: 1fr; }
+  .app-row { grid-template-columns: minmax(0, 1fr) 60px 74px 60px 56px; }
 }
