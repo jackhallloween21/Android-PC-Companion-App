@@ -1,11 +1,9 @@
 name: Build Windows EXE
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch: # Manual trigger for testing
+  release:
+    types: [published] # Triggers automatically when a release is created/published
 
 jobs:
   build:
@@ -24,7 +22,14 @@ jobs:
         env:
           CI: false
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Unzipped EXE (Artifact Test)
+        uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: dist/*.exe
+          path: dist/*.exe # Uploads raw .exe file directly
+
+      - name: Attach EXE to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe # Attaches raw unzipped .exe to release assets
