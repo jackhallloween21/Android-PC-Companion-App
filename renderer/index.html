@@ -182,6 +182,13 @@
 
       <section id="view-files" class="view hidden">
         <div class="view-header"><h2>File Explorer</h2></div>
+        <div id="file-storage-overview" class="file-storage-overview">
+          <div class="file-storage-head">
+            <span class="file-storage-title">Storage spaces</span>
+            <span id="file-storage-note" class="muted tiny"></span>
+          </div>
+          <div id="file-storage-list" class="file-storage-list"></div>
+        </div>
         <div class="chip-tabs" id="file-category-tabs">
           <button class="chip-tab active" data-path="/sdcard/">All files</button>
           <button class="chip-tab" data-path="/sdcard/Pictures">Photos</button>
@@ -191,21 +198,37 @@
         </div>
         <div class="split-panel">
           <div class="glass-card">
+            <div class="breadcrumb-bar">
+              <button id="breadcrumb-back" class="breadcrumb-back" title="Go up one level">&#9664;</button>
+              <div class="breadcrumb-path mono" id="breadcrumb-path"></div>
+            </div>
             <div class="path-bar">
               <input id="remote-path" class="mono" value="/sdcard/" spellcheck="false" />
               <button id="list-files-btn">Go</button>
               <button id="push-file-btn" class="ghost-btn">Upload here</button>
             </div>
+            <div class="file-toolbar">
+              <label class="checkbox-row small"><input type="checkbox" id="file-select-all" /> Select all</label>
+              <span id="file-sel-count" class="muted tiny"></span>
+              <button id="file-download-btn" class="primary-btn tiny" disabled>Download selected</button>
+              <button id="file-upload-btn" class="ghost-btn tiny" disabled>Upload to here</button>
+              <div id="file-transfer-progress" class="transfer-progress hidden">
+                <div class="transfer-bar"><div id="file-transfer-fill" class="transfer-fill"></div></div>
+                <span id="file-transfer-label" class="muted tiny"></span>
+              </div>
+            </div>
             <div id="file-list" class="mono file-list"></div>
           </div>
           <div class="glass-card inspector">
             <h3>File inspector</h3>
-            <div id="file-inspector-empty" class="muted">Select a file to see its details.</div>
+            <div id="file-inspector-empty" class="muted">Select a file or folder to see its details.</div>
             <div id="file-inspector-body" class="hidden">
-              <img id="file-preview-img" class="file-preview hidden" />
+              <div id="file-preview-container"></div>
               <div class="data-cell"><span class="k">Name</span><span class="v mono" id="fi-name"></span></div>
               <div class="data-cell"><span class="k">Path</span><span class="v mono" id="fi-path"></span></div>
-              <button id="fi-pull-btn" class="primary-btn">Copy to PC (Pull)</button>
+              <div class="data-cell"><span class="k">Type</span><span class="v" id="fi-type"></span></div>
+              <div class="data-cell"><span class="k">Size</span><span class="v mono" id="fi-size"></span></div>
+              <button id="fi-pull-btn" class="primary-btn">Download to PC</button>
               <button id="fi-delete-btn" class="danger-btn">Delete from device</button>
             </div>
           </div>

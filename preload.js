@@ -56,8 +56,12 @@ contextBridge.exposeInMainWorld('api', {
   listFiles: (serial, remotePath) => ipcRenderer.invoke('files:list', { serial, remotePath }),
   previewFile: (serial, remotePath) => ipcRenderer.invoke('files:preview', { serial, remotePath }),
   pullFile: (serial, remotePath) => ipcRenderer.invoke('files:pull', { serial, remotePath }),
+  pullBatch: (serial, files, destDir) => ipcRenderer.invoke('files:pullBatch', { serial, files, destDir }),
   pushFile: (serial, remoteDir) => ipcRenderer.invoke('files:push', { serial, remoteDir }),
+  pushBatch: (serial, remoteDir) => ipcRenderer.invoke('files:pushBatch', { serial, remoteDir }),
   deleteFile: (serial, remotePath) => ipcRenderer.invoke('files:delete', { serial, remotePath }),
+  onPullProgress: (cb) => ipcRenderer.on('files:pullProgress', (_e, data) => cb(data)),
+  onPushProgress: (cb) => ipcRenderer.on('files:pushProgress', (_e, data) => cb(data)),
 
   // apps
   listAppsDetailed: (serial) => ipcRenderer.invoke('apps:listDetailed', serial),
@@ -98,7 +102,7 @@ contextBridge.exposeInMainWorld('api', {
   stopAudio: () => ipcRenderer.invoke('audio:stop'),
   audioStatus: () => ipcRenderer.invoke('audio:status'),
   mediaKey: (serial, action) => ipcRenderer.invoke('media:key', { serial, action }),
-  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', { serial }),
+  nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', serial),
 
   // camera
   listCameras: (serial) => ipcRenderer.invoke('camera:list', serial),

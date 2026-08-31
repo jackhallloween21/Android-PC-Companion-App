@@ -1283,30 +1283,193 @@ ipcMain.handle('wireless:qrPairCancel', async () => {
 // ---------------------------------------------------------------------------
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const TEXT_EXT = /\.(txt|md|json|xml|csv|log|ini|cfg|conf|yaml|yml|toml|sh|bat|ps1|py|js|ts|html|css|java|kt|c|cpp|h|rs)$/i;
+const VIDEO_EXT = /\.(mp4|mkv|avi|mov|webm|3gp|m4v)$/i;
+const PDF_EXT = /\.pdf$/i;
 
 ipcMain.handle('files:list', async (_e, { serial, remotePath }) => {
-  const out = await adb(['-s', serial, 'shell', 'ls', '-la', remotePath]);
+  const out = await adb(['-s', serial, 'shell', 'ls -la ' + JSON.stringify(remotePath)]);
   return out.split('\n').filter(Boolean);
 });
 
+function streamMax(bin, args, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(bin, args);
+    const chunks = [];
+    let total = 0;
+    let truncated = false;
+    proc.stdout.on('data', (chunk) => {
+      total += chunk.length;
+      if (total <= maxBytes) {
+        chunks.push(chunk);
+      } else if (!truncated) {
+        truncated = true;
+        const remaining = maxBytes - (total - chunk.length);
+        if (remaining > 0) chunks.push(chunk.slice(0, remaining));
+        proc.kill();
+      }
+    });
+    proc.on('close', (code) => {
+      if (code !== 0 && truncated) return resolve(Buffer.concat(chunks));
+      if (code !== 0) return reject(new Error('adb exited ' + code));
+      resolve(Buffer.concat(chunks));
+    });
+    proc.on('error', reject);
+  });
+}
+
+const PREVIEW_MAX = 20 * 1024 * 1024;
+
 ipcMain.handle('files:preview', async (_e, { serial, remotePath }) => {
-  if (!IMAGE_EXT.test(remotePath)) return null;
-  const buf = await adbBuffer(['-s', serial, 'exec-out', 'cat', remotePath]);
-  return `data:image/*;base64,${buf.toString('base64')}`;
+  if (IMAGE_EXT.test(remotePath)) {
+    const buf = await streamMax(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath], PREVIEW_MAX);
+    return { kind: 'image', data: `data:image/*;base64,${buf.toString('base64')}` };
+  }
+  if (TEXT_EXT.test(remotePath)) {
+    const out = await adb(['-s', serial, 'shell', 'head', '-c', '50000', remotePath]);
+    return { kind: 'text', data: out };
+  }
+  if (VIDEO_EXT.test(remotePath)) {
+    const buf = await streamMax(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath], PREVIEW_MAX);
+    if (buf.length < PREVIEW_MAX) {
+      return { kind: 'video', data: `data:video/*;base64,${buf.toString('base64')}` };
+    }
+    return null;
+  }
+  if (PDF_EXT.test(remotePath)) {
+    const buf = await streamMax(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath], PREVIEW_MAX);
+    return { kind: 'pdf', data: `data:application/pdf;base64,${buf.toString('base64')}` };
+  }
+  return null;
 });
 
-ipcMain.handle('files:pull', async (_e, { serial, remotePath }) => {
+ipcMain.handle('files:pull', async (e, { serial, remotePath }) => {
   const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: path.basename(remotePath) });
   if (canceled || !filePath) return null;
-  await adb(['-s', serial, 'pull', remotePath, filePath]);
-  return filePath;
+  e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 0 });
+  try {
+    let totalBytes = 0;
+    try {
+      const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remotePath]);
+      totalBytes = parseInt(sizeOut.trim(), 10) || 0;
+    } catch { /* ignore — we'll show indeterminate */ }
+    const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath]);
+    let bytesRead = 0;
+    const ws = fs.createWriteStream(filePath);
+    await new Promise((resolve, reject) => {
+      proc.stdout.on('data', (chunk) => {
+        bytesRead += chunk.length;
+        ws.write(chunk);
+        if (totalBytes > 0) {
+          const pct = Math.min(99, Math.round((bytesRead / totalBytes) * 100));
+          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: pct, bytes: bytesRead, totalBytes });
+        } else {
+          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: -1, bytes: bytesRead, totalBytes: 0 });
+        }
+      });
+      proc.on('close', (code) => {
+        ws.end(() => {
+          if (code === 0) resolve();
+          else reject(new Error('adb exited with code ' + code));
+        });
+      });
+      proc.on('error', (err) => { ws.end(); reject(err); });
+    });
+    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+    return filePath;
+  } catch (err) {
+    try { await adb(['-s', serial, 'pull', remotePath, filePath]); } catch (fallbackErr) { throw fallbackErr; }
+    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100 });
+    return filePath;
+  }
 });
 
-ipcMain.handle('files:push', async (_e, { serial, remoteDir }) => {
+ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
+  if (!destDir) {
+    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
+    if (result.canceled || !result.filePaths.length) return null;
+    destDir = result.filePaths[0];
+  }
+  const results = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 0 });
+    const localPath = path.join(destDir, f.name);
+    try {
+      let totalBytes = 0;
+      try {
+        const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', f.path]);
+        totalBytes = parseInt(sizeOut.trim(), 10) || 0;
+      } catch { /* ignore */ }
+      const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', f.path]);
+      let bytesRead = 0;
+      const ws = fs.createWriteStream(localPath);
+      await new Promise((resolve, reject) => {
+        proc.stdout.on('data', (chunk) => {
+          bytesRead += chunk.length;
+          ws.write(chunk);
+          const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
+          e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
+        });
+        proc.on('close', (code) => { ws.end(() => code === 0 ? resolve() : reject(new Error('exit ' + code))); });
+        proc.on('error', (err) => { ws.end(); reject(err); });
+      });
+      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+      results.push({ name: f.name, ok: true, path: localPath });
+    } catch (err) {
+      try {
+        await adb(['-s', serial, 'pull', f.path, localPath]);
+        results.push({ name: f.name, ok: true, path: localPath });
+      } catch (pullErr) {
+        results.push({ name: f.name, ok: false, error: pullErr.message });
+      }
+      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100 });
+    }
+  }
+  return { destDir, results };
+});
+
+ipcMain.handle('files:push', async (e, { serial, remoteDir }) => {
   const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
   if (canceled || !filePaths.length) return null;
-  await adb(['-s', serial, 'push', filePaths[0], remoteDir]);
-  return filePaths[0];
+  const localPath = filePaths[0];
+  const name = path.basename(localPath);
+  const remotePath = remoteDir.replace(/\/?$/, '/') + name;
+  const totalBytes = fs.statSync(localPath).size;
+  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: 0, bytes: 0, totalBytes });
+  try {
+    const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    await adb(['-s', serial, 'push', localPath, tmpPath]);
+    await adb(['-s', serial, 'shell', 'mv', tmpPath, remotePath]);
+  } catch {
+    await adb(['-s', serial, 'push', localPath, remoteDir]);
+  }
+  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: 100, bytes: totalBytes, totalBytes });
+  return localPath;
+});
+
+ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
+  const { canceled, filePaths } = await dialog.showOpenDialog({
+    properties: ['openFile', 'multiSelections'],
+    title: 'Select files to upload',
+  });
+  if (canceled || !filePaths.length) return null;
+  const results = [];
+  for (let i = 0; i < filePaths.length; i++) {
+    const lp = filePaths[i];
+    const name = path.basename(lp);
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 0, bytes: 0, totalBytes: 0 });
+    let totalBytes = 0;
+    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+    try {
+      await adb(['-s', serial, 'push', lp, remoteDir]);
+      results.push({ name, ok: true });
+    } catch (err) {
+      results.push({ name, ok: false, error: err.message });
+    }
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+  }
+  return results;
 });
 
 ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm', '-rf', remotePath]));

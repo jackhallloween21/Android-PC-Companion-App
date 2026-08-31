@@ -644,6 +644,76 @@ button:disabled { opacity: 0.4; cursor: not-allowed; filter: none !important; }
 .list-row.selected { background: var(--accent-dim); }
 .list-row .name { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .list-row .meta { color: var(--text-muted); font-size: 10.5px; flex-shrink: 0; }
+.list-row .name { display: flex; align-items: center; gap: 8px; }
+.file-icon { flex-shrink: 0; font-size: 14px; }
+
+/* file storage overview */
+.file-storage-overview {
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md); padding: 12px 14px; margin-bottom: 10px;
+}
+.file-storage-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.file-storage-title { font-size: 13px; font-weight: 700; }
+.file-storage-list { display: flex; flex-direction: column; gap: 6px; }
+.file-storage-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border: 1px solid var(--panel-border);
+  border-radius: 8px; background: rgba(255,255,255,0.02);
+}
+.file-storage-item .fs-label { font-size: 12px; font-weight: 600; }
+.file-storage-item .fs-details { font-size: 11px; color: var(--text-muted); }
+.file-storage-item .fs-track {
+  height: 4px; border-radius: 3px; background: var(--track); margin-top: 4px; overflow: hidden;
+}
+.file-storage-item .fs-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+
+/* breadcrumb bar */
+.breadcrumb-bar {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
+  padding: 4px 8px; font-size: 11px; overflow-x: auto; white-space: nowrap;
+}
+.breadcrumb-back {
+  flex-shrink: 0; border: 1px solid var(--panel-border); background: var(--panel-strong);
+  color: var(--text-muted); border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer;
+}
+.breadcrumb-back:hover { color: var(--accent); border-color: var(--accent); }
+.breadcrumb-back:disabled { opacity: 0.3; pointer-events: none; }
+.breadcrumb-path { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+.breadcrumb-path span { cursor: pointer; }
+.breadcrumb-path span:hover { color: var(--accent); }
+
+/* file toolbar (select-all, batch buttons, transfer progress) */
+.file-toolbar {
+  display: flex; align-items: center; gap: 10px; padding: 6px 0; margin-bottom: 2px;
+}
+.file-toolbar .checkbox-row { margin: 0; padding: 0; font-size: 11px; }
+.file-toolbar .checkbox-row input { accent-color: var(--accent); }
+.file-toolbar button { padding: 4px 10px; font-size: 11px; margin-top: 0; }
+.file-toolbar button:disabled { opacity: 0.4; pointer-events: none; }
+
+.transfer-progress { display: flex; align-items: center; gap: 8px; flex: 1; }
+.transfer-bar { flex: 1; height: 4px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.transfer-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.2s ease; width: 0%; }
+
+/* file list checkboxes */
+.file-list .list-row { position: relative; }
+.file-list .list-row .file-cb { accent-color: var(--accent); flex-shrink: 0; margin-right: 6px; }
+
+/* file preview containers */
+.preview-image { width: 100%; border-radius: var(--radius-md); margin-bottom: 12px; border: 1px solid var(--panel-border); }
+.preview-video { width: 100%; border-radius: var(--radius-md); margin-bottom: 12px; border: 1px solid var(--panel-border); background: #000; }
+.preview-text {
+  max-height: 300px; overflow: auto; padding: 10px; margin-bottom: 12px;
+  background: rgba(0,0,0,0.3); border: 1px solid var(--panel-border); border-radius: var(--radius-md);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.5; color: var(--text-primary); white-space: pre-wrap; word-break: break-all;
+}
+.preview-pdf {
+  width: 100%; height: 400px; border: 1px solid var(--panel-border); border-radius: var(--radius-md); margin-bottom: 12px;
+}
+
+/* storage items clickable */
+.file-storage-item { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.file-storage-item:hover { border-color: var(--accent); background: rgba(245,165,36,0.06); }
 
 .row-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .row-actions button {
@@ -946,7 +1016,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .size-cell { font-family: var(--font-mono); font-size: 11px; color: var(--text-primary); }
 .size-cell.unknown { color: var(--text-muted); }
 
-.app-row .row-actions { justify-content: flex-end; }
+.app-row .row-actions { justify-content: center; }
 .row-icon-btn {
   width: 24px; height: 24px; border-radius: 7px; padding: 0;
   display: grid; place-items: center;

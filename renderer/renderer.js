@@ -114,7 +114,7 @@ function refreshView(view) {
   if (view !== 'dashboard') stopDashboardPolling();
   if (!state.selected) return;
   if (view === 'dashboard') { loadDashboard(); loadStorage(); startDashboardPolling(); }
-  if (view === 'files') loadFiles();
+  if (view === 'files') { loadFiles(); loadFileStorage(); }
   if (view === 'apps') loadApps();
   if (view === 'hardware') { loadHardware(); startHardwarePolling(); }
   if (view === 'multimedia') { refreshAudioStatus(); refreshBridge(); }
@@ -650,11 +650,11 @@ async function loadHardware() {
   // Full capacity: a measured charge_full when the gauge publishes one, else the
   // value implied by charge_counter at the current level — labelled "≈" so an
   // estimate is never mistaken for a reading.
-  setText('hw-capacity', power.chargeFullMah
-    ? `${power.chargeFullMah} / ${power.chargeDesignMah || '?'} mAh`
-    : power.estimatedFullMah
-      ? `≈ ${power.estimatedFullMah} / ${power.chargeDesignMah || '?'} mAh`
-      : (power.chargeDesignMah ? `${power.chargeDesignMah} mAh design` : '—'));
+  const currentMah = power.chargeNowMah ?? power.estimatedNowMah;
+  const totalMah = power.chargeFullMah ?? power.estimatedFullMah ?? power.chargeDesignMah;
+  setText('hw-capacity', totalMah
+    ? `${currentMah ?? '—'} / ${totalMah} mAh`
+    : '—');
   el('hw-capacity').title = notes.chargeFullMah || '';
 
   setText('hw-cycles', power.cycleCount ?? 'Not counted');
@@ -770,6 +770,47 @@ function stopHardwarePolling() {
 
 // ----------------------------------------------------------------------- files
 
+function formatSize(bytes) {
+  if (bytes === null || bytes === undefined) return '';
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024, u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return v.toFixed(v < 10 ? 1 : 0) + ' ' + units[u];
+}
+
+const EXT_ICON = {
+  jpg: '\uD83D\uDF9C', jpeg: '\uD83D\uDF9C', png: '\uD83D\uDF9C', gif: '\uD83D\uDF9C', webp: '\uD83D\uDF9C',
+  mp4: '\uD83C\uDFAC', mkv: '\uD83C\uDFAC', avi: '\uD83C\uDFAC', mov: '\uD83C\uDFAC',
+  mp3: '\uD83C\uDFB5', flac: '\uD83C\uDFB5', aac: '\uD83C\uDFB5', wav: '\uD83C\uDFB5',
+  pdf: '\uD83D\uDCC4', doc: '\uD83D\uDCC4', docx: '\uD83D\uDCC4', txt: '\uD83D\uDCDD', md: '\uD83D\uDCDD',
+  zip: '\uD83D\uDCE6', rar: '\uD83D\uDCE6', '7z': '\uD83D\uDCE6', tar: '\uD83D\uDCE6',
+  apk: '\uD83E\uDD16', json: '\uD83D\uDCCB', xml: '\uD83D\uDCCB', js: '\uD83D\uDCCB',
+};
+function fileIcon(name, isDir, isLink) {
+  if (isLink) return '\uD83D\uDD17';
+  if (isDir) return '\uD83D\uDCC1';
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return EXT_ICON[ext] || '\uD83D\uDCC4';
+}
+
+// Multi-select state
+state.selectedFiles = new Set();
+
+function updateFileToolbar() {
+  const count = state.selectedFiles.size;
+  el('file-sel-count').textContent = count ? count + ' selected' : '';
+  const dlBtn = el('file-download-btn');
+  const upBtn = el('file-upload-btn');
+  if (dlBtn) dlBtn.disabled = count === 0;
+  if (upBtn) upBtn.disabled = count === 0;
+  // count actual files (not dirs) for download
+  const fileCount = count - [...state.selectedFiles].filter((p) => p._isDir).length;
+  if (dlBtn) dlBtn.disabled = fileCount === 0;
+}
+
 qAll('#file-category-tabs .chip-tab').forEach((tab) => {
   tab.onclick = () => {
     qAll('#file-category-tabs .chip-tab').forEach((t) => t.classList.remove('active'));
@@ -785,60 +826,317 @@ el('push-file-btn').onclick = async () => {
   loadFiles();
 };
 
+// Select-all checkbox
+const selectAllCb = el('file-select-all');
+if (selectAllCb) selectAllCb.onchange = () => {
+  const cbs = qAll('#file-list .file-cb');
+  cbs.forEach((cb) => { cb.checked = selectAllCb.checked; });
+  syncFileSelection();
+};
+
+function syncFileSelection() {
+  state.selectedFiles.clear();
+  qAll('#file-list .list-row').forEach((row) => {
+    const cb = row.querySelector('.file-cb');
+    if (cb && cb.checked) {
+      const fp = row.dataset.fullpath;
+      const isDir = row.dataset.isdir === '1';
+      const item = { path: fp, name: row.dataset.name, _isDir: isDir };
+      state.selectedFiles.add(item);
+    }
+  });
+  updateFileToolbar();
+}
+
 async function loadFiles() {
   const remotePath = el('remote-path').value;
   const container = el('file-list');
-  container.innerHTML = '<span class="muted">Listing…</span>';
+  container.innerHTML = '<span class="muted">Listing\u2026</span>';
+  state.selectedFiles.clear();
+  updateFileToolbar();
+  if (selectAllCb) selectAllCb.checked = false;
   try {
     const lines = await window.api.listFiles(state.selected, remotePath);
     container.innerHTML = '';
-    lines.forEach((line) => {
-      const cols = line.split(/\s+/);
-      const name = cols.slice(8).join(' ') || line;
-      if (!name || name === '.' || name === '..') return;
-      const size = cols[4] || '';
+    const parsed = lines.map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return null;
+      const parts = trimmed.split(/\s+/);
+      if (parts.length < 8) return { isDir: false, isLink: false, size: null, name: trimmed };
+      const perms = parts[0];
+      const isLink = perms.charAt(0) === 'l';
+      const isDir = perms.charAt(0) === 'd';
+      const size = Number.isFinite(Number(parts[4])) ? Number(parts[4]) : null;
+      const name = parts.slice(7).join(' ').replace(/\s*->\s*.*$/, '').trim();
+      return { isDir, isLink, size, name };
+    }).filter(Boolean);
+    parsed.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    parsed.forEach((item) => {
+      if (!item.name || item.name === '.' || item.name === '..') return;
       const row = document.createElement('div');
       row.className = 'list-row';
-      row.innerHTML = `<span class="name" title="${line}">${name}</span><span class="meta">${size}</span>`;
-      const fullPath = remotePath.replace(/\/?$/, '/') + name;
-      row.onclick = () => selectFile(name, fullPath);
+      const icon = fileIcon(item.name, item.isDir, item.isLink);
+      const sizeStr = formatSize(item.size);
+      const fullPath = remotePath.replace(/\/?$/, '/') + item.name;
+      row.dataset.fullpath = fullPath;
+      row.dataset.name = item.name;
+      row.dataset.isdir = item.isDir ? '1' : '0';
+      row.innerHTML = '<input type="checkbox" class="file-cb" /><span class="name"><span class="file-icon">' + icon + '</span><span class="fname">' + esc(item.name) + '</span></span><span class="meta">' + sizeStr + '</span>';
+      const cb = row.querySelector('.file-cb');
+      cb.onclick = (e) => { e.stopPropagation(); syncFileSelection(); };
+      row.onclick = (e) => {
+        if (e.target.tagName === 'INPUT') return;
+        if (item.isDir) {
+          el('remote-path').value = fullPath;
+          loadFiles();
+        } else {
+          selectFile(item.name, fullPath, item);
+        }
+      };
       container.appendChild(row);
     });
-    if (!container.children.length) container.innerHTML = '<span class="muted">Empty or inaccessible folder.</span>';
+    if (remotePath !== '/') {
+      const upRow = document.createElement('div');
+      upRow.className = 'list-row';
+      upRow.innerHTML = '<span class="name"><span class="file-icon">\uD83D\uDCC1</span><span class="fname">\u2026 (parent)</span></span>';
+      upRow.onclick = () => {
+        const parent = remotePath.replace(/\/?$/, '').replace(/[^/]+$/, '') || '/';
+        el('remote-path').value = parent;
+        loadFiles();
+      };
+      container.insertBefore(upRow, container.firstChild);
+    }
+    if (!container.querySelectorAll('.list-row').length) container.innerHTML = '<span class="muted">Empty or inaccessible folder.</span>';
+    updateBreadcrumb(remotePath);
   } catch (err) {
-    container.innerHTML = `<span class="muted">${err.message}</span>`;
+    container.innerHTML = '<span class="muted">' + esc(err.message) + '</span>';
   }
 }
 
-async function selectFile(name, fullPath) {
+async function selectFile(name, fullPath, itemInfo) {
   state.selectedFile = { name, fullPath };
   qAll('#file-list .list-row').forEach((r) => r.classList.remove('selected'));
   el('file-inspector-empty').classList.add('hidden');
   el('file-inspector-body').classList.remove('hidden');
   el('fi-name').textContent = name;
   el('fi-path').textContent = fullPath;
+  const fiType = el('fi-type');
+  if (fiType) fiType.textContent = itemInfo ? (itemInfo.isDir ? 'Folder' : 'File') : 'File';
+  const fiSize = el('fi-size');
+  if (fiSize) fiSize.textContent = itemInfo ? formatSize(itemInfo.size) : '';
 
-  const img = el('file-preview-img');
-  img.classList.add('hidden');
+  const container = el('file-preview-container');
+  container.innerHTML = '';
+  if (itemInfo && itemInfo.isDir) return;
+
   try {
-    const dataUrl = await window.api.previewFile(state.selected, fullPath);
-    if (dataUrl) {
-      img.src = dataUrl;
-      img.classList.remove('hidden');
+    const result = await window.api.previewFile(state.selected, fullPath);
+    if (!result) return;
+    if (result.kind === 'image') {
+      const img = document.createElement('img');
+      img.className = 'preview-image';
+      img.src = result.data;
+      container.appendChild(img);
+    } else if (result.kind === 'video') {
+      const vid = document.createElement('video');
+      vid.className = 'preview-video';
+      vid.controls = true;
+      vid.src = result.data;
+      container.appendChild(vid);
+    } else if (result.kind === 'text') {
+      const pre = document.createElement('pre');
+      pre.className = 'preview-text';
+      pre.textContent = result.data;
+      container.appendChild(pre);
+    } else if (result.kind === 'pdf') {
+      const iframe = document.createElement('iframe');
+      iframe.className = 'preview-pdf';
+      iframe.src = result.data;
+      container.appendChild(iframe);
     }
-  } catch { /* not an image or unreadable — skip preview */ }
+  } catch { /* not previewable */ }
 }
 
-el('fi-pull-btn').onclick = () => state.selectedFile && window.api.pullFile(state.selected, state.selectedFile.fullPath);
+// Single-file download
+el('fi-pull-btn').onclick = async () => {
+  if (!state.selectedFile) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPullProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      const dl = data.bytes ? formatSize(data.bytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '');
+    } else {
+      fill.style.background = '';
+      fill.style.width = data.percent + '%';
+      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%');
+    }
+  });
+  try {
+    const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath);
+    if (saved) { toast('Saved to ' + saved); label.textContent = 'Done \u2014 ' + saved; }
+    else { label.textContent = 'Cancelled.'; }
+  } catch (err) { label.textContent = 'Error: ' + err.message; }
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+};
+
+// Batch download
+el('file-download-btn').onclick = async () => {
+  const files = [...state.selectedFiles].filter((f) => !f._isDir);
+  if (!files.length) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPullProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      const dl = data.bytes ? formatSize(data.bytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    } else {
+      fill.style.background = '';
+      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
+      fill.style.width = overall + '%';
+      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    }
+  });
+  try {
+    const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop() })));
+    if (res) {
+      const ok = res.results.filter((r) => r.ok).length;
+      const fail = res.results.filter((r) => !r.ok).length;
+      label.textContent = 'Done: ' + ok + ' saved' + (fail ? ', ' + fail + ' failed' : '') + ' to ' + res.destDir;
+      toast('Downloaded ' + ok + ' file(s) to ' + res.destDir);
+    } else {
+      label.textContent = 'Download cancelled.';
+    }
+  } catch (err) {
+    label.textContent = 'Error: ' + err.message;
+  }
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+};
+
+// Batch upload
+el('file-upload-btn').onclick = async () => {
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPushProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      const ul = data.bytes ? formatSize(data.bytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    } else {
+      fill.style.background = '';
+      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
+      fill.style.width = overall + '%';
+      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    }
+  });
+  try {
+    const results = await window.api.pushBatch(state.selected, el('remote-path').value);
+    if (results) {
+      const ok = results.filter((r) => r.ok).length;
+      const fail = results.filter((r) => !r.ok).length;
+      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
+      toast('Uploaded ' + ok + ' file(s)');
+      loadFiles();
+    } else {
+      label.textContent = 'Upload cancelled.';
+    }
+  } catch (err) {
+    label.textContent = 'Error: ' + err.message;
+  }
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+};
+
+// Delete
 el('fi-delete-btn').onclick = async () => {
   if (!state.selectedFile) return;
-  if (confirm(`Delete ${state.selectedFile.fullPath} from the device?`)) {
+  if (confirm('Delete ' + state.selectedFile.fullPath + ' from the device?')) {
     await window.api.deleteFile(state.selected, state.selectedFile.fullPath);
     el('file-inspector-body').classList.add('hidden');
     el('file-inspector-empty').classList.remove('hidden');
     loadFiles();
   }
 };
+
+function updateBreadcrumb(path) {
+  const container = el('breadcrumb-path');
+  if (!container) return;
+  const backBtn = el('breadcrumb-back');
+  if (backBtn) {
+    backBtn.disabled = path === '/' || path === '';
+    backBtn.onclick = () => {
+      const parent = path.replace(/\/?$/, '').replace(/[^/]+$/, '') || '/';
+      el('remote-path').value = parent;
+      loadFiles();
+    };
+  }
+  const segments = path.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+  container.innerHTML = '/';
+  let accumulated = '';
+  segments.forEach((seg) => {
+    accumulated += '/' + seg;
+    const span = document.createElement('span');
+    span.textContent = seg;
+    span.style.cursor = 'pointer';
+    span.style.color = 'var(--text-muted)';
+    span.onclick = () => { el('remote-path').value = accumulated; loadFiles(); };
+    span.onmouseover = () => { span.style.color = 'var(--accent)'; };
+    span.onmouseout = () => { span.style.color = 'var(--text-muted)'; };
+    container.appendChild(span);
+    container.appendChild(document.createTextNode('/'));
+  });
+}
+
+async function loadFileStorage() {
+  const container = el('file-storage-list');
+  const note = el('file-storage-note');
+  if (!container || !state.selected) return;
+  try {
+    const report = await window.api.getStorage(state.selected);
+    const volumes = report.volumes || [];
+    container.innerHTML = '';
+    if (note) note.textContent = volumes.length
+      ? [report.diskstatsAvailable ? 'Category sizes from dumpsys diskstats' : 'Totals from df',
+         report.sdPresent ? 'SD card mounted' : report.sdDetected ? 'SD card detected (not mounted)' : 'No removable card'
+        ].join(' \u00b7 ')
+      : '';
+    if (!volumes.length) { container.innerHTML = '<span class="muted">Storage info unavailable.</span>'; return; }
+    volumes.forEach((vol) => {
+      const total = vol.totalBytes || 0;
+      const used = vol.usedBytes || 0;
+      const free = vol.freeBytes || 0;
+      const pct = total ? Math.round((used / total) * 100) : 0;
+      const item = document.createElement('div');
+      item.className = 'file-storage-item';
+      const mountPath = vol.key === 'internal' ? '/storage/emulated/0'
+        : (vol.key && vol.key.startsWith('sd:') ? vol.mount : null);
+      item.innerHTML = '<div style="flex:1;min-width:0;"><div class="fs-label">' + esc(vol.label) + '</div><div class="fs-details">' + bytesText(used) + ' used \u00b7 ' + bytesText(free) + ' free</div><div class="fs-track"><div class="fs-fill" style="width:' + pct + '%;background:' + (pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--accent)' : 'var(--signal)') + '"></div></div></div>';
+      if (mountPath) {
+        item.onclick = () => { el('remote-path').value = mountPath; loadFiles(); };
+      }
+      container.appendChild(item);
+    });
+  } catch (err) {
+    container.innerHTML = '<span class="muted">Could not read storage: ' + esc(err.message) + '</span>';
+    if (note) note.textContent = '';
+  }
+}
 
 // ------------------------------------------------------------------------ apps
 //
