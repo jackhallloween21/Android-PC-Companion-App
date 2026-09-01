@@ -35,14 +35,16 @@ const POWER_NODES = [
 // UI blames an unreadable sysfs, even where most of the nodes read perfectly.
 const POWER_SCRIPT = [
   'for d in /sys/class/power_supply/*; do',
+  's="${d##*/}";',
   'for n in ' + POWER_NODES.join(' ') + '; do',
-  'if [ -r "$d/$n" ]; then',
-  'v=$(cat "$d/$n" 2>/dev/null | head -n 1);',
-  '[ -n "$v" ] && echo "PS|${d##*/}|$n|$v";',
+  'if [ -f "$d/$n" ] && read -r v < "$d/$n" 2>/dev/null; then',
+  '[ -n "$v" ] && echo "PS|$s|$n|$v";',
   'fi; done; done;',
   'for z in /sys/class/thermal/thermal_zone*; do',
-  '[ -r "$z/temp" ] && echo "TZ|$(cat $z/type 2>/dev/null)|$(cat $z/temp 2>/dev/null)";',
-  'done;',
+  'if [ -f "$z/temp" ] && read -r t < "$z/temp" 2>/dev/null; then',
+  'read -r y < "$z/type" 2>/dev/null;',
+  'echo "TZ|$y|$t";',
+  'fi; done;',
   'exit 0',
 ].join(' ');
 

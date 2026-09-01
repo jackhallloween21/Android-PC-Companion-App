@@ -163,10 +163,12 @@ function supportsMic(help) {
   if (!help) return true;
   // scrcpy 2.x-3.x: --audio-source listed with mic option
   if (/--audio-source[^\n]*\bmic\b/i.test(help)) return true;
-  // scrcpy 4.x+: may list --audio-source=mic directly or in a different format
-  if (/\bmic\b/i.test((help.match(/--audio-source[\s\S]{0,400}/) || [''])[0])) return true;
-  // If --audio-source exists at all, assume mic is supported (scrcpy 4.x changed help format)
-  if (/--audio-source/i.test(help)) return true;
+  const match = (help.match(/--audio-source[\s\S]{0,400}/) || [''])[0];
+  if (/\b(?:possible values|values are)\b/i.test(match)) {
+    return /\bmic\b/i.test(match);
+  }
+  if (/\bmic\b/i.test(match)) return true;
+  if (/--audio-source/i.test(help) && !/--audio-source=\w+/i.test(match)) return true;
   return false;
 }
 

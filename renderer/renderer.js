@@ -246,14 +246,16 @@ function renderDeviceList() {
     const item = document.createElement('div');
     item.className = 'connect-device-item' + (isActive ? ' active' : '');
     const model = d.model ? d.model.replace(/_/g, ' ') : d.serial;
-    const detail = d.ip ? `${d.ip}` : (d.transport || d.serial);
+    const isWireless = d.transport === 'Wi-Fi' || d.ip || d.serial.startsWith('adb-') || d.serial.includes('._tcp') || /^\d{1,3}(?:\.\d{1,3}){3}/.test(d.serial);
+    const transport = isWireless ? 'Wi-Fi' : (d.transport || 'USB');
+    const detail = d.ip ? d.ip : (isWireless ? 'Wireless debugging' : 'USB debugging');
     item.innerHTML = `
       <div class="cdi-icon">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/></svg>
       </div>
       <div class="cdi-info">
         <div class="cdi-name">${model}</div>
-        <div class="cdi-detail">${detail} ${d.transport ? '· ' + d.transport : ''}</div>
+        <div class="cdi-detail">${detail} · ${transport}</div>
       </div>
       <div class="cdi-action${isActive ? ' active-badge' : ''}">
         ${isActive ? '✓ Active' : 'Switch →'}
@@ -324,17 +326,19 @@ function updateTitlebarStatus() {
 function updateSidebarDeviceCard() {
   const card = el('sidebar-device-card');
   const nameEl = el('sdc-name');
-  const connEl = el('sdc-conn');
+  const connEl = el('sdc-conn') || el('sdc-conn-type');
   const ipEl = el('sdc-ip');
   const device = state.devices.find((d) => d.serial === state.selected);
 
   if (device) {
     card.classList.add('connected');
     nameEl.textContent = device.model ? device.model.replace(/_/g, ' ') : device.serial;
-    const transport = device.transport || 'USB';
-    connEl.innerHTML = `<span class="conn-dot"></span> ${transport} Mode`;
-    if (device.ip) {
-      ipEl.textContent = `IP: ${device.ip}`;
+    const isWireless = device.transport === 'Wi-Fi' || device.ip || device.serial.startsWith('adb-') || device.serial.includes('._tcp') || /^\d{1,3}(?:\.\d{1,3}){3}/.test(device.serial);
+    const transport = isWireless ? 'Wi-Fi' : (device.transport || 'USB');
+    if (connEl) connEl.innerHTML = `<span class="conn-dot"></span> ${transport} Mode`;
+    const cachedIp = device.ip || (specsCache.get(device.serial)?.info?.ip) || null;
+    if (cachedIp) {
+      ipEl.textContent = `IP: ${cachedIp}`;
       ipEl.classList.remove('hidden');
     } else {
       ipEl.classList.add('hidden');
@@ -342,7 +346,7 @@ function updateSidebarDeviceCard() {
   } else {
     card.classList.remove('connected');
     nameEl.textContent = 'No device connected';
-    connEl.innerHTML = '<span class="conn-dot"></span> —';
+    if (connEl) connEl.innerHTML = '<span class="conn-dot"></span> —';
     ipEl.classList.add('hidden');
   }
 }
@@ -451,7 +455,8 @@ async function loadDashboard() {
   const perf = telemetry.error ? {} : (telemetry.perf || {});
 
   // --- identity -------------------------------------------------------------
-  const wireless = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+  const dev = state.devices.find((d) => d.serial === serial);
+  const wireless = /^\d{1,3}(?:\.\d{1,3}){3}/.test(serial) || serial.startsWith('adb-') || serial.includes('._tcp') || (dev && dev.transport === 'Wi-Fi');
   setText('dash-model', (info['ro.product.model'] || serial).replace(/_/g, ' '));
   const codename = el('dash-codename');
   codename.textContent = info['ro.product.manufacturer'] || '';
@@ -462,11 +467,15 @@ async function loadDashboard() {
     : 'Android ?');
   setText('dash-serial', `SN: ${info['ro.boot.serialno'] || serial}`);
   setText('dash-ip', info.ip || '');
+  if (info.ip && dev && !dev.ip) {
+    dev.ip = info.ip;
+    updateSidebarDeviceCard();
+  }
   setText('dash-secpatch', info['ro.build.version.security_patch'] || 'Not reported');
   setText('dash-selinux', info.selinux || 'Unknown');
   setText('dash-bootloader', info.bootloaderLocked === '1' ? 'Locked'
     : info.bootloaderLocked === '0' ? 'Unlocked' : 'Unknown');
-  setText('dash-transport-detail', wireless ? `TCP/IP · ${serial}` : 'USB');
+  setText('dash-transport-detail', wireless ? `Wi-Fi · ${info.ip || (serial.includes(':') ? serial : 'mDNS')}` : 'USB');
 
   // --- battery --------------------------------------------------------------
   const level = power.level ?? 0;
@@ -748,12 +757,15 @@ async function loadHardware() {
   setText('hw-tech', power.technology || '—');
 
   // --- electrical & thermal telemetry ---------------------------------------
+  setText('hw-power-label', power.charging ? 'Charging Power' : 'Power Draw');
+  setText('hw-current-label', power.charging ? 'Charging Current' : 'Discharge Current');
+
   setText('hw-watts', fmt(power.watts, 2));
   setText('hw-voltage', fmt(power.voltage, 2));
   setText('hw-voltage-mv', power.voltageMv ? `${power.voltageMv} mV` : '');
   setText('hw-current', fmt(power.current, 2));
-  setText('hw-current-ma', power.currentMa
-    ? `${power.charging ? '+' : '−'}${power.currentMa} mA`
+  setText('hw-current-ma', power.currentMa !== null && power.currentMa !== undefined
+    ? `${power.charging ? '+' : '−'}${Math.abs(power.currentMa)} mA`
     // With no measured draw, show the negotiated ceiling instead — clearly
     // marked, because a ceiling is what the charger *allows*, not what flows.
     : power.maxChargeWatts ? `up to ${fmt(power.maxChargeWatts, 0)} W negotiated` : '');
@@ -779,8 +791,15 @@ async function loadHardware() {
   setText('hw-protocol-sub', inputBits.join(' · '));
 
   const rate = el('hw-rate');
-  rate.textContent = power.watts ? `${power.watts >= 15 ? 'Fast charge' : 'Charging'} (${fmt(power.watts, 1)} W)` : '';
-  rate.style.color = power.watts >= 15 ? 'var(--accent)' : 'var(--signal)';
+  if (power.charging && power.watts) {
+    rate.textContent = `${power.watts >= 15 ? 'Fast charge' : 'Charging'} (${fmt(power.watts, 1)} W)`;
+    rate.style.color = power.watts >= 15 ? 'var(--accent)' : 'var(--signal)';
+  } else if (!power.charging && power.watts) {
+    rate.textContent = `Discharging (${fmt(power.watts, 1)} W)`;
+    rate.style.color = 'var(--text-muted)';
+  } else {
+    rate.textContent = '';
+  }
 
   // Name the source that actually answered rather than assuming sysfs, and only
   // apologise for what is genuinely missing.

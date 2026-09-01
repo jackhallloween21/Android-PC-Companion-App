@@ -41,9 +41,9 @@ const PERF_SCRIPT = [
   'for d in /sys/devices/system/cpu/cpu*/cpufreq; do',
   'c=${d%/cpufreq}; c=${c##*/};',
   'for n in scaling_cur_freq cpuinfo_min_freq cpuinfo_max_freq; do',
-  '[ -r "$d/$n" ] && echo "FQ|$c|$n|$(cat "$d/$n" 2>/dev/null)";',
+  '[ -r "$d/$n" ] && read -r v < "$d/$n" 2>/dev/null && [ -n "$v" ] && echo "FQ|$c|$n|$v";',
   'done; done;',
-  '[ -r /sys/devices/system/cpu/online ] && echo "ON|$(cat /sys/devices/system/cpu/online 2>/dev/null)";',
+  '[ -r /sys/devices/system/cpu/online ] && read -r o < /sys/devices/system/cpu/online 2>/dev/null && echo "ON|$o";',
   // `exit 0` is load-bearing for the same reason it is in POWER_SCRIPT: a script
   // inherits the status of its last command, and the last command here is a
   // `[ -r … ] && echo …`. Without this, a device that does not expose the online

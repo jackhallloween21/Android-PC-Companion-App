@@ -434,8 +434,11 @@ ipcMain.handle('devices:list', async () => {
       const state = parts[1];
       const model = (parts.find((p) => p.startsWith('model:')) || '').split(':')[1] || null;
       const hasUsb = parts.some((p) => p.startsWith('usb:'));
-      const ip = serial.includes(':') ? serial.split(':')[0] : null;
-      const transport = ip ? 'Wi-Fi' : hasUsb ? 'USB' : 'USB';
+      const isMdns = serial.startsWith('adb-') || serial.includes('._tcp') || serial.includes('_adb');
+      const isIpPort = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+      const cachedIp = infoCache.get(serial)?.ip || null;
+      const ip = isIpPort ? serial.split(':')[0] : cachedIp;
+      const transport = (isIpPort || isMdns || ip) ? 'Wi-Fi' : (hasUsb ? 'USB' : 'USB');
       const product = (parts.find((p) => p.startsWith('product:')) || '').split(':')[1] || null;
       return { serial, state, model, transport, ip, product };
     });
@@ -446,6 +449,27 @@ ipcMain.handle('devices:list', async () => {
 // round trips on every dashboard refresh. The cache is dropped when a device
 // disconnects (see forgetDevice).
 const infoCache = new Map();
+const meminfoCache = new Map();
+
+function getMeminfoRaw(serial) {
+  const cached = meminfoCache.get(serial);
+  const now = Date.now();
+  if (!cached || (!cached.inFlight && now - cached.timestamp > 30000)) {
+    const entry = cached || { data: null, timestamp: 0, inFlight: false };
+    entry.inFlight = true;
+    meminfoCache.set(serial, entry);
+    adb(['-s', serial, 'shell', 'dumpsys', 'meminfo'])
+      .then((raw) => {
+        entry.data = raw;
+        entry.timestamp = Date.now();
+        entry.inFlight = false;
+      })
+      .catch(() => {
+        entry.inFlight = false;
+      });
+  }
+  return cached ? cached.data : null;
+}
 
 ipcMain.handle('device:info', async (_e, serial) => {
   const cached = infoCache.get(serial);
@@ -504,6 +528,7 @@ function forgetDevice(serial) {
   infoCache.delete(serial);
   socCache.delete(serial);
   healthSourceCache.delete(serial);
+  meminfoCache.delete(serial);
 }
 
 // ---------------------------------------------------------------------------
@@ -780,11 +805,9 @@ ipcMain.handle('device:soc', async (_e, serial) => {
 const settled = (p) => p.then((v) => v, () => null);
 
 ipcMain.handle('device:telemetry', async (_e, serial) => {
-  const [perfRaw, meminfoRaw, psRaw, sweep, dumpRaw, hal] = await Promise.all([
+  const meminfoRaw = getMeminfoRaw(serial);
+  const [perfRaw, psRaw, sweep, dumpRaw, hal] = await Promise.all([
     settled(adb(['-s', serial, 'shell', PERF_SCRIPT])),
-    // Only for the app-PSS vs kernel split; the totals come from /proc/meminfo,
-    // which is exact rather than pre-rounded.
-    settled(adb(['-s', serial, 'shell', 'dumpsys', 'meminfo'])),
     settled(adb(['-s', serial, 'shell', 'ps -A -o PID 2>/dev/null | wc -l'])),
     settled(adb(['-s', serial, 'shell', POWER_SCRIPT])),
     settled(adb(['-s', serial, 'shell', 'dumpsys', 'battery'])),

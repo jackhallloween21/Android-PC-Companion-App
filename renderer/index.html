@@ -50,7 +50,7 @@
         <div class="sdc-info">
           <div class="sdc-name" id="sdc-name">No device connected</div>
           <div class="sdc-meta">
-            <span id="sdc-conn-type" class="sdc-conn">—</span>
+            <span id="sdc-conn" class="sdc-conn">—</span>
             <span id="sdc-ip" class="sdc-ip hidden"></span>
           </div>
         </div>
@@ -660,7 +660,7 @@
             </div>
             <div class="telemetry-grid">
               <div class="metric">
-                <span class="metric-label">Charging Power</span>
+                <span class="metric-label" id="hw-power-label">Charging Power</span>
                 <span class="metric-value amber"><span id="hw-watts">—</span><em>W</em></span>
                 <span class="metric-sub mono">V × A direct flow</span>
               </div>
@@ -670,7 +670,7 @@
                 <span class="metric-sub mono" id="hw-voltage-mv"></span>
               </div>
               <div class="metric">
-                <span class="metric-label">Charging Current</span>
+                <span class="metric-label" id="hw-current-label">Charging Current</span>
                 <span class="metric-value green"><span id="hw-current">—</span><em>A</em></span>
                 <span class="metric-sub mono" id="hw-current-ma"></span>
               </div>
