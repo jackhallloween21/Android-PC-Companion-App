@@ -386,7 +386,7 @@ select:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
 .ring-bolt { font-size: 12px; color: var(--accent-text); line-height: 1; }
 .ring-bolt.hidden { display: none; }
 .ring-level { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; }
-.ring-eta { font-size: 10.5px; color: var(--text-muted); }
+.ring-eta { font-size: 11px; color: var(--text-muted); white-space: nowrap; letter-spacing: 0; }
 
 .station-facts {
   display: grid;

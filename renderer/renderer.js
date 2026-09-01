@@ -653,6 +653,18 @@ function formatEta(minutes, charging) {
   return charging ? `~${span} to full` : `~${span} left`;
 }
 
+// The power-station ring is only ~82–104px across, so its eta has to stay on
+// one short line. Direction is already shown by the status badge ("Charging" /
+// "On battery") and the bolt, so inside the ring we show just the duration —
+// the full "~… to full / … left" phrasing is kept for the roomier dashboard
+// eta that sits below its ring.
+function formatEtaCompact(minutes) {
+  if (!minutes) return '';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
 // dumpsys reports BatteryManager health constants numerically on some builds.
 const HEALTH_NAMES = {
   1: 'Unknown', 2: 'Good', 3: 'Overheat', 4: 'Dead',
@@ -723,7 +735,7 @@ async function loadHardware() {
   ring.classList.toggle('warn', level > 15 && level <= 35);
 
   setText('hw-level', power.level === null ? '—' : `${power.level}%`);
-  setText('hw-eta', formatEta(power.minutesRemaining, power.charging));
+  setText('hw-eta', formatEtaCompact(power.minutesRemaining));
   el('hw-ring-bolt').classList.toggle('hidden', !power.charging);
 
   const statusBadge = el('hw-batt-status');
