@@ -178,6 +178,30 @@ test('an old build is refused with a version, not an unknown-option crash', () =
   assert.throws(() => buildCameraArgs('', {}, HELP_MODERN), /No device/);
 });
 
+test('camera window title is formatted with serial', () => {
+  const { cameraWindowTitle } = require('../src/camera');
+  assert.strictEqual(cameraWindowTitle('ABC123XYZ'), 'Camera — ABC123XYZ');
+});
+
+test('bitrate, maxFps, orientation, and record are passed when supported', () => {
+  const HELP_EXTRA = `${HELP_MODERN}
+    --video-bit-rate=value
+    --max-fps=value
+    --capture-orientation=value
+    --record=file.mp4
+  `;
+  const args = buildCameraArgs('SER1', {
+    bitrate: 8,
+    maxFps: 60,
+    orientation: 90,
+    record: 'C:\\Videos\\cam.mp4',
+  }, HELP_EXTRA);
+  assert.ok(args.includes('--video-bit-rate=8M'));
+  assert.ok(args.includes('--max-fps=60'));
+  assert.ok(args.includes('--capture-orientation=90'));
+  assert.ok(args.includes('--record=C:\\Videos\\cam.mp4'));
+});
+
 test('unreadable help falls back to the modern spelling rather than doing nothing', () => {
   const args = buildCameraArgs('SER1', { size: '1280x720' }, null);
   assert.ok(args.includes('--video-source=camera'));

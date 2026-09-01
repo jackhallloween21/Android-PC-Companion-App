@@ -24,15 +24,28 @@ const CAMERA_FLAGS = {
   facing: ['--camera-facing'],
   size: ['--camera-size'],
   fps: ['--camera-fps'],
+  maxFps: ['--max-fps'],
+  bitrate: ['--video-bit-rate', '--bit-rate'],
+  maxSize: ['--max-size'],
   aspectRatio: ['--camera-ar'],
   highSpeed: ['--camera-high-speed'],
   audioSource: ['--audio-source'],
   v4l2Sink: ['--v4l2-sink'],
   windowTitle: ['--window-title'],
+  captureOrientation: ['--capture-orientation', '--orientation', '--display-orientation'],
+  record: ['--record'],
+  stayAwake: ['--stay-awake'],
 };
 
 /** Human labels for the facing values scrcpy reports. */
 const FACING_LABELS = { back: 'Rear', front: 'Front', external: 'External' };
+
+/**
+ * Window title for camera streams. Used for docked window matching and tracking.
+ */
+function cameraWindowTitle(serial) {
+  return `Camera — ${serial}`;
+}
 
 /**
  * Parses `scrcpy --list-cameras` and `--list-camera-sizes`.
@@ -140,7 +153,13 @@ function buildCameraArgs(serial, o = {}, help = null) {
 
   if (o.size) push('size', o.size);
   if (o.fps) push('fps', o.fps);
+  if (o.maxFps) push('maxFps', o.maxFps);
+  if (o.bitrate) push('bitrate', typeof o.bitrate === 'number' ? `${o.bitrate}M` : o.bitrate);
+  if (o.maxSize) push('maxSize', o.maxSize);
   if (o.highSpeed) push('highSpeed');
+  if (o.orientation !== undefined && o.orientation !== null) push('captureOrientation', o.orientation);
+  if (o.record) push('record', o.record);
+  if (o.stayAwake) push('stayAwake');
 
   // Audio: the mic is a genuine capture source; without it there is nothing
   // worth forwarding from a camera session, so the default is silence.
@@ -154,7 +173,7 @@ function buildCameraArgs(serial, o = {}, help = null) {
     args.push(`${flag}=${o.v4l2Device}`);
   }
 
-  push('windowTitle', `Camera — ${serial}`);
+  push('windowTitle', cameraWindowTitle(serial));
   return args;
 }
 
@@ -450,6 +469,7 @@ module.exports = {
   FACING_LABELS,
   TORCH_TILES,
   DEFAULT_CODEC,
+  cameraWindowTitle,
   parseCameraList,
   describeCamera,
   buildCameraArgs,

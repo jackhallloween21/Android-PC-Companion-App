@@ -95,6 +95,7 @@ const {
 } = require('./src/keys');
 const {
   TORCH_TILES,
+  cameraWindowTitle,
   parseCameraList,
   buildCameraArgs,
   supportsMic,
@@ -1856,7 +1857,7 @@ async function readDisplayGeometry(serial) {
   return { size, rotation };
 }
 
-function controlBarWindow(bar, serial) {
+function controlBarWindow(bar, serial, { type = 'mirror' } = {}) {
   const win = new BrowserWindow({
     x: bar.x,
     y: bar.y,
@@ -1888,7 +1889,7 @@ function controlBarWindow(bar, serial) {
   win.setAlwaysOnTop(true, 'screen-saver');
   win.once('ready-to-show', () => win.showInactive());
   win.loadFile(path.join(__dirname, 'renderer', 'controlbar.html'), {
-    query: { serial },
+    query: { serial, type },
   });
   return win;
 }
@@ -1937,7 +1938,7 @@ function runWindowScript(script, env) {
 function windowTarget(session) {
   return {
     pid: session.child && session.child.exitCode === null ? session.child.pid : undefined,
-    title: mirrorWindowTitle(session.serial),
+    title: session.title || (session.type === 'camera' ? cameraWindowTitle(session.serial) : mirrorWindowTitle(session.serial)),
   };
 }
 
@@ -2115,7 +2116,10 @@ ipcMain.handle('scrcpy:stop', () => {
   return wasOpen;
 });
 
-app.on('before-quit', () => closeMirrorSession({ killScrcpy: true }));
+app.on('before-quit', () => {
+  closeMirrorSession({ killScrcpy: true });
+  closeCameraSession({ killScrcpy: true });
+});
 
 ipcMain.handle('scrcpy:info', async () => {
   if (!scrcpyInfo.version) await probeScrcpyVersion();
@@ -2301,48 +2305,142 @@ function cleanScrcpyLog(text) {
     .join('\n');
 }
 
-ipcMain.handle('camera:start', async (_e, opts = {}) => {
+function closeCameraSession({ killScrcpy = false } = {}) {
+  const session = cameraSession;
+  cameraSession = null;
+  if (!session) return;
+  if (session.bar && !session.bar.isDestroyed()) session.bar.destroy();
+  if (killScrcpy && session.child && session.child.exitCode === null) {
+    try { session.child.kill(); } catch { /* already gone */ }
+  }
+}
+
+async function startCameraSession(opts = {}) {
   const { serial } = opts;
   await assertDeviceReady(serial);
   assertCameraSupport();
-  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
-    throw new Error('A camera stream is already running. Stop it before starting another.');
+  closeCameraSession({ killScrcpy: true });
+
+  const dock = opts.dock !== false;
+  const canDock = dock && supportsPlacement(scrcpyInfo.help);
+
+  let camW = 1920;
+  let camH = 1080;
+  if (opts.size && /^\d+x\d+$/.test(opts.size)) {
+    const [w, h] = opts.size.split('x').map(Number);
+    if (w && h) { camW = w; camH = h; }
   }
 
-  const args = buildCameraArgs(serial, {
+  const rotation = opts.orientation ? Math.round(((opts.orientation % 360) / 90)) : 0;
+  const zoom = clampZoom(opts.zoom);
+  const geometry = {
+    deviceWidth: camW,
+    deviceHeight: camH,
+    rotation,
+    maxSize: opts.maxSize,
+  };
+
+  const layout = computeDockLayout({
+    ...geometry,
+    zoom,
+    workArea: screen.getPrimaryDisplay().workArea,
+  });
+
+  const baseArgs = buildCameraArgs(serial, {
     cameraId: opts.cameraId,
     facing: opts.facing,
-    size: opts.size,
+    size: opts.size || (opts.maxSize ? undefined : '1920x1080'),
     fps: opts.fps,
+    maxFps: opts.maxFps || 60,
+    bitrate: opts.bitrate || 8,
+    maxSize: opts.maxSize,
     highSpeed: opts.highSpeed,
     mic: opts.mic,
     v4l2Device: opts.v4l2Device,
+    orientation: opts.orientation,
+    record: opts.record,
+    stayAwake: true,
   }, scrcpyInfo.help);
 
-  cameraSession = { serial, child: null, opts };
+  const args = canDock
+    ? [...baseArgs, ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: !!opts.borderless })]
+    : baseArgs;
+
+  const session = {
+    serial,
+    child: null,
+    bar: null,
+    layout,
+    geometry,
+    zoom,
+    opts,
+    args: baseArgs,
+    type: 'camera',
+    title: cameraWindowTitle(serial),
+    borderless: !!opts.borderless,
+  };
+
   try {
     await spawnScrcpy(args, {
-      graceMs: 2500,
-      onSpawn: (child) => { cameraSession.child = child; },
-      onExit: () => { if (cameraSession && cameraSession.serial === serial) cameraSession = null; },
+      graceMs: 2200,
+      onSpawn: (child) => { session.child = child; },
+      onExit: () => { if (cameraSession === session) closeCameraSession(); },
     });
   } catch (err) {
-    // scrcpy reports an encoder rejection as a Java stack trace, which is not
-    // something a user can act on. Name the size and the device's own limit
-    // instead; the limit is re-read here because a start can follow a detect
-    // from an earlier session.
     const limits = await readEncoderLimits(serial);
     throw new Error(describeCameraFailure(err.message, { size: opts.size, limits }));
   }
-  return { running: true, size: opts.size || null, mic: !!opts.mic };
-});
+
+  if (canDock && session.child && session.child.exitCode === null) {
+    session.bar = controlBarWindow(layout.bar, serial, { type: 'camera' });
+    session.bar.on('closed', () => {
+      if (cameraSession === session) closeCameraSession({ killScrcpy: true });
+    });
+  }
+
+  cameraSession = session;
+  return { running: true, docked: canDock, size: opts.size || `${camW}x${camH}`, mic: !!opts.mic, layout, zoom };
+}
+
+async function applyCameraZoom(zoom) {
+  const session = cameraSession;
+  if (!session) throw new Error('No camera stream running.');
+
+  const next = clampZoom(zoom);
+  const workArea = screen.getPrimaryDisplay().workArea;
+  const layout = computeDockLayout({ ...session.geometry, zoom: next, workArea });
+
+  const moved = await moveScrcpyWindow(session, layout.video);
+
+  if (moved !== 'ok') {
+    const args = [
+      ...session.args,
+      ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: session.borderless }),
+    ];
+    if (session.child && session.child.exitCode === null) {
+      session.child.removeAllListeners('exit');
+      try { session.child.kill(); } catch { /* already gone */ }
+    }
+    await spawnScrcpy(args, {
+      graceMs: 1800,
+      onSpawn: (child) => { session.child = child; },
+      onExit: () => { if (cameraSession === session) closeCameraSession(); },
+    });
+  }
+
+  session.zoom = next;
+  session.layout = layout;
+  placeBar(session, layout.bar);
+
+  return { zoom: next, relaunched: moved !== 'ok', reason: moved, layout };
+}
+
+ipcMain.handle('camera:start', async (_e, opts = {}) => startCameraSession(opts));
 
 ipcMain.handle('camera:stop', () => {
-  if (cameraSession && cameraSession.child) {
-    try { cameraSession.child.kill(); } catch { /* already gone */ }
-  }
-  cameraSession = null;
-  return true;
+  const wasOpen = !!cameraSession;
+  closeCameraSession({ killScrcpy: true });
+  return wasOpen;
 });
 
 ipcMain.handle('camera:status', () => ({
@@ -2350,34 +2448,89 @@ ipcMain.handle('camera:status', () => ({
   serial: cameraSession ? cameraSession.serial : null,
   size: cameraSession ? (cameraSession.opts.size || null) : null,
   mic: cameraSession ? !!cameraSession.opts.mic : false,
+  docked: !!(cameraSession && cameraSession.bar),
+  zoom: cameraSession ? cameraSession.zoom : 1,
 }));
+
+ipcMain.handle('camera:setZoom', (_e, zoom) => applyCameraZoom(zoom));
+
+ipcMain.handle('camera:nudgeZoom', (_e, direction) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  return applyCameraZoom(stepZoom(cameraSession.zoom, direction));
+});
+
+ipcMain.handle('camera:redock', async () => {
+  const session = cameraSession;
+  if (!session || !session.bar || session.bar.isDestroyed()) return false;
+  const live = await readScrcpyWindowRect(session);
+  if (!live) return placeBar(session, session.layout.bar);
+  session.layout = { ...session.layout, video: live };
+  return placeBar(session, barBelow(live, screen.getPrimaryDisplay().workArea));
+});
+
+ipcMain.handle('camera:switch', async (_e, serial) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  const currOpts = { ...cameraSession.opts };
+  const targetSerial = serial || cameraSession.serial;
+  let cameras = [];
+  try {
+    const out = await runScrcpyText(['-s', targetSerial, '--list-camera-sizes']);
+    cameras = parseCameraList(out);
+  } catch { /* ignore */ }
+
+  if (cameras.length > 1) {
+    const currId = currOpts.cameraId;
+    const currIdx = cameras.findIndex((c) => (currId !== undefined && c.id === currId) || c.facing === currOpts.facing);
+    const nextCam = cameras[(currIdx + 1) % cameras.length];
+    currOpts.cameraId = nextCam.id;
+    currOpts.facing = nextCam.facing;
+    if (nextCam.sizes && nextCam.sizes.length) {
+      const preferred = nextCam.sizes.find((s) => s.size === '1920x1080') || nextCam.sizes.find((s) => s.size === '1280x720') || nextCam.sizes[0];
+      currOpts.size = preferred.size;
+    }
+  } else {
+    currOpts.facing = currOpts.facing === 'front' ? 'back' : 'front';
+    delete currOpts.cameraId;
+  }
+
+  return startCameraSession(currOpts);
+});
+
+ipcMain.handle('camera:rotate', async (_e, serial) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  const currOpts = { ...cameraSession.opts };
+  currOpts.orientation = ((currOpts.orientation || 0) + 90) % 360;
+  return startCameraSession(currOpts);
+});
+
+ipcMain.handle('camera:toggleMic', async (_e, serial) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  const currOpts = { ...cameraSession.opts };
+  currOpts.mic = !currOpts.mic;
+  return startCameraSession(currOpts);
+});
 
 /**
  * Camera frame: captures the scrcpy camera window via desktopCapturer when a
  * camera stream is running, or falls back to screencap (phone screen) otherwise.
- * scrcpy opens its own SDL window titled "Camera — {serial}" when streaming
- * --video-source=camera; capturing that window gives the actual camera feed
- * instead of the phone display.
  */
 ipcMain.handle('camera:frame', async (_e, serial) => {
   if (!serial) return null;
 
-  // If camera session is active, capture the scrcpy camera window
   if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
     try {
       const sources = await desktopCapturer.getSources({
         types: ['window'],
-        thumbnailSize: { width: 640, height: 480 },
+        thumbnailSize: { width: 960, height: 540 },
       });
-      const camTitle = `Camera — ${serial}`;
-      const src = sources.find((s) => s.name.includes(camTitle));
+      const camTitle = cameraWindowTitle(serial);
+      const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
       if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
         return `data:image/png;base64,${src.thumbnail.toPNG().toString('base64')}`;
       }
     } catch { /* fall through to screencap */ }
   }
 
-  // Fallback: screencap captures the phone display, not the camera sensor
   try {
     const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
     if (!buf || !buf.length) return null;
@@ -2386,82 +2539,86 @@ ipcMain.handle('camera:frame', async (_e, serial) => {
 });
 
 /**
- * Camera photo capture: uses screencap to capture the current camera preview
- * frame directly from the device, then saves it locally.
+ * Camera photo capture: captures the high-res camera frame directly from the
+ * scrcpy camera stream window.
  */
 ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
-  if (!serial) throw new Error('No device selected.');
+  const targetSerial = serial || cameraSession?.serial;
+  if (!targetSerial) throw new Error('No device selected.');
 
-  // Capture the screen directly via screencap (works when camera preview is visible)
-  const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
-  if (!buf || !buf.length) throw new Error('Failed to capture screenshot from device.');
+  let buf = null;
+  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 1920, height: 1080 },
+      });
+      const camTitle = cameraWindowTitle(targetSerial);
+      const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
+      if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
+        buf = src.thumbnail.toPNG();
+      }
+    } catch { /* fall through */ }
+  }
+
+  if (!buf || !buf.length) {
+    try {
+      buf = await adbBuffer(['-s', targetSerial, 'exec-out', 'screencap', '-p']);
+    } catch { /* ignore */ }
+  }
+
+  if (!buf || !buf.length) throw new Error('Failed to capture photo from camera.');
 
   const defaultName = `camera-capture-${Date.now()}.png`;
   const { canceled, filePath } = await dialog.showSaveDialog({
     defaultPath: defaultName,
-    filters: [{ name: 'Image', extensions: ['png'] }],
+    filters: [{ name: 'PNG Image', extensions: ['png'] }, { name: 'All Files', extensions: ['*'] }],
   });
   if (canceled || !filePath) return null;
   fs.writeFileSync(filePath, buf);
   return filePath;
 });
 
+let cameraRecordingFile = null;
+
 /**
- * Camera video record: starts adb screenrecord on the device while the camera
- * stream is active. The screenrecord captures the device display, which shows
- * the camera preview when the camera app is open.
+ * Camera video record: records the pristine hardware-encoded camera stream
+ * directly to a local MP4 file on the PC using scrcpy's native --record.
  */
 ipcMain.handle('camera:recordStart', async (_e, serial) => {
-  if (!serial) throw new Error('No device selected.');
+  const targetSerial = serial || cameraSession?.serial;
+  if (!targetSerial) throw new Error('No device selected.');
   if (!cameraSession || !cameraSession.child || cameraSession.child.exitCode !== null) {
     throw new Error('Camera stream is not running. Start the camera first.');
   }
-  const result = await dialog.showSaveDialog({
-    defaultPath: `camera-record-${Date.now()}.mp4`,
-    filters: [{ name: 'Video', extensions: ['mp4'] }],
-  });
-  if (result.canceled || !result.filePath) return null;
-  const filePath = result.filePath;
-  const remotePath = `/sdcard/record_${Date.now()}.mp4`;
 
-  // Start screenrecord on the device (max 180s, it auto-stops)
-  const recordChild = spawn(tools.adb, ['-s', serial, 'shell', 'screenrecord', '--time-limit', '180', remotePath], { windowsHide: true });
-  if (!recordChild || recordChild.exitCode !== null && recordChild.exitCode !== 0) {
-    throw new Error('Failed to start screenrecord on the device.');
-  }
-  recordChild.on('error', () => {});
-  cameraRecordProcess = recordChild;
-  cameraRecordRemotePath = remotePath;
-  cameraRecordLocalPath = filePath;
+  const defaultName = `camera-record-${Date.now()}.mp4`;
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: defaultName,
+    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'MKV Video', extensions: ['mkv'] }],
+  });
+  if (canceled || !filePath) return null;
+
+  cameraRecordingFile = filePath;
+  const currOpts = { ...cameraSession.opts, record: filePath };
+  await startCameraSession(currOpts);
   return filePath;
 });
 
-let cameraRecordProcess = null;
-let cameraRecordRemotePath = null;
-let cameraRecordLocalPath = null;
+ipcMain.handle('camera:recordStop', async () => {
+  const filePath = cameraRecordingFile;
+  cameraRecordingFile = null;
+  if (!filePath) return null;
 
-ipcMain.handle('camera:recordStop', async (_e, serial) => {
-  if (!serial) serial = cameraSession?.serial;
-  const remotePath = cameraRecordRemotePath;
-  const localPath = cameraRecordLocalPath;
-  // Kill the screenrecord process
-  if (cameraRecordProcess) {
-    try { cameraRecordProcess.kill(); } catch { /* already gone */ }
-    cameraRecordProcess = null;
+  if (cameraSession) {
+    const currOpts = { ...cameraSession.opts };
+    delete currOpts.record;
+    await startCameraSession(currOpts);
   }
-  cameraRecordRemotePath = null;
-  cameraRecordLocalPath = null;
-  // Wait for screenrecord to finalize the file
-  await new Promise((r) => setTimeout(r, 2000));
-  if (!remotePath || !localPath || !serial) return null;
-  try {
-    await adb(['-s', serial, 'pull', remotePath, localPath]);
-    await adb(['-s', serial, 'shell', 'rm -f ' + JSON.stringify(remotePath)]).catch(() => {});
-    return localPath;
-  } catch (err) {
-    throw new Error('Failed to pull recording: ' + cleanIpcError(err.message));
-  }
+  return filePath;
 });
+
+ipcMain.handle('camera:recordStatus', () => !!cameraRecordingFile);
 
 /**
  * Flashlight.

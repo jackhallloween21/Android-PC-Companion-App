@@ -1942,10 +1942,10 @@ const cleanIpcError = (msg) => msg.replace(/^Error invoking remote method '[^']+
 const camera = { list: [], selected: null, mic: false, micEnabled: false, v4l2: false, bridge: null, limits: null };
 
 const RES_PRESETS = [
+  { label: '1080p Full HD (1920 x 1080) — Recommended', value: '1920x1080' },
+  { label: '720p HD (1280 x 720) — High Performance', value: '1280x720' },
+  { label: '480p SD (854 x 480) — Low Latency', value: '854x480' },
   { label: 'Auto (sensor default)', value: '' },
-  { label: '480p SD (854 x 480)', value: '854x480' },
-  { label: '720p HD (1280 x 720)', value: '1280x720' },
-  { label: '1080p Full HD (1920 x 1080)', value: '1920x1080' },
 ];
 
 const FACING_ICONS = { back: '\uD83D\uDCF7', front: '\uD83D\uDCBB', external: '\uD83D\uDD0C' };
@@ -1975,7 +1975,7 @@ function renderLensList() {
     const desc = FACING_DESC[cam.facing] || '';
     card.innerHTML = `<div class="cam-lens-name">${label}${mp ? ` (${mp})` : ''}</div>`
       + (desc ? `<div class="cam-lens-desc">${desc}</div>` : '');
-    card.onclick = () => { camera.selected = cam.id; renderLensList(); updateLensLabel(); };
+    card.onclick = () => { camera.selected = cam.id; renderLensList(); updateLensLabel(); renderSizeOptions(); };
     box.appendChild(card);
   });
 }
@@ -1999,8 +1999,25 @@ function renderSizeOptions() {
     const opt = document.createElement('option');
     opt.value = p.value;
     opt.textContent = p.label;
+    if (p.value === '1920x1080') opt.selected = true;
     sizeSel.appendChild(opt);
   });
+
+  if (cam && cam.sizes && cam.sizes.length) {
+    const group = document.createElement('optgroup');
+    group.label = 'Sensor Native Resolutions';
+    cam.sizes.forEach((s) => {
+      // Don't duplicate exact presets
+      if (['1920x1080', '1280x720', '854x480'].includes(s.size)) return;
+      const opt = document.createElement('option');
+      opt.value = s.size;
+      const mp = Math.round((s.width * s.height) / 100000) / 10;
+      opt.textContent = `${s.size} (${mp} MP)`;
+      group.appendChild(opt);
+    });
+    if (group.children.length > 0) sizeSel.appendChild(group);
+  }
+
   if (cam && cam.maxSize) {
     const info = el('camera-res-info');
     if (info) info.textContent = cam.maxSize + (cam.megapixels ? ` @ ${cam.megapixels} MP` : '');
@@ -2104,6 +2121,9 @@ el('camera-start-btn').onclick = async () => {
       serial: state.selected,
       cameraId: cam ? cam.id : undefined,
       size: el('camera-size').value || undefined,
+      dock: el('camera-dock') ? el('camera-dock').checked : true,
+      bitrate: el('camera-bitrate') ? Number(el('camera-bitrate').value) : 8,
+      maxFps: el('camera-framerate') ? Number(el('camera-framerate').value) : 60,
       highSpeed: el('camera-highspeed').checked,
       mic: camera.micEnabled && camera.mic,
     };

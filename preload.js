@@ -115,7 +115,14 @@ contextBridge.exposeInMainWorld('api', {
   cameraCapturePhoto: (serial) => ipcRenderer.invoke('camera:capturePhoto', serial),
   cameraRecordStart: (serial) => ipcRenderer.invoke('camera:recordStart', serial),
   cameraRecordStop: (serial) => ipcRenderer.invoke('camera:recordStop', serial),
+  cameraRecordStatus: () => ipcRenderer.invoke('camera:recordStatus'),
   cameraFrame: (serial) => ipcRenderer.invoke('camera:frame', serial),
+  cameraSetZoom: (zoom) => ipcRenderer.invoke('camera:setZoom', zoom),
+  cameraNudgeZoom: (direction) => ipcRenderer.invoke('camera:nudgeZoom', direction),
+  cameraRedock: () => ipcRenderer.invoke('camera:redock'),
+  cameraSwitch: (serial) => ipcRenderer.invoke('camera:switch', serial),
+  cameraRotate: (serial) => ipcRenderer.invoke('camera:rotate', serial),
+  cameraToggleMic: (serial) => ipcRenderer.invoke('camera:toggleMic', serial),
 
   // fastboot
   fastbootUnlock: (serial) => ipcRenderer.invoke('fastboot:unlock', serial),

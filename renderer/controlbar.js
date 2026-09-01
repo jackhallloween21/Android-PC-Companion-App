@@ -6,7 +6,9 @@
 // which is the reason this bar exists at all.
 // ---------------------------------------------------------------------------
 
-const serial = new URLSearchParams(location.search).get('serial') || '';
+const params = new URLSearchParams(location.search);
+const serial = params.get('serial') || '';
+const type = params.get('type') || 'mirror';
 
 const el = (id) => document.getElementById(id);
 const toast = el('toast');
@@ -30,9 +32,7 @@ function cleanError(message) {
 }
 
 /**
- * Wires a button so it cannot be double-fired while its adb call is in flight —
- * `input keyevent` is cheap but not instant, and a queued burst of Back presses
- * walks the user out of their app.
+ * Wires a button so it cannot be double-fired while its IPC/adb call is in flight.
  */
 function action(id, run, { busy, done } = {}) {
   const node = el(id);
@@ -54,13 +54,141 @@ function action(id, run, { busy, done } = {}) {
 
 if (!serial) {
   say('No device serial was passed to this window.', 'err');
+} else if (type === 'camera') {
+  // ---- Camera Mode --------------------------------------------------------
+  const mirrorNav = el('mirror-nav-row');
+  const camNav = el('camera-nav-row');
+  const mirrorAux = el('mirror-aux');
+  const mirrorStop = el('a-stop');
+
+  if (mirrorNav) mirrorNav.style.display = 'none';
+  if (mirrorAux) mirrorAux.style.display = 'none';
+  if (mirrorStop) mirrorStop.style.display = 'none';
+  if (camNav) camNav.style.display = 'flex';
+
+  action('c-flip', () => window.api.cameraSwitch(serial), {
+    busy: 'Switching camera…',
+    done: () => 'Switched camera',
+  });
+
+  action('c-rotate', () => window.api.cameraRotate(serial), {
+    busy: 'Rotating camera…',
+    done: () => 'Rotated camera 90°',
+  });
+
+  const micBtn = el('c-mic');
+  let micActive = false;
+  const paintMic = (active) => {
+    micActive = !!active;
+    if (micBtn) micBtn.classList.toggle('active-mic', micActive);
+  };
+  if (micBtn) {
+    micBtn.addEventListener('click', async () => {
+      micBtn.disabled = true;
+      try {
+        const res = await window.api.cameraToggleMic(serial);
+        paintMic(res && res.mic);
+        say(res && res.mic ? 'Microphone enabled' : 'Microphone muted', 'ok');
+      } catch (err) {
+        say(cleanError(err.message), 'err');
+      } finally {
+        micBtn.disabled = false;
+      }
+    });
+  }
+
+  action('c-shot', () => window.api.cameraCapturePhoto(serial), {
+    busy: 'Capturing photo…',
+    done: (file) => (file ? `Saved ${file.split(/[\\/]/).pop()}` : 'Cancelled'),
+  });
+
+  const camRecBtn = el('c-record');
+  let camRecording = false;
+  const paintCamRec = () => {
+    if (camRecBtn) {
+      camRecBtn.textContent = camRecording ? 'Stop rec' : 'Record';
+      camRecBtn.classList.toggle('rec-on', camRecording);
+    }
+  };
+  if (camRecBtn) {
+    camRecBtn.addEventListener('click', async () => {
+      camRecBtn.disabled = true;
+      try {
+        if (camRecording) {
+          say('Finalising…');
+          const file = await window.api.cameraRecordStop(serial);
+          camRecording = false;
+          say(file ? `Saved ${file.split(/[\\/]/).pop()}` : 'Discarded', 'ok');
+        } else {
+          const file = await window.api.cameraRecordStart(serial);
+          if (file) {
+            camRecording = true;
+            say('Recording camera…');
+          }
+        }
+      } catch (err) {
+        say(cleanError(err.message), 'err');
+      } finally {
+        paintCamRec();
+        camRecBtn.disabled = false;
+      }
+    });
+  }
+  window.api.cameraRecordStatus().then((active) => { camRecording = !!active; paintCamRec(); }).catch(() => {});
+
+  action('c-stop', () => window.api.stopCamera(), { busy: 'Stopping camera…' });
+
+  action('a-redock', () => window.api.cameraRedock(), {
+    done: (ok) => (ok ? 'Snapped back under the video' : 'No docked session'),
+  });
+
+  // ---- Camera Resize ------------------------------------------------------
+  const zoomValue = el('zoom-value');
+  const zoomBtns = ['z-out', 'z-in', 'z-fit'].map(el);
+  let zooming = false;
+
+  const paintZoom = (zoom) => {
+    if (Number.isFinite(zoom)) zoomValue.textContent = `${Math.round(zoom * 100)}%`;
+  };
+
+  async function resize(run) {
+    if (zooming) return;
+    zooming = true;
+    zoomBtns.forEach((b) => { if (b) b.disabled = true; });
+    try {
+      const res = await run();
+      paintZoom(res && res.zoom);
+    } catch (err) {
+      say(cleanError(err.message), 'err');
+    } finally {
+      zooming = false;
+      zoomBtns.forEach((b) => { if (b) b.disabled = false; });
+    }
+  }
+
+  el('z-out').addEventListener('click', () => resize(() => window.api.cameraNudgeZoom(-1)));
+  el('z-in').addEventListener('click', () => resize(() => window.api.cameraNudgeZoom(1)));
+  el('z-fit').addEventListener('click', () => resize(() => window.api.cameraSetZoom(1)));
+
+  document.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    resize(() => window.api.cameraNudgeZoom(e.deltaY < 0 ? 1 : -1));
+  }, { passive: false });
+
+  window.api.cameraStatus().then((st) => {
+    if (st) {
+      paintZoom(st.zoom || 1);
+      paintMic(st.mic);
+    }
+  }).catch(() => {});
+
 } else {
+  // ---- Screen Mirror Mode -------------------------------------------------
   action('k-back', () => window.api.navKey(serial, 'back'));
   action('k-home', () => window.api.navKey(serial, 'home'));
   action('k-recents', () => window.api.navKey(serial, 'recents'));
 
-  // A second press on either shade button collapses it, so the buttons behave
-  // like the gesture they replace rather than being one-way.
   let openPanel = null;
   const shade = (id, panel) => action(id, async () => {
     const target = openPanel === panel ? 'collapse' : panel;
@@ -74,8 +202,6 @@ if (!serial) {
   action('a-vol-down', () => window.api.volumeDown(serial));
   action('a-vol-up', () => window.api.volumeUp(serial));
 
-  // The device's absolute rotation is not queried, so cycle a local counter;
-  // the first press may therefore land on the orientation it is already in.
   let rotation = 0;
   action('a-rotate', () => {
     rotation = (rotation + 1) % 4;
@@ -90,37 +216,40 @@ if (!serial) {
   const recordBtn = el('a-record');
   let recording = false;
   const paintRecord = () => {
-    recordBtn.textContent = recording ? 'Stop rec' : 'Record';
-    recordBtn.classList.toggle('rec-on', recording);
-  };
-  recordBtn.addEventListener('click', async () => {
-    recordBtn.disabled = true;
-    try {
-      if (recording) {
-        say('Finalising…');
-        const file = await window.api.recordStop(serial);
-        recording = false;
-        say(file ? `Saved ${file.split(/[\\/]/).pop()}` : 'Discarded', 'ok');
-      } else {
-        await window.api.recordStart(serial);
-        recording = true;
-        say('Recording…');
-      }
-    } catch (err) {
-      say(cleanError(err.message), 'err');
-    } finally {
-      paintRecord();
-      recordBtn.disabled = false;
+    if (recordBtn) {
+      recordBtn.textContent = recording ? 'Stop rec' : 'Record';
+      recordBtn.classList.toggle('rec-on', recording);
     }
-  });
+  };
+  if (recordBtn) {
+    recordBtn.addEventListener('click', async () => {
+      recordBtn.disabled = true;
+      try {
+        if (recording) {
+          say('Finalising…');
+          const file = await window.api.recordStop(serial);
+          recording = false;
+          say(file ? `Saved ${file.split(/[\\/]/).pop()}` : 'Discarded', 'ok');
+        } else {
+          await window.api.recordStart(serial);
+          recording = true;
+          say('Recording…');
+        }
+      } catch (err) {
+        say(cleanError(err.message), 'err');
+      } finally {
+        paintRecord();
+        recordBtn.disabled = false;
+      }
+    });
+  }
   window.api.recordStatus().then((active) => { recording = !!active; paintRecord(); }).catch(() => {});
 
   action('a-redock', () => window.api.redockControls(), {
     done: (ok) => (ok ? 'Snapped back under the video' : 'No docked session'),
   });
-  // ---- Resize -------------------------------------------------------------
-  // The video window is borderless so it cannot drift out of alignment, which
-  // also means it has no edges to drag. These buttons are the resize handle.
+
+  // ---- Mirror Resize ------------------------------------------------------
   const zoomValue = el('zoom-value');
   const zoomBtns = ['z-out', 'z-in', 'z-fit'].map(el);
   let zooming = false;
@@ -129,12 +258,10 @@ if (!serial) {
     if (Number.isFinite(zoom)) zoomValue.textContent = `${Math.round(zoom * 100)}%`;
   };
 
-  // Serialised rather than debounced: each resize either moves the window or
-  // relaunches scrcpy, and overlapping those would fight over the same window.
   async function resize(run) {
     if (zooming) return;
     zooming = true;
-    zoomBtns.forEach((b) => { b.disabled = true; });
+    zoomBtns.forEach((b) => { if (b) b.disabled = true; });
     try {
       const res = await run();
       paintZoom(res && res.zoom);
@@ -149,7 +276,7 @@ if (!serial) {
       say(cleanError(err.message), 'err');
     } finally {
       zooming = false;
-      zoomBtns.forEach((b) => { b.disabled = false; });
+      zoomBtns.forEach((b) => { if (b) b.disabled = false; });
     }
   }
 
@@ -157,7 +284,6 @@ if (!serial) {
   el('z-in').addEventListener('click', () => resize(() => window.api.nudgeMirrorZoom(1)));
   el('z-fit').addEventListener('click', () => resize(() => window.api.setMirrorZoom(1)));
 
-  // Ctrl+wheel over the bar, the gesture people already expect for zoom.
   document.addEventListener('wheel', (e) => {
     if (!e.ctrlKey) return;
     e.preventDefault();
@@ -166,6 +292,5 @@ if (!serial) {
 
   window.api.dockState().then((s) => paintZoom(s && s.zoom)).catch(() => {});
 
-  // Stopping tears down scrcpy, which closes this window from the main process.
   action('a-stop', () => window.api.stopMirror(), { busy: 'Stopping…' });
 }
