@@ -11,6 +11,33 @@ const state = {
 const el = (id) => document.getElementById(id);
 const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+// Writes text only when it actually changed. The dashboard repaints every
+// second, and reassigning textContent on an unchanged node still invalidates
+// layout — which is visible as flicker on the wide monospace rows.
+function setText(id, text) {
+  const node = el(id);
+  if (!node) return;
+  const next = text === null || text === undefined ? '' : String(text);
+  if (node.textContent !== next) node.textContent = next;
+}
+
+// Transient message. Created on demand so index.html does not need a slot for
+// it, and self-removing so a stack of them cannot build up.
+let toastTimer = null;
+function toast(message) {
+  let node = el('toast');
+  if (!node) {
+    node = document.createElement('div');
+    node.id = 'toast';
+    node.className = 'toast';
+    document.body.appendChild(node);
+  }
+  node.textContent = message;
+  node.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.remove('show'), 6000);
+}
+
 // -------------------------------------------------------------- first-run setup
 
 let setupFailed = false;
@@ -18,7 +45,7 @@ let setupFailed = false;
 function enterShell() {
   el('setup-overlay').classList.add('hidden');
   el('shell').classList.remove('hidden');
-  refreshDevices();
+  refreshDevices().then(autoconnectKnown);
 }
 
 el('setup-continue').onclick = enterShell;
@@ -71,7 +98,7 @@ el('close-btn').onclick = () => window.api.close();
 // ------------------------------------------------------------------ nav
 
 qAll('.nav-item[data-view]').forEach((btn) => (btn.onclick = () => setView(btn.dataset.view)));
-qAll('.launcher[data-view]').forEach((btn) => (btn.onclick = () => setView(btn.dataset.view)));
+qAll('.launcher[data-view], .link-btn[data-view]').forEach((btn) => (btn.onclick = () => setView(btn.dataset.view)));
 el('tools-nav-btn').onclick = () => openToolsModal();
 
 function setView(view) {
@@ -84,57 +111,201 @@ function setView(view) {
 
 function refreshView(view) {
   if (view !== 'hardware') stopHardwarePolling();
+  if (view !== 'dashboard') stopDashboardPolling();
   if (!state.selected) return;
-  if (view === 'dashboard') loadDashboard();
-  if (view === 'files') loadFiles();
+  if (view === 'dashboard') { loadDashboard(); loadStorage(); startDashboardPolling(); }
+  if (view === 'files') { loadFiles(); loadFileStorage(); }
   if (view === 'apps') loadApps();
   if (view === 'hardware') { loadHardware(); startHardwarePolling(); }
   if (view === 'multimedia') { refreshAudioStatus(); refreshBridge(); }
   if (view === 'mirror') showScrcpyBuild();
 }
 
-// -------------------------------------------------------------- device modal
+// -------------------------------------------------------------- connect modal
 
-el('device-picker-btn').onclick = () => el('device-modal').classList.remove('hidden');
-el('device-modal-close').onclick = () => el('device-modal').classList.add('hidden');
+function openConnectModal(tab) {
+  el('connect-modal').classList.remove('hidden');
+  if (tab) switchConnectTab(tab);
+}
+function closeConnectModal() {
+  const m = el('connect-modal');
+  if (m) m.classList.add('hidden');
+}
+
+el('sidebar-device-card').onclick = () => openConnectModal();
+el('connect-modal-close').onclick = () => closeConnectModal();
+
+// Tab switching
+document.querySelectorAll('.connect-tab').forEach((btn) => {
+  btn.onclick = () => switchConnectTab(btn.dataset.ctab);
+});
+function switchConnectTab(tab) {
+  document.querySelectorAll('.connect-tab').forEach((b) => b.classList.toggle('active', b.dataset.ctab === tab));
+  document.querySelectorAll('.connect-tab-panel').forEach((p) => p.classList.toggle('active', p.id === `ctab-${tab}`));
+  if (tab === 'switch') renderConnectDeviceList();
+}
+
+// USB scan
+el('usb-scan-btn').onclick = async () => {
+  const btn = el('usb-scan-btn');
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  try {
+    await window.api.autoconnect({ includeNew: true });
+    await refreshDevices();
+  } catch { /* ignore */ }
+  btn.disabled = false;
+  btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.22-8.56"/><path d="M21 3v6h-6"/></svg> Scan USB Ports';
+};
+
+// Wi-Fi pair
+el('wifi-pair-btn').onclick = async () => {
+  const ip = el('wifi-ip').value.trim();
+  const port = el('wifi-port').value.trim();
+  const code = el('wifi-code').value.trim();
+  const statusEl = el('wifi-pair-status');
+  const btn = el('wifi-pair-btn');
+
+  if (!ip) { statusEl.textContent = 'Enter the phone\'s IP address.'; statusEl.className = 'mirror-status err'; return; }
+  if (!port && !code) { statusEl.textContent = 'Enter the port number.'; statusEl.className = 'mirror-status err'; return; }
+
+  btn.disabled = true;
+  statusEl.textContent = code ? 'Pairing, then connecting…' : 'Connecting…';
+  statusEl.className = 'mirror-status busy';
+  try {
+    if (code) {
+      const hostPort = `${ip}:${port}`;
+      const res = await window.api.pairWireless(hostPort, code, port);
+      if (res && res.connected) {
+        statusEl.textContent = res.message;
+        statusEl.className = 'mirror-status ok';
+        closeConnectModal();
+        await refreshDevices();
+      } else {
+        statusEl.textContent = res ? res.message : 'Paired, but connect step did not run.';
+        statusEl.className = 'mirror-status err';
+      }
+    } else {
+      const result = await window.api.connectWireless(`${ip}:${port}`);
+      statusEl.textContent = result || 'Connected.';
+      statusEl.className = 'mirror-status ok';
+      closeConnectModal();
+      await refreshDevices();
+    }
+  } catch (err) {
+    statusEl.textContent = cleanIpcError(err.message);
+    statusEl.className = 'mirror-status err';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// QR from connect modal
+el('wifi-qr-btn').onclick = () => {
+  closeConnectModal();
+  el('qr-modal').classList.remove('hidden');
+  startQrPairing();
+};
 
 async function refreshDevices() {
   const devices = await window.api.listDevices();
   state.devices = devices;
+  // A device that has gone away may come back as a different build (or after an
+  // OTA), so its cached static specs must not survive the disconnect.
+  const present = new Set(devices.map((d) => d.serial));
+  for (const serial of [...specsCache.keys()]) {
+    if (!present.has(serial)) specsCache.delete(serial);
+  }
   renderDeviceList();
   updateTitlebarStatus();
+  updateSidebarDeviceCard();
+  const cnt = el('connect-device-count');
+  if (cnt) cnt.textContent = String(devices.length);
+  // Safety net: if a device is selected but the dashboard is still showing the
+  // empty state, force it into the correct state. This catches races where
+  // selectDevice() was skipped or threw before hiding the empty state.
+  if (state.selected) {
+    const es = el('empty-state');
+    const dg = el('dashboard-grid');
+    if (es && !es.classList.contains('hidden')) es.classList.add('hidden');
+    if (dg && dg.classList.contains('hidden')) dg.classList.remove('hidden');
+  }
 }
 
+// Render detected devices in the Switch Device tab of the connect modal.
 function renderDeviceList() {
-  const list = el('device-list');
+  const list = el('connect-device-list');
+  if (!list) return;
   list.innerHTML = '';
   if (!state.devices.length) {
-    list.innerHTML = '<div class="empty-devices">No devices found. Plug in a phone with USB debugging enabled, or pair one wirelessly.</div>';
+    list.innerHTML = '<div class="muted" style="padding:16px;text-align:center;">No devices found. Connect via USB or Wi-Fi first.</div>';
     return;
   }
   state.devices.forEach((d) => {
-    const chip = document.createElement('div');
-    chip.className = 'device-chip' + (state.selected === d.serial ? ' selected' : '');
-    chip.innerHTML = `
-      <div class="row">
-        <span class="status-dot ${d.state === 'device' ? 'online' : ''}"></span>
-        <span class="model">${d.model ? d.model.replace(/_/g, ' ') : d.state}</span>
+    const isActive = state.selected === d.serial;
+    const item = document.createElement('div');
+    item.className = 'connect-device-item' + (isActive ? ' active' : '');
+    const model = d.model ? d.model.replace(/_/g, ' ') : d.serial;
+    const detail = d.ip ? `${d.ip}` : (d.transport || d.serial);
+    item.innerHTML = `
+      <div class="cdi-icon">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/></svg>
       </div>
-      <div class="serial">${d.serial}</div>
+      <div class="cdi-info">
+        <div class="cdi-name">${model}</div>
+        <div class="cdi-detail">${detail} ${d.transport ? '· ' + d.transport : ''}</div>
+      </div>
+      <div class="cdi-action${isActive ? ' active-badge' : ''}">
+        ${isActive ? '✓ Active' : 'Switch →'}
+      </div>
     `;
-    chip.onclick = () => selectDevice(d.serial);
-    list.appendChild(chip);
+    item.onclick = () => selectDevice(d.serial);
+    list.appendChild(item);
   });
+}
+
+// Renders devices in the sidebar card and connect modal switch list.
+function renderConnectDeviceList() {
+  renderDeviceList();
+}
+
+// Re-attaches phones paired in an earlier session. Runs once at startup: the
+// pairing key on the phone is permanent, so all that is needed is `adb connect`
+// at whatever address the device is on now — the user should never have to open
+// the pairing screen for a phone they have already paired.
+async function autoconnectKnown() {
+  let result;
+  try { result = await window.api.autoconnect(); }
+  catch { return; }
+  if (!result || !result.connected.length) return;
+  await refreshDevices();
+  const names = result.connected.map((c) => c.target).join(', ');
+  toast(`Reconnected to ${names} — no pairing needed.`);
+  if (!state.selected) selectDevice(result.connected[0].target);
 }
 
 function selectDevice(serial) {
   state.selected = serial;
   renderDeviceList();
   updateTitlebarStatus();
-  el('device-modal').classList.add('hidden');
-  el('empty-state').classList.add('hidden');
-  el('dashboard-grid').classList.remove('hidden');
+  updateSidebarDeviceCard();
+  try { closeConnectModal(); } catch {}
+  const es = el('empty-state');
+  const dg = el('dashboard-grid');
+  if (es) es.classList.add('hidden');
+  if (dg) dg.classList.remove('hidden');
   setView(state.activeView);
+  // Double-check after the current paint to catch any race where another
+  // handler re-opened the modal or re-shown the empty state.
+  requestAnimationFrame(() => {
+    if (!state.selected || state.selected !== serial) return;
+    const m = el('connect-modal');
+    if (m && !m.classList.contains('hidden')) m.classList.add('hidden');
+    const e2 = el('empty-state');
+    if (e2 && !e2.classList.contains('hidden')) e2.classList.add('hidden');
+    const d2 = el('dashboard-grid');
+    if (d2 && d2.classList.contains('hidden')) d2.classList.remove('hidden');
+  });
 }
 
 function updateTitlebarStatus() {
@@ -150,73 +321,320 @@ function updateTitlebarStatus() {
   }
 }
 
+function updateSidebarDeviceCard() {
+  const card = el('sidebar-device-card');
+  const nameEl = el('sdc-name');
+  const connEl = el('sdc-conn');
+  const ipEl = el('sdc-ip');
+  const device = state.devices.find((d) => d.serial === state.selected);
+
+  if (device) {
+    card.classList.add('connected');
+    nameEl.textContent = device.model ? device.model.replace(/_/g, ' ') : device.serial;
+    const transport = device.transport || 'USB';
+    connEl.innerHTML = `<span class="conn-dot"></span> ${transport} Mode`;
+    if (device.ip) {
+      ipEl.textContent = `IP: ${device.ip}`;
+      ipEl.classList.remove('hidden');
+    } else {
+      ipEl.classList.add('hidden');
+    }
+  } else {
+    card.classList.remove('connected');
+    nameEl.textContent = 'No device connected';
+    connEl.innerHTML = '<span class="conn-dot"></span> —';
+    ipEl.classList.add('hidden');
+  }
+}
+
 // -------------------------------------------------------------------- dashboard
+
+// ---------------------------------------------------------------------------
+// Dashboard
+//
+// The live half (CPU, RAM, battery) comes from one batched `device:telemetry`
+// call and is polled; the static half (model, Android version, patch level) is
+// fetched once per serial. Storage is polled far more slowly than the rest,
+// because `dumpsys diskstats` reads a cache Android refreshes on its own
+// schedule — asking every second would cost an adb round trip for a number that
+// cannot have changed.
+// ---------------------------------------------------------------------------
+
+const LAUNCHERS = [
+  { view: 'mirror', label: 'Scrcpy mirror', sub: 'Start a live session', color: 'var(--cat-apps)', icon: '<rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8"/>' },
+  { view: 'apps', label: 'App debloater', sub: 'Sideload / disable', color: 'var(--cat-photos)', icon: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14.5v6M14.5 17.5h6"/>' },
+  { view: 'multimedia', label: 'Webcam bridge', sub: 'Camera + microphone', color: 'var(--cat-videos)', icon: '<path d="M2.5 7.5h11v9h-11z" /><path d="M13.5 12l8-4v8z"/>' },
+  { view: 'console', label: 'ADB shell', sub: 'Raw commands', color: 'var(--cat-audio)', icon: '<rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="M6.5 9.5l3 2.5-3 2.5M12 15h5"/>' },
+];
+
+function renderLaunchers() {
+  const grid = el('dash-launchers');
+  if (!grid || grid.childElementCount) return;
+  LAUNCHERS.forEach((l) => {
+    const btn = document.createElement('button');
+    btn.className = 'launcher';
+    btn.dataset.view = l.view;
+    btn.innerHTML = `
+      <span class="launcher-icon" style="--tile:${l.color}">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round">${l.icon}</svg>
+      </span>
+      <span class="launcher-text">
+        <span class="launcher-label">${l.label}</span>
+        <span class="muted tiny">${l.sub}</span>
+      </span>`;
+    btn.onclick = () => setView(l.view);
+    grid.appendChild(btn);
+  });
+}
+
+/** Bytes as a short string. Mirrors src/storage.js formatBytes. */
+function bytesText(bytes) {
+  if (bytes === null || bytes === undefined || !Number.isFinite(Number(bytes)) || Number(bytes) < 0) return '—';
+  const n = Number(bytes);
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u += 1; }
+  return `${v.toFixed(v < 100 ? 1 : 0)} ${units[u]}`;
+}
+
+/**
+ * One volume: a multi-colour bar whose segments are the measured categories,
+ * plus a legend built from the same list so the two cannot disagree.
+ *
+ * Free space is drawn as the remainder of the track rather than as a segment, so
+ * the bar reads as "how full is this" at a glance.
+ */
+function volumeMarkup(vol) {
+  const total = vol.totalBytes || 0;
+  const pct = (b) => (total ? Math.max(0, (b / total) * 100) : 0);
+  const segments = (vol.segments || []).filter((s) => s.bytes > 0);
+  const bars = segments.map((s) => `<span class="seg" style="width:${pct(s.bytes).toFixed(3)}%;background:${s.color}"
+      title="${s.label}: ${bytesText(s.bytes)}"></span>`).join('');
+  const legend = segments.concat(
+    vol.freeBytes ? [{ key: 'free', label: 'Free', color: 'var(--track)', bytes: vol.freeBytes }] : []
+  ).map((s) => `<span class="legend-item"><span class="legend-dot" style="background:${s.color}"></span>${s.label}
+      <span class="mono muted">${bytesText(s.bytes)}</span></span>`).join('');
+
+  const note = vol.categorised
+    ? ''
+    : vol.removable
+      ? 'Android measures categories for internal storage only, so a card shows total usage.'
+      : 'Category sizes are unavailable on this device, so only total usage is shown.';
+
+  return `
+    <div class="volume">
+      <div class="volume-head">
+        <span class="volume-name">${vol.label}${vol.removable ? '' : ''}</span>
+        <span class="mono muted tiny">${bytesText(vol.usedBytes)} of ${bytesText(vol.totalBytes)}
+          · ${bytesText(vol.freeBytes)} free</span>
+      </div>
+      <div class="seg-track">${bars}</div>
+      <div class="legend">${legend}</div>
+      ${note ? `<div class="muted tiny">${note}</div>` : ''}
+    </div>`;
+}
 
 async function loadDashboard() {
   const serial = state.selected;
-  const [info, battery, perf, hw, storage] = await Promise.all([
-    window.api.getDeviceInfo(serial),
-    window.api.getBattery(serial),
-    window.api.getPerformance(serial),
-    window.api.getHardware(serial),
-    window.api.getStorageBreakdown(serial),
+  if (!serial) return;
+  renderLaunchers();
+
+  const [telemetry, specs] = await Promise.all([
+    window.api.getTelemetry(serial).then((t) => t, (e) => ({ error: e.message })),
+    loadSpecs(serial),
   ]);
+  const { hw, info, soc } = specs;
+  const power = telemetry.error ? {} : (telemetry.power || {});
+  const perf = telemetry.error ? {} : (telemetry.perf || {});
 
-  el('dash-model').textContent = info['ro.product.model'] || serial;
-  el('dash-serial').textContent = `SN: ${serial}`;
-  el('dash-android').textContent = `Android ${info['ro.build.version.release'] || '?'} (API ${info['ro.build.version.sdk'] || '?'})`;
-  el('dash-ip').textContent = info.ip ? `${info.ip}` : '';
+  // --- identity -------------------------------------------------------------
+  const wireless = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+  setText('dash-model', (info['ro.product.model'] || serial).replace(/_/g, ' '));
+  const codename = el('dash-codename');
+  codename.textContent = info['ro.product.manufacturer'] || '';
+  codename.classList.toggle('hidden', !codename.textContent);
+  setText('dash-transport', wireless ? 'Wireless debugging' : 'USB debugging');
+  setText('dash-android', info['ro.build.version.release']
+    ? `Android ${info['ro.build.version.release']} (API ${info['ro.build.version.sdk'] || '?'})`
+    : 'Android ?');
+  setText('dash-serial', `SN: ${info['ro.boot.serialno'] || serial}`);
+  setText('dash-ip', info.ip || '');
+  setText('dash-secpatch', info['ro.build.version.security_patch'] || 'Not reported');
+  setText('dash-selinux', info.selinux || 'Unknown');
+  setText('dash-bootloader', info.bootloaderLocked === '1' ? 'Locked'
+    : info.bootloaderLocked === '0' ? 'Unlocked' : 'Unknown');
+  setText('dash-transport-detail', wireless ? `TCP/IP · ${serial}` : 'USB');
 
-  const infoGrid = el('dash-info-grid');
-  infoGrid.innerHTML = '';
-  const rows = [
-    ['Manufacturer', info['ro.product.manufacturer']],
-    ['Bootloader', info.bootloaderLocked === '1' ? 'Locked' : info.bootloaderLocked === '0' ? 'Unlocked' : 'Unknown'],
-    ['Security patch', info['ro.build.version.security_patch']],
-    ['CPU ABI', info['ro.product.cpu.abi']],
-  ];
-  rows.forEach(([k, v]) => {
-    const cell = document.createElement('div');
-    cell.className = 'data-cell';
-    cell.innerHTML = `<span class="k">${k}</span><span class="v">${v || '—'}</span>`;
-    infoGrid.appendChild(cell);
-  });
+  // --- battery --------------------------------------------------------------
+  const level = power.level ?? 0;
+  const ring = el('battery-ring');
+  ring.style.setProperty('--pct', level);
+  ring.classList.toggle('critical', level <= 15);
+  ring.classList.toggle('warn', level > 15 && level <= 35);
+  setText('battery-pct', power.level === null || power.level === undefined ? '—' : `${power.level}%`);
+  setText('dash-batt-eta', formatEta(power.minutesRemaining, power.charging));
+  const battStatus = el('dash-batt-status');
+  battStatus.textContent = power.charging ? 'Charging' : 'On battery';
+  battStatus.classList.toggle('badge-online', !!power.charging);
 
-  const level = Number(battery.level || 0);
-  el('battery-ring').style.setProperty('--pct', level);
-  el('battery-pct').textContent = `${level}%`;
-  el('dash-batt-status').textContent = /2|charg/i.test(battery.status || '') ? 'Charging' : 'On battery';
-  el('dash-health').textContent = battery.health || '—';
-  el('dash-cycles').textContent = battery['cycle count'] || 'N/A';
-  el('dash-temp').textContent = battery.temperature ? `${(Number(battery.temperature) / 10).toFixed(1)}°C` : '—';
-  el('dash-voltage').textContent = battery.voltage ? `${(Number(battery.voltage) / 1000).toFixed(2)} V` : '—';
+  // A measured draw when the gauge publishes one; otherwise the negotiated
+  // ceiling, marked "≤" so it is never read as a measurement.
+  setText('dash-watts', power.watts ? `${power.watts.toFixed(1)} W`
+    : power.maxChargeWatts ? `≤ ${power.maxChargeWatts.toFixed(0)} W` : '—');
+  setText('dash-temp', power.batteryTemp === null || power.batteryTemp === undefined
+    ? '—' : `${power.batteryTemp.toFixed(1)}°C`);
+  const health = healthLabel(power);
+  const healthEl = el('dash-health');
+  healthEl.textContent = health.text;
+  healthEl.className = 'v' + (health.pct === null ? ''
+    : health.pct >= 85 ? ' good' : health.pct >= 70 ? ' warn' : ' bad');
+  setText('dash-cycles', power.cycleCount ?? 'Not counted');
+  el('dash-cycles').title = (power.notes || {}).cycleCount || '';
 
-  el('dash-procs').textContent = perf.processCount ? `${perf.processCount} processes` : '';
-  el('dash-load').textContent = perf.loadavg || '—';
-  const usedGb = Number(hw.ramUsedGb || 0);
-  const totalGb = Number(hw.ramTotalGb || 0);
-  el('dash-mem').textContent = totalGb ? `${usedGb} / ${totalGb} GB` : '—';
-  el('mem-bar').style.width = totalGb ? `${Math.min(100, (usedGb / totalGb) * 100)}%` : '0%';
+  // --- CPU ------------------------------------------------------------------
+  setText('dash-procs', perf.processCount ? `${perf.processCount} processes` : '');
+  const load = perf.cpuOverallPct;
+  setText('dash-load', load === null || load === undefined ? '—' : `${load}%`);
+  el('dash-load-bar').style.width = `${load || 0}%`;
+  const socTemp = perf.socTempC ?? power.socTemp ?? null;
+  setText('dash-soc-temp', socTemp === null ? '—' : `${socTemp.toFixed(1)}°C`);
 
-  const storeUsed = Number(hw.storageUsedGb || 0);
-  const storeTotal = Number(hw.storageTotalGb || 0);
-  el('dash-storage-total').textContent = storeTotal ? `${storeUsed} / ${storeTotal} GB` : '';
-  el('storage-bar').style.width = storeTotal ? `${Math.min(100, (storeUsed / storeTotal) * 100)}%` : '0%';
+  const cores = perf.cores || [];
+  setText('dash-cores-label', cores.length
+    ? `${cores.length}-core cluster frequencies${soc.clusterSummary ? ` · ${soc.clusterSummary}` : ''}`
+    : 'Per-core load is not readable on this device');
+  const coreGrid = el('dash-cores');
+  coreGrid.innerHTML = cores.map((c) => {
+    const pct = c.pct === null || c.pct === undefined ? null : c.pct;
+    const hue = pct === null ? 'var(--track)' : pct >= 80 ? 'var(--cat-system)'
+      : pct >= 45 ? 'var(--cat-videos)' : 'var(--cat-photos)';
+    return `<div class="core${c.online ? '' : ' offline'}" title="${
+      c.online ? `Core ${c.index}` : `Core ${c.index} — offline (parked by the kernel)`}">
+      <div class="core-bar"><span style="height:${pct === null ? 0 : pct}%;background:${hue}"></span></div>
+      <span class="core-pct mono">${pct === null ? '—' : `${pct}%`}</span>
+      <span class="core-name mono muted">C${c.index}</span>
+      <span class="core-ghz mono muted">${c.curGhz ? `${c.curGhz.toFixed(2)}` : '—'}</span>
+    </div>`;
+  }).join('');
 
-  const breakdownGrid = el('storage-breakdown-grid');
-  breakdownGrid.innerHTML = '';
-  Object.entries(storage).forEach(([k, v]) => {
-    const cell = document.createElement('div');
-    cell.className = 'data-cell';
-    cell.innerHTML = `<span class="k">${k}</span><span class="v">${v || '—'}</span>`;
-    breakdownGrid.appendChild(cell);
-  });
+  // --- RAM ------------------------------------------------------------------
+  setText('dash-ram-title', soc.ddrType ? `${soc.ddrType} system memory` : 'System memory');
+  const memPct = perf.memUsedPct;
+  const memBadge = el('dash-mem-pct');
+  memBadge.textContent = memPct === null || memPct === undefined ? '' : `${memPct}% utilised`;
+  memBadge.className = 'badge' + (memPct >= 90 ? ' badge-bad' : memPct >= 75 ? ' badge-warn' : '');
+  setText('dash-mem', perf.memTotalBytes
+    ? `${bytesText(perf.memUsedBytes)} / ${bytesText(perf.memTotalBytes)}`
+    : (hw.ramTotalGb ? `${hw.ramUsedGb || '?'} / ${hw.ramTotalGb} GB` : '—'));
+  el('mem-bar').style.width = `${memPct || 0}%`;
+  // kernel vs app PSS, which only `dumpsys meminfo` knows. Absent on some builds,
+  // so the cells are only drawn when the split was actually measured.
+  const split = [
+    ['Android OS &amp; system', perf.kernelBytes],
+    ['Foreground apps', perf.appBytes],
+    ['Swap in use', perf.swapUsedBytes],
+    ['Available', perf.memAvailableBytes],
+  ].filter(([, v]) => Number.isFinite(v) && v > 0);
+  el('dash-mem-split').innerHTML = split
+    .map(([k, v]) => `<div class="data-cell"><span class="k">${k}</span><span class="v">${bytesText(v)}</span></div>`)
+    .join('');
+
+  if (telemetry.error) setText('dash-storage-note', `Telemetry unavailable: ${telemetry.error}`);
 }
+
+// Storage is polled on a much longer cycle than CPU/RAM: `df` is cheap but the
+// category split behind it comes from a cache Android rebuilds on its own
+// schedule, so a 1 s poll would spend adb round trips on a number that cannot
+// have moved.
+let storageInFlight = false;
+
+async function loadStorage() {
+  const serial = state.selected;
+  if (!serial || storageInFlight) return;
+  storageInFlight = true;
+  try {
+    const report = await window.api.getStorage(serial);
+    const volumes = report.volumes || [];
+    el('dash-volumes').innerHTML = volumes.length
+      ? volumes.map(volumeMarkup).join('')
+      : '<div class="muted">Storage could not be read from this device.</div>';
+    setText('dash-storage-note', volumes.length
+      ? [
+        report.diskstatsAvailable ? 'Category sizes from dumpsys diskstats' : 'Totals from df',
+        report.sdPresent ? 'SD card mounted'
+          : report.sdDetected ? 'SD card detected but not mounted' : 'No removable card',
+      ].join(' · ')
+      : '');
+  } catch (e) {
+    el('dash-volumes').innerHTML = `<div class="muted">Storage unavailable: ${e.message}</div>`;
+  } finally {
+    storageInFlight = false;
+  }
+}
+
+let dashboardTimer = null;
+let dashboardInFlight = false;
+let dashboardTicks = 0;
+
+function startDashboardPolling() {
+  stopDashboardPolling();
+  dashboardTicks = 0;
+  dashboardTimer = setInterval(async () => {
+    if (state.activeView !== 'dashboard' || !state.selected) { stopDashboardPolling(); return; }
+    // A device on a slow link can take longer than the interval to answer.
+    // Without this the ticks would queue and every one of them would time out.
+    if (dashboardInFlight) return;
+    dashboardInFlight = true;
+    try {
+      await loadDashboard();
+      dashboardTicks += 1;
+      if (dashboardTicks % 30 === 0) await loadStorage();
+    } finally {
+      dashboardInFlight = false;
+    }
+  }, 1000);
+}
+
+function stopDashboardPolling() {
+  if (dashboardTimer) clearInterval(dashboardTimer);
+  dashboardTimer = null;
+}
+
+el('dash-refresh').onclick = async (e) => {
+  const btn = e.currentTarget;
+  btn.classList.add('spinning');
+  // Drop the cached static specs too, so this button is a genuine re-read rather
+  // than a repaint of the same numbers.
+  specsCache.delete(state.selected);
+  try {
+    await refreshDevices();
+    if (state.selected) { await loadDashboard(); await loadStorage(); }
+  } finally {
+    btn.classList.remove('spinning');
+  }
+};
+
+el('dash-disconnect').onclick = async () => {
+  const serial = state.selected;
+  if (!serial) return;
+  const res = await window.api.disconnectDevice(serial);
+  specsCache.delete(serial);
+  if (res.disconnected) {
+    stopDashboardPolling();
+    state.selected = null;
+  }
+  // A USB device stays attached until the cable comes out, so say so rather than
+  // pretending the button did something.
+  if (res.message) toast(res.message);
+  await refreshDevices();
+};
 
 // ---------------------------------------------------------------- hardware view
 
 const fmt = (v, digits = 2) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? '—' : Number(v).toFixed(digits));
-const setText = (id, value) => { el(id).textContent = value; };
 
 function formatEta(minutes, charging) {
   if (!minutes) return '';
@@ -238,26 +656,55 @@ function healthLabel(power) {
   if (power.healthPct !== null && power.healthPct !== undefined) {
     return { text: `${power.healthPct}%${name ? ` (${name})` : ''}`, pct: power.healthPct };
   }
+  // Derived from charge_counter rather than a published charge_full, so it is
+  // shown with a "≈" — the number is real arithmetic on real readings, but its
+  // input is the level, which the gauge rounds to a whole percent.
+  if (power.estimatedHealthPct !== null && power.estimatedHealthPct !== undefined) {
+    return {
+      text: `≈ ${power.estimatedHealthPct}%${name ? ` (${name})` : ''}`,
+      pct: power.estimatedHealthPct,
+    };
+  }
   return { text: name || '—', pct: null };
 }
 
 let hardwareTimer = null;
+// Model name, chipset, display and Android version cannot change while a device
+// stays connected, so they are fetched once per serial instead of on every tick.
+// Re-fetching them was most of the lag the user was seeing: `device:info` alone
+// used to be nine sequential adb round trips.
+const specsCache = new Map();
+
+async function loadSpecs(serial) {
+  if (specsCache.has(serial)) return specsCache.get(serial);
+  const [hw, info, soc] = await Promise.all([
+    window.api.getHardware(serial).catch(() => ({})),
+    window.api.getDeviceInfo(serial).catch(() => ({})),
+    window.api.getSoc(serial).catch(() => ({})),
+  ]);
+  const specs = { hw, info, soc };
+  specsCache.set(serial, specs);
+  return specs;
+}
 
 async function loadHardware() {
   const serial = state.selected;
   if (!serial) return;
 
-  const [power, hw, info, soc] = await Promise.all([
-    window.api.getPower(serial).catch((e) => ({ error: e.message })),
-    window.api.getHardware(serial).catch(() => ({})),
-    window.api.getDeviceInfo(serial).catch(() => ({})),
-    window.api.getSoc(serial).catch(() => ({})),
+  // The live half is one IPC call and one batched adb round trip; the static
+  // half resolves from cache after the first load.
+  const [telemetry, specs] = await Promise.all([
+    window.api.getTelemetry(serial).then((t) => t, (e) => ({ error: e.message })),
+    loadSpecs(serial),
   ]);
 
-  if (power.error) {
-    setText('hw-source-note', `Could not read power telemetry: ${power.error}`);
+  if (telemetry.error) {
+    setText('hw-source-note', `Could not read power telemetry: ${telemetry.error}`);
     return;
   }
+  const power = telemetry.power || {};
+  const perf = telemetry.perf || {};
+  const { hw, info, soc } = specs;
 
   // --- battery power station -------------------------------------------------
   const level = power.level ?? 0;
@@ -284,11 +731,20 @@ async function loadHardware() {
     health.pct === null ? '' : health.pct >= 85 ? ' good' : health.pct >= 70 ? ' warn' : ' bad'
   );
 
-  setText('hw-capacity', power.chargeFullMah
-    ? `${power.chargeFullMah} / ${power.chargeDesignMah || '?'} mAh`
-    : (power.chargeDesignMah ? `${power.chargeDesignMah} mAh design` : '—'));
+  const notes = power.notes || {};
 
-  setText('hw-cycles', power.cycleCount ?? 'Not exposed');
+  // Full capacity: a measured charge_full when the gauge publishes one, else the
+  // value implied by charge_counter at the current level — labelled "≈" so an
+  // estimate is never mistaken for a reading.
+  const currentMah = power.chargeNowMah ?? power.estimatedNowMah;
+  const totalMah = power.chargeFullMah ?? power.estimatedFullMah ?? power.chargeDesignMah;
+  setText('hw-capacity', totalMah
+    ? `${currentMah ?? '—'} / ${totalMah} mAh`
+    : '—');
+  el('hw-capacity').title = notes.chargeFullMah || '';
+
+  setText('hw-cycles', power.cycleCount ?? 'Not counted');
+  el('hw-cycles').title = notes.cycleCount || '';
   setText('hw-tech', power.technology || '—');
 
   // --- electrical & thermal telemetry ---------------------------------------
@@ -296,15 +752,23 @@ async function loadHardware() {
   setText('hw-voltage', fmt(power.voltage, 2));
   setText('hw-voltage-mv', power.voltageMv ? `${power.voltageMv} mV` : '');
   setText('hw-current', fmt(power.current, 2));
-  setText('hw-current-ma', power.currentMa ? `${power.charging ? '+' : '−'}${power.currentMa} mA` : '');
+  setText('hw-current-ma', power.currentMa
+    ? `${power.charging ? '+' : '−'}${power.currentMa} mA`
+    // With no measured draw, show the negotiated ceiling instead — clearly
+    // marked, because a ceiling is what the charger *allows*, not what flows.
+    : power.maxChargeWatts ? `up to ${fmt(power.maxChargeWatts, 0)} W negotiated` : '');
+  el('hw-watts').title = notes.watts || '';
+  el('hw-current').title = notes.current || '';
 
   setText('hw-temp', fmt(power.batteryTemp, 1));
   setText('hw-temp-sub', power.batteryTemp === null
     ? ''
     : `${(power.batteryTemp * 9 / 5 + 32).toFixed(1)}°F · ${power.batteryTemp >= 43 ? 'Hot' : power.batteryTemp >= 38 ? 'Warm' : 'Normal'}`);
 
-  setText('hw-soc-temp', fmt(power.socTemp, 1));
-  setText('hw-soc-zone', power.socZone ? `zone: ${power.socZone}` : 'Not exposed');
+  const socTemp = power.socTemp ?? perf.socTempC ?? null;
+  setText('hw-soc-temp', fmt(socTemp, 1));
+  setText('hw-soc-zone', power.socZone ? `zone: ${power.socZone}` : 'No SoC thermal zone');
+  el('hw-soc-temp').title = notes.socTemp || '';
 
   setText('hw-protocol', power.protocol || (power.charging ? 'USB (unreported)' : 'Not charging'));
   const inputBits = [
@@ -318,9 +782,14 @@ async function loadHardware() {
   rate.textContent = power.watts ? `${power.watts >= 15 ? 'Fast charge' : 'Charging'} (${fmt(power.watts, 1)} W)` : '';
   rate.style.color = power.watts >= 15 ? 'var(--accent)' : 'var(--signal)';
 
-  setText('hw-source-note', power.sysfsAvailable
-    ? `Power measurements read directly from the Android kernel power-supply subsystem (${power.source}).`
-    : 'Kernel power-supply nodes are not readable on this device — values fall back to "dumpsys battery", so current and wattage may be missing.');
+  // Name the source that actually answered rather than assuming sysfs, and only
+  // apologise for what is genuinely missing.
+  const sourceBits = [];
+  if (power.sysfsAvailable) sourceBits.push('kernel power-supply nodes');
+  if (power.healthHal) sourceBits.push(power.healthHal);
+  if (!sourceBits.length) sourceBits.push('dumpsys battery');
+  const gaps = Object.values(notes);
+  setText('hw-source-note', `Read from ${sourceBits.join(' + ')}.${gaps.length ? ` ${gaps[0]}` : ''}`);
 
   // --- processor & device specs --------------------------------------------
   setText('hw-chipset', soc.socName || info['ro.board.platform'] || '—');
@@ -332,10 +801,14 @@ async function loadHardware() {
   setText('hw-display', hw.resolution ? `${hw.resolution} pixels` : '—');
   setText('hw-display-sub', hw.density ? `${hw.density} dpi` : '');
 
-  setText('hw-ram', hw.ramTotalGb ? `${hw.ramTotalGb} GB` : '—');
+  // RAM total is static, but "in use" is not — take it from the live telemetry
+  // so it moves with the 1 s poll instead of sitting at the first reading.
+  const gb = (bytes) => (bytes ? (bytes / 1073741824).toFixed(1) : null);
+  setText('hw-ram', gb(perf.memTotalBytes) ? `${gb(perf.memTotalBytes)} GB` : (hw.ramTotalGb ? `${hw.ramTotalGb} GB` : '—'));
   setText('hw-ram-sub', [
     soc.ddrType ? `DDR type ${soc.ddrType}` : null,
-    hw.ramUsedGb ? `${hw.ramUsedGb} GB in use` : null,
+    gb(perf.memUsedBytes) ? `${gb(perf.memUsedBytes)} GB in use` : (hw.ramUsedGb ? `${hw.ramUsedGb} GB in use` : null),
+    perf.cpuOverallPct === null || perf.cpuOverallPct === undefined ? null : `CPU ${perf.cpuOverallPct}%`,
   ].filter(Boolean).join(' · '));
 
   setText('hw-storage', hw.storageTotalGb ? `${hw.storageTotalGb} GB` : '—');
@@ -359,12 +832,22 @@ async function loadHardware() {
 
 // Telemetry is only meaningful live, so poll while the view is on screen and
 // stop as soon as the user navigates away.
+//
+// 1 s rather than 3 s: the live half is now a single batched adb round trip
+// (~250 ms including the 0.4 s on-device sampling sleep for /proc/stat), so a
+// 3 s gap was mostly idle waiting. `inFlight` keeps a slow device from stacking
+// up overlapping reads, which would make the display lag further behind rather
+// than catch up.
+let hardwareInFlight = false;
+
 function startHardwarePolling() {
   stopHardwarePolling();
-  hardwareTimer = setInterval(() => {
-    if (state.activeView === 'hardware' && state.selected) loadHardware();
-    else stopHardwarePolling();
-  }, 3000);
+  hardwareTimer = setInterval(async () => {
+    if (state.activeView !== 'hardware' || !state.selected) { stopHardwarePolling(); return; }
+    if (hardwareInFlight) return;
+    hardwareInFlight = true;
+    try { await loadHardware(); } finally { hardwareInFlight = false; }
+  }, 1000);
 }
 
 function stopHardwarePolling() {
@@ -372,6 +855,47 @@ function stopHardwarePolling() {
 }
 
 // ----------------------------------------------------------------------- files
+
+function formatSize(bytes) {
+  if (bytes === null || bytes === undefined) return '';
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024, u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return v.toFixed(v < 10 ? 1 : 0) + ' ' + units[u];
+}
+
+const EXT_ICON = {
+  jpg: '\uD83D\uDF9C', jpeg: '\uD83D\uDF9C', png: '\uD83D\uDF9C', gif: '\uD83D\uDF9C', webp: '\uD83D\uDF9C',
+  mp4: '\uD83C\uDFAC', mkv: '\uD83C\uDFAC', avi: '\uD83C\uDFAC', mov: '\uD83C\uDFAC',
+  mp3: '\uD83C\uDFB5', flac: '\uD83C\uDFB5', aac: '\uD83C\uDFB5', wav: '\uD83C\uDFB5',
+  pdf: '\uD83D\uDCC4', doc: '\uD83D\uDCC4', docx: '\uD83D\uDCC4', txt: '\uD83D\uDCDD', md: '\uD83D\uDCDD',
+  zip: '\uD83D\uDCE6', rar: '\uD83D\uDCE6', '7z': '\uD83D\uDCE6', tar: '\uD83D\uDCE6',
+  apk: '\uD83E\uDD16', json: '\uD83D\uDCCB', xml: '\uD83D\uDCCB', js: '\uD83D\uDCCB',
+};
+function fileIcon(name, isDir, isLink) {
+  if (isLink) return '\uD83D\uDD17';
+  if (isDir) return '\uD83D\uDCC1';
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return EXT_ICON[ext] || '\uD83D\uDCC4';
+}
+
+// Multi-select state
+state.selectedFiles = new Set();
+
+function updateFileToolbar() {
+  const count = state.selectedFiles.size;
+  el('file-sel-count').textContent = count ? count + ' selected' : '';
+  const dlBtn = el('file-download-btn');
+  const upBtn = el('file-upload-btn');
+  if (dlBtn) dlBtn.disabled = count === 0;
+  if (upBtn) upBtn.disabled = count === 0;
+  // count actual files (not dirs) for download
+  const fileCount = count - [...state.selectedFiles].filter((p) => p._isDir).length;
+  if (dlBtn) dlBtn.disabled = fileCount === 0;
+}
 
 qAll('#file-category-tabs .chip-tab').forEach((tab) => {
   tab.onclick = () => {
@@ -384,139 +908,801 @@ qAll('#file-category-tabs .chip-tab').forEach((tab) => {
 
 el('list-files-btn').onclick = loadFiles;
 el('push-file-btn').onclick = async () => {
-  await window.api.pushFile(state.selected, el('remote-path').value);
+  if (!state.selected) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPushProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      label.textContent = 'Uploading ' + data.name + '...';
+    } else {
+      fill.style.background = '';
+      fill.style.width = data.percent + '%';
+      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%');
+    }
+  });
+  try {
+    const result = await window.api.pushFile(state.selected, el('remote-path').value);
+    if (result) { toast('Uploaded ' + result.split('/').pop()); label.textContent = 'Done \u2014 ' + result; }
+    else { label.textContent = 'Cancelled.'; }
+  } catch (err) { label.textContent = 'Error: ' + err.message; }
   loadFiles();
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 3000);
 };
+
+// Select-all checkbox
+const selectAllCb = el('file-select-all');
+if (selectAllCb) selectAllCb.onchange = () => {
+  const cbs = qAll('#file-list .file-cb');
+  cbs.forEach((cb) => { cb.checked = selectAllCb.checked; });
+  syncFileSelection();
+};
+
+function syncFileSelection() {
+  state.selectedFiles.clear();
+  qAll('#file-list .list-row').forEach((row) => {
+    const cb = row.querySelector('.file-cb');
+    if (cb && cb.checked) {
+      const fp = row.dataset.fullpath;
+      const isDir = row.dataset.isdir === '1';
+      const item = { path: fp, name: row.dataset.name, _isDir: isDir };
+      state.selectedFiles.add(item);
+    }
+  });
+  updateFileToolbar();
+}
 
 async function loadFiles() {
   const remotePath = el('remote-path').value;
   const container = el('file-list');
-  container.innerHTML = '<span class="muted">Listing…</span>';
+  container.innerHTML = '<span class="muted">Listing\u2026</span>';
+  state.selectedFiles.clear();
+  updateFileToolbar();
+  if (selectAllCb) selectAllCb.checked = false;
   try {
     const lines = await window.api.listFiles(state.selected, remotePath);
     container.innerHTML = '';
-    lines.forEach((line) => {
-      const cols = line.split(/\s+/);
-      const name = cols.slice(8).join(' ') || line;
-      if (!name || name === '.' || name === '..') return;
-      const size = cols[4] || '';
+    const parsed = lines.map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return null;
+      const parts = trimmed.split(/\s+/);
+      if (parts.length < 8) return { isDir: false, isLink: false, size: null, name: trimmed };
+      const perms = parts[0];
+      const isLink = perms.charAt(0) === 'l';
+      const isDir = perms.charAt(0) === 'd';
+      const size = Number.isFinite(Number(parts[4])) ? Number(parts[4]) : null;
+      const name = parts.slice(7).join(' ').replace(/\s*->\s*.*$/, '').trim();
+      return { isDir, isLink, size, name };
+    }).filter(Boolean);
+    parsed.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    parsed.forEach((item) => {
+      if (!item.name || item.name === '.' || item.name === '..') return;
       const row = document.createElement('div');
       row.className = 'list-row';
-      row.innerHTML = `<span class="name" title="${line}">${name}</span><span class="meta">${size}</span>`;
-      const fullPath = remotePath.replace(/\/?$/, '/') + name;
-      row.onclick = () => selectFile(name, fullPath);
+      const icon = fileIcon(item.name, item.isDir, item.isLink);
+      const sizeStr = formatSize(item.size);
+      const fullPath = remotePath.replace(/\/?$/, '/') + item.name;
+      row.dataset.fullpath = fullPath;
+      row.dataset.name = item.name;
+      row.dataset.isdir = item.isDir ? '1' : '0';
+      row.innerHTML = '<input type="checkbox" class="file-cb" /><span class="name"><span class="file-icon">' + icon + '</span><span class="fname">' + esc(item.name) + '</span></span><span class="meta">' + sizeStr + '</span>';
+      const cb = row.querySelector('.file-cb');
+      cb.onclick = (e) => { e.stopPropagation(); syncFileSelection(); };
+      row.onclick = (e) => {
+        if (e.target.tagName === 'INPUT') return;
+        if (item.isDir) {
+          el('remote-path').value = fullPath;
+          loadFiles();
+        } else {
+          selectFile(item.name, fullPath, item);
+        }
+      };
       container.appendChild(row);
     });
-    if (!container.children.length) container.innerHTML = '<span class="muted">Empty or inaccessible folder.</span>';
+    if (remotePath !== '/') {
+      const upRow = document.createElement('div');
+      upRow.className = 'list-row';
+      upRow.innerHTML = '<span class="name"><span class="file-icon">\uD83D\uDCC1</span><span class="fname">\u2026 (parent)</span></span>';
+      upRow.onclick = () => {
+        const parent = remotePath.replace(/\/?$/, '').replace(/[^/]+$/, '') || '/';
+        el('remote-path').value = parent;
+        loadFiles();
+      };
+      container.insertBefore(upRow, container.firstChild);
+    }
+    if (!container.querySelectorAll('.list-row').length) container.innerHTML = '<span class="muted">Empty or inaccessible folder.</span>';
+    updateBreadcrumb(remotePath);
   } catch (err) {
-    container.innerHTML = `<span class="muted">${err.message}</span>`;
+    container.innerHTML = '<span class="muted">' + esc(err.message) + '</span>';
   }
 }
 
-async function selectFile(name, fullPath) {
+async function selectFile(name, fullPath, itemInfo) {
   state.selectedFile = { name, fullPath };
   qAll('#file-list .list-row').forEach((r) => r.classList.remove('selected'));
   el('file-inspector-empty').classList.add('hidden');
   el('file-inspector-body').classList.remove('hidden');
   el('fi-name').textContent = name;
   el('fi-path').textContent = fullPath;
+  const fiType = el('fi-type');
+  if (fiType) fiType.textContent = itemInfo ? (itemInfo.isDir ? 'Folder' : 'File') : 'File';
+  const fiSize = el('fi-size');
+  if (fiSize) fiSize.textContent = itemInfo ? formatSize(itemInfo.size) : '';
 
-  const img = el('file-preview-img');
-  img.classList.add('hidden');
+  const container = el('file-preview-container');
+  container.innerHTML = '';
+  if (itemInfo && itemInfo.isDir) return;
+
   try {
-    const dataUrl = await window.api.previewFile(state.selected, fullPath);
-    if (dataUrl) {
-      img.src = dataUrl;
-      img.classList.remove('hidden');
+    const result = await window.api.previewFile(state.selected, fullPath);
+    if (!result) return;
+    if (result.kind === 'image') {
+      const img = document.createElement('img');
+      img.className = 'preview-image';
+      img.src = result.data;
+      container.appendChild(img);
+    } else if (result.kind === 'video') {
+      const vid = document.createElement('video');
+      vid.className = 'preview-video';
+      vid.controls = true;
+      vid.src = result.data;
+      container.appendChild(vid);
+    } else if (result.kind === 'text') {
+      const pre = document.createElement('pre');
+      pre.className = 'preview-text';
+      pre.textContent = result.data;
+      container.appendChild(pre);
+    } else if (result.kind === 'pdf') {
+      const iframe = document.createElement('iframe');
+      iframe.className = 'preview-pdf';
+      iframe.src = result.data;
+      container.appendChild(iframe);
     }
-  } catch { /* not an image or unreadable — skip preview */ }
+  } catch { /* not previewable */ }
 }
 
-el('fi-pull-btn').onclick = () => state.selectedFile && window.api.pullFile(state.selected, state.selectedFile.fullPath);
+// Single-file download
+el('fi-pull-btn').onclick = async () => {
+  if (!state.selectedFile) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPullProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      const dl = data.bytes ? formatSize(data.bytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '');
+    } else {
+      fill.style.background = '';
+      fill.style.width = data.percent + '%';
+      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%');
+    }
+  });
+  try {
+    const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath);
+    if (saved) { toast('Saved to ' + saved); label.textContent = 'Done \u2014 ' + saved; }
+    else { label.textContent = 'Cancelled.'; }
+  } catch (err) { label.textContent = 'Error: ' + err.message; }
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+};
+
+// Batch download
+el('file-download-btn').onclick = async () => {
+  const files = [...state.selectedFiles].filter((f) => !f._isDir);
+  if (!files.length) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPullProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      const dl = data.bytes ? formatSize(data.bytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    } else {
+      fill.style.background = '';
+      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
+      fill.style.width = overall + '%';
+      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    }
+  });
+  try {
+    const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop() })));
+    if (res) {
+      const ok = res.results.filter((r) => r.ok).length;
+      const fail = res.results.filter((r) => !r.ok).length;
+      label.textContent = 'Done: ' + ok + ' saved' + (fail ? ', ' + fail + ' failed' : '') + ' to ' + res.destDir;
+      toast('Downloaded ' + ok + ' file(s) to ' + res.destDir);
+    } else {
+      label.textContent = 'Download cancelled.';
+    }
+  } catch (err) {
+    label.textContent = 'Error: ' + err.message;
+  }
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+};
+
+// Batch upload
+async function uploadFiles(filePaths) {
+  if (!filePaths || !filePaths.length || !state.selected) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPushProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      const ul = data.bytes ? formatSize(data.bytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    } else {
+      fill.style.background = '';
+      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
+      fill.style.width = overall + '%';
+      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    }
+  });
+  try {
+    const results = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths);
+    if (results && results.length) {
+      const ok = results.filter((r) => r.ok).length;
+      const fail = results.filter((r) => !r.ok).length;
+      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
+      toast('Uploaded ' + ok + ' file(s)');
+      loadFiles();
+    } else {
+      label.textContent = 'Upload cancelled.';
+    }
+  } catch (err) {
+    label.textContent = 'Error: ' + err.message;
+  }
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+}
+
+el('file-upload-btn').onclick = async () => {
+  if (!state.selected) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPushProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      label.textContent = 'Uploading ' + data.name + ' (' + (data.index + 1) + '/' + data.total + ')';
+    } else {
+      fill.style.background = '';
+      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
+      fill.style.width = overall + '%';
+      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    }
+  });
+  try {
+    const results = await window.api.pushBatch(state.selected, el('remote-path').value);
+    if (results && results.length) {
+      const ok = results.filter((r) => r.ok).length;
+      const fail = results.filter((r) => !r.ok).length;
+      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
+      toast('Uploaded ' + ok + ' file(s)');
+    } else { label.textContent = 'Upload cancelled.'; }
+  } catch (err) { label.textContent = 'Error: ' + err.message; }
+  loadFiles();
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+};
+
+// Drag-and-drop upload
+(function setupDropZone() {
+  const fileList = el('file-list');
+  const overlay = el('file-drop-overlay');
+  if (!fileList || !overlay) return;
+  let dragCounter = 0;
+  fileList.addEventListener('dragenter', (e) => { e.preventDefault(); e.stopPropagation(); dragCounter++; overlay.classList.remove('hidden'); });
+  fileList.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; overlay.classList.add('hidden'); } });
+  fileList.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
+  fileList.addEventListener('drop', (e) => {
+    e.preventDefault(); e.stopPropagation(); dragCounter = 0; overlay.classList.add('hidden');
+    const files = e.dataTransfer.files;
+    if (!files || !files.length) return;
+    const paths = [];
+    for (let i = 0; i < files.length; i++) {
+      const p = window.api.pathForFile(files[i]);
+      if (p) paths.push(p);
+    }
+    if (paths.length) uploadFiles(paths);
+  });
+})();
+
+// Delete
 el('fi-delete-btn').onclick = async () => {
   if (!state.selectedFile) return;
-  if (confirm(`Delete ${state.selectedFile.fullPath} from the device?`)) {
-    await window.api.deleteFile(state.selected, state.selectedFile.fullPath);
-    el('file-inspector-body').classList.add('hidden');
-    el('file-inspector-empty').classList.remove('hidden');
-    loadFiles();
+  if (confirm('Delete ' + state.selectedFile.fullPath + ' from the device?')) {
+    try {
+      await window.api.deleteFile(state.selected, state.selectedFile.fullPath);
+      toast('Deleted ' + state.selectedFile.name);
+      el('file-inspector-body').classList.add('hidden');
+      el('file-inspector-empty').classList.remove('hidden');
+      state.selectedFile = null;
+      loadFiles();
+    } catch (err) {
+      toast('Delete failed: ' + err.message);
+    }
   }
 };
 
+function updateBreadcrumb(path) {
+  const container = el('breadcrumb-path');
+  if (!container) return;
+  const backBtn = el('breadcrumb-back');
+  if (backBtn) {
+    backBtn.disabled = path === '/' || path === '';
+    backBtn.onclick = () => {
+      const parent = path.replace(/\/?$/, '').replace(/[^/]+$/, '') || '/';
+      el('remote-path').value = parent;
+      loadFiles();
+    };
+  }
+  const segments = path.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+  container.innerHTML = '/';
+  let accumulated = '';
+  segments.forEach((seg) => {
+    accumulated += '/' + seg;
+    const span = document.createElement('span');
+    span.textContent = seg;
+    span.style.cursor = 'pointer';
+    span.style.color = 'var(--text-muted)';
+    span.onclick = () => { el('remote-path').value = accumulated; loadFiles(); };
+    span.onmouseover = () => { span.style.color = 'var(--accent)'; };
+    span.onmouseout = () => { span.style.color = 'var(--text-muted)'; };
+    container.appendChild(span);
+    container.appendChild(document.createTextNode('/'));
+  });
+}
+
+async function loadFileStorage() {
+  const container = el('file-storage-list');
+  const note = el('file-storage-note');
+  if (!container || !state.selected) return;
+  try {
+    const report = await window.api.getStorage(state.selected);
+    const volumes = report.volumes || [];
+    container.innerHTML = '';
+    if (note) note.textContent = volumes.length
+      ? [report.diskstatsAvailable ? 'Category sizes from dumpsys diskstats' : 'Totals from df',
+         report.sdPresent ? 'SD card mounted' : report.sdDetected ? 'SD card detected (not mounted)' : 'No removable card'
+        ].join(' \u00b7 ')
+      : '';
+    if (!volumes.length) { container.innerHTML = '<span class="muted">Storage info unavailable.</span>'; return; }
+    volumes.forEach((vol) => {
+      const total = vol.totalBytes || 0;
+      const used = vol.usedBytes || 0;
+      const free = vol.freeBytes || 0;
+      const pct = total ? Math.round((used / total) * 100) : 0;
+      const item = document.createElement('div');
+      item.className = 'file-storage-item';
+      const mountPath = vol.key === 'internal' ? '/storage/emulated/0'
+        : (vol.key && vol.key.startsWith('sd:') ? vol.mount : null);
+      item.innerHTML = '<div style="flex:1;min-width:0;"><div class="fs-label">' + esc(vol.label) + '</div><div class="fs-details">' + bytesText(used) + ' used \u00b7 ' + bytesText(free) + ' free</div><div class="fs-track"><div class="fs-fill" style="width:' + pct + '%;background:' + (pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--accent)' : 'var(--signal)') + '"></div></div></div>';
+      if (mountPath) {
+        item.onclick = () => { el('remote-path').value = mountPath; loadFiles(); };
+      }
+      container.appendChild(item);
+    });
+  } catch (err) {
+    container.innerHTML = '<span class="muted">Could not read storage: ' + esc(err.message) + '</span>';
+    if (note) note.textContent = '';
+  }
+}
+
 // ------------------------------------------------------------------------ apps
+//
+// Everything a row shows is decided in src/apps.js before it crosses IPC —
+// readable label, monogram, avatar colour, type, status, bloat verdict — because
+// the sandboxed renderer cannot require a CommonJS module out of src/. Only the
+// tab predicates are mirrored here; APP_FILTERS in src/apps.js is the source of
+// truth for them and is unit-tested there, so the two have to stay in step.
 
 let appFilter = 'all';
 let appSearch = '';
 let allApps = [];
 
-qAll('#app-category-tabs .chip-tab').forEach((tab) => {
-  tab.onclick = () => {
-    qAll('#app-category-tabs .chip-tab').forEach((t) => t.classList.remove('active'));
-    tab.classList.add('active');
-    appFilter = tab.dataset.filter;
-    renderApps();
-  };
-});
-el('app-search').oninput = (e) => { appSearch = e.target.value.toLowerCase(); renderApps(); };
-el('install-apk-btn').onclick = async () => { await window.api.installApk(state.selected); loadApps(); };
+const APP_TABS = [
+  { key: 'all', label: 'All', test: () => true },
+  { key: 'user', label: 'User', test: (a) => a.type === 'user' },
+  { key: 'system', label: 'System', test: (a) => a.type === 'system' || a.type === 'carrier' },
+  { key: 'bloat', label: 'Bloatware', test: (a) => a.bloat, danger: true },
+  { key: 'disabled', label: 'Frozen', test: (a) => a.status === 'disabled' },
+];
 
-async function loadApps() {
-  const container = el('app-list');
-  container.innerHTML = '<span class="muted">Loading…</span>';
-  try {
-    allApps = await window.api.listAppsDetailed(state.selected);
-    renderApps();
-  } catch (err) {
-    container.innerHTML = `<span class="muted">${err.message}</span>`;
-  }
+// Labels come off the device (a build that prints applicationLabel= is trusted
+// for it), so nothing device-derived is interpolated without escaping.
+const esc = (value) => String(value === null || value === undefined ? '' : value)
+  .replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+const TYPE_LABELS = { user: 'User', system: 'System', carrier: 'Carrier' };
+const STATUS_LABELS = { active: 'Active', disabled: 'Frozen', idle: 'Idle' };
+
+const DERIVED_HINT = 'Name worked out from the package id — Android does not hand app labels to adb.';
+
+// Mirrors isApkPath in src/apps.js. A bundle is still an APK drop even though
+// adb install cannot take one; main.js says so per file rather than the drop
+// being silently ignored.
+const APK_DROP = /\.(apk|apks|apkm|xapk)$/i;
+const baseName = (p) => String(p || '').split(/[\\/]/).pop();
+
+function visibleApps() {
+  const rule = APP_TABS.find((t) => t.key === appFilter) || APP_TABS[0];
+  const q = appSearch.trim().toLowerCase();
+  return allApps.filter((a) => {
+    if (!rule.test(a)) return false;
+    if (!q) return true;
+    return a.pkg.toLowerCase().includes(q) || String(a.label || '').toLowerCase().includes(q);
+  });
+}
+
+// The count lives on the chip and is computed with the very predicate the chip
+// filters by, so a tab can never promise a number its list does not deliver.
+function renderAppTabs() {
+  const host = el('app-category-tabs');
+  host.innerHTML = APP_TABS.map((tab) => {
+    const n = allApps.filter(tab.test).length;
+    const cls = ['chip-tab', tab.danger ? 'chip-bloat' : '', tab.key === appFilter ? 'active' : ''];
+    return `<button class="${cls.filter(Boolean).join(' ')}" data-filter="${tab.key}">${tab.label}
+      <span class="chip-count">${n}</span></button>`;
+  }).join('');
+  qAll('#app-category-tabs .chip-tab').forEach((btn) => {
+    btn.onclick = () => { appFilter = btn.dataset.filter; renderApps(); };
+  });
+}
+
+function appRowMarkup(app) {
+  const guess = app.labelSource === 'derived'
+    ? `<span class="guess-mark" title="${esc(DERIVED_HINT)}">◇</span>` : '';
+  const bloat = app.bloat
+    ? `<span class="bloat-tag" title="${esc(app.bloatReason || 'Preinstalled')}">Bloat</span>` : '';
+  const size = app.apkBytes === null || app.apkBytes === undefined
+    ? '<span class="size-cell num unknown" title="No stat line came back for this APK">—</span>'
+    : `<span class="size-cell num">${bytesText(app.apkBytes)}</span>`;
+  const frozen = app.status === 'disabled';
+  return `
+    <div class="app-ident">
+      <div class="app-avatar" style="background:${esc(app.color)}">${esc(app.monogram)}</div>
+      <div class="app-names">
+        <div class="app-name-line"><span class="app-name">${esc(app.label)}</span>${guess}${bloat}</div>
+        <span class="app-pkg">${esc(app.pkg)}</span>
+      </div>
+    </div>
+    <span class="type-cell type-${esc(app.type)}">${TYPE_LABELS[app.type] || esc(app.type)}</span>
+    <span><span class="status-pill st-${frozen ? 'disabled' : esc(app.status)}">${STATUS_LABELS[app.status] || esc(app.status)}</span></span>
+    ${size}
+    <span class="row-actions actions">
+      <button class="row-icon-btn ${frozen ? 'good' : 'warn'}" data-act="${frozen ? 'enable' : 'disable'}"
+        title="${frozen ? 'Re-enable this app' : 'Freeze (disable for user 0)'}">
+        ${frozen
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>'}
+      </button>
+      <button class="row-icon-btn danger" data-act="uninstall" title="Uninstall via adb">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M10 4h4l1 2H9z"/><path d="M6 6l1 14h10l1-14"/></svg>
+      </button>
+    </span>`;
 }
 
 function renderApps() {
+  renderAppTabs();
   const container = el('app-list');
-  const filtered = allApps.filter((a) => {
-    if (appFilter === 'user' && a.type !== 'user') return false;
-    if (appFilter === 'system' && a.type !== 'system') return false;
-    if (appFilter === 'disabled' && a.status !== 'disabled') return false;
-    if (appSearch && !a.pkg.toLowerCase().includes(appSearch)) return false;
-    return true;
-  });
+  const rows = visibleApps();
+
+  const total = allApps.length;
+  const bloat = allApps.filter((a) => a.bloat).length;
+  setText('apps-summary', total
+    ? `${total} packages · ${bloat} look preinstalled junk · showing ${rows.length}`
+    : '');
+
   container.innerHTML = '';
-  filtered.forEach((app) => {
+  if (!total) {
+    container.innerHTML = '<span class="muted">No packages came back.</span>';
+    return;
+  }
+  if (!rows.length) {
+    container.innerHTML = '<span class="muted">Nothing matches that filter.</span>';
+    return;
+  }
+
+  for (const app of rows) {
     const row = document.createElement('div');
-    row.className = 'list-row';
-    row.innerHTML = `<span class="name">${app.pkg}</span><span class="meta">${app.type} · ${app.status}</span>`;
+    row.className = 'app-row';
+    if (app.status === 'disabled') row.classList.add('is-disabled');
+    if (state.selectedApp && state.selectedApp.pkg === app.pkg) row.classList.add('selected');
+    row.dataset.pkg = app.pkg;
+    row.innerHTML = appRowMarkup(app);
     row.onclick = () => selectApp(app);
+    qAll('.row-icon-btn', row).forEach((btn) => {
+      btn.onclick = (e) => { e.stopPropagation(); runAppAction(btn.dataset.act, app); };
+    });
     container.appendChild(row);
+  }
+}
+
+async function loadApps() {
+  const container = el('app-list');
+  container.innerHTML = '<span class="muted">Reading the package list…</span>';
+  try {
+    allApps = await window.api.listAppsDetailed(state.selected);
+    renderApps();
+    // The inspector is showing a snapshot from before the sweep; refresh it so a
+    // just-frozen app does not keep offering to be frozen.
+    const still = state.selectedApp && allApps.find((a) => a.pkg === state.selectedApp.pkg);
+    if (still) selectApp(still);
+  } catch (err) {
+    allApps = [];
+    container.innerHTML = `<span class="muted">${esc(cleanIpcError(err.message))}</span>`;
+  }
+}
+
+// ---- sideloading
+
+function renderInstallLog(lines) {
+  const log = el('apk-install-log');
+  if (!lines || !lines.length) {
+    log.classList.add('hidden');
+    log.innerHTML = '';
+    return;
+  }
+  log.classList.remove('hidden');
+  log.innerHTML = lines.map((l) => `<div class="install-line ${l.cls}">
+    <span class="il-icon">${l.icon}</span>
+    ${l.file ? `<span class="il-file" title="${esc(l.file)}">${esc(l.file)}</span>` : ''}
+    <span class="il-msg">${esc(l.message)}</span>
+  </div>`).join('');
+}
+
+async function sideload(paths) {
+  const files = (paths || []).filter(Boolean);
+  if (!files.length) return;
+  if (!state.selected) {
+    renderInstallLog([{ cls: 'bad', icon: '✕', file: '', message: 'Connect a device first.' }]);
+    return;
+  }
+
+  const apks = files.filter((p) => APK_DROP.test(p));
+  const rejected = files.filter((p) => !APK_DROP.test(p));
+  if (!apks.length) {
+    renderInstallLog(rejected.map((p) => ({
+      cls: 'bad', icon: '✕', file: baseName(p), message: 'Not an APK.',
+    })));
+    return;
+  }
+
+  const zone = el('apk-dropzone');
+  zone.classList.add('busy');
+  renderInstallLog(apks.map((p) => ({ cls: 'pending', icon: '⋯', file: baseName(p), message: 'Installing…' })));
+  try {
+    // adb reports install failures on stdout and can still exit 0, so main
+    // classifies the output and hands back one verdict per file.
+    const results = await window.api.installApkFiles(state.selected, apks);
+    renderInstallLog((results || []).map((r) => ({
+      cls: r.ok ? 'ok' : 'bad', icon: r.ok ? '✓' : '✕', file: r.file, message: r.message,
+    })).concat(rejected.map((p) => ({
+      cls: 'bad', icon: '✕', file: baseName(p), message: 'Not an APK.',
+    }))));
+    if ((results || []).some((r) => r.ok)) loadApps();
+  } catch (err) {
+    renderInstallLog([{ cls: 'bad', icon: '✕', file: '', message: cleanIpcError(err.message) }]);
+  } finally {
+    zone.classList.remove('busy');
+  }
+}
+
+el('install-apk-btn').onclick = async () => {
+  if (!state.selected) { toast('Connect a device first.'); return; }
+  el('install-apk-btn').disabled = true;
+  try {
+    const results = await window.api.installApk(state.selected);
+    if (!results) return; // dialog cancelled
+    renderInstallLog(results.map((r) => ({
+      cls: r.ok ? 'ok' : 'bad', icon: r.ok ? '✓' : '✕', file: r.file, message: r.message,
+    })));
+    if (results.some((r) => r.ok)) loadApps();
+  } catch (err) {
+    renderInstallLog([{ cls: 'bad', icon: '✕', file: '', message: cleanIpcError(err.message) }]);
+  } finally {
+    el('install-apk-btn').disabled = false;
+  }
+};
+
+// A drop anywhere else in the window would make Electron navigate to the file,
+// which throws the whole UI away, so the default is cancelled document-wide and
+// only the banner acts on it.
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => e.preventDefault());
+
+{
+  const zone = el('apk-dropzone');
+  // dragenter/dragleave fire for every child element the pointer crosses, so the
+  // highlight is reference-counted instead of toggled.
+  let depth = 0;
+  zone.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    depth += 1;
+    zone.classList.add('dragging');
   });
-  if (!filtered.length) container.innerHTML = '<span class="muted">No apps match.</span>';
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  zone.addEventListener('dragleave', () => {
+    depth = Math.max(0, depth - 1);
+    if (!depth) zone.classList.remove('dragging');
+  });
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    depth = 0;
+    zone.classList.remove('dragging');
+    // A dropped File no longer carries a usable path in the renderer; only the
+    // preload can turn it back into one.
+    const paths = Array.from(e.dataTransfer.files || [])
+      .map((f) => window.api.pathForFile(f))
+      .filter(Boolean);
+    sideload(paths);
+  });
+}
+
+el('app-search').oninput = (e) => { appSearch = e.target.value; renderApps(); };
+
+// ---- inspector
+
+function chip(text, kind = '', title = '') {
+  return `<span class="chip${kind ? ` ${kind}` : ''}"${title ? ` title="${esc(title)}"` : ''}>${esc(text)}</span>`;
+}
+
+function footprintMarkup(detail) {
+  // Data and cache both come back unmeasured for the same reason, and printing
+  // that reason twice reads as a stutter — the first row to hit it explains it.
+  const seen = new Set();
+  const rows = (detail.footprint || []).map((f) => {
+    const note = f.note && !seen.has(f.note) ? f.note : null;
+    if (f.note) seen.add(f.note);
+    return `<div class="fp-row">
+    <span class="fp-label">${esc(f.label)}${note ? `<span class="fp-note">${esc(note)}</span>` : ''}</span>
+    <span class="fp-value${f.bytes === null ? ' unknown' : ''}">${f.bytes === null ? '—' : bytesText(f.bytes)}</span>
+  </div>`;
+  }).join('');
+  // A sum of two rows out of three is not the total, and saying so is the whole
+  // point of tracking which rows were measured.
+  const total = `<div class="fp-row fp-total">
+    <span class="fp-label">${detail.totalComplete ? 'Total on device' : 'Measured so far'}</span>
+    <span class="fp-value${detail.totalBytes === null ? ' unknown' : ''}">${detail.totalBytes === null ? '—' : bytesText(detail.totalBytes)}</span>
+  </div>`;
+  return rows + total;
+}
+
+const PERM_MARK = { true: '✓', false: '✕', null: '·' };
+
+function permissionsMarkup(detail) {
+  const groups = detail.permissionGroups || [];
+  if (!groups.length) return '<div class="perm-empty">No declared permissions came back for this package.</div>';
+  return groups.map((g) => `<div class="perm-group">
+    <div class="perm-group-head">
+      <span class="perm-dot" style="background:${esc(g.color)}"></span>
+      <span class="perm-group-name">${esc(g.label)}</span>
+      <span class="perm-group-count">${g.grantedCount}/${g.items.length}</span>
+    </div>
+    <div class="perm-items">${g.items.map((p) => {
+    const cls = p.granted === true ? 'granted' : p.granted === false ? 'denied' : 'undecided';
+    const hint = p.granted === true ? 'Granted' : p.granted === false ? 'Denied' : 'Declared, never decided on';
+    return `<div class="perm-item ${cls}${p.known ? '' : ' unknown-perm'}" title="${esc(p.id)} — ${hint}">
+        <span class="pi-mark">${PERM_MARK[String(p.granted)]}</span>
+        <span class="pi-name">${esc(p.label)}</span>
+      </div>`;
+  }).join('')}</div>
+  </div>`).join('');
+}
+
+function renderInspector(detail) {
+  const avatar = el('ai-avatar');
+  avatar.textContent = detail.monogram || '?';
+  avatar.style.background = detail.color || 'var(--panel-strong)';
+  setText('ai-label', detail.label || detail.pkg);
+  setText('ai-pkg', detail.pkg);
+
+  const frozen = detail.status === 'disabled';
+  const tags = [
+    detail.versionName ? chip(`v${detail.versionName}`) : '',
+    chip(TYPE_LABELS[detail.type] || detail.type || 'Unknown'),
+    chip(frozen ? 'Frozen' : 'Active', frozen ? 'bad' : 'good'),
+    detail.targetSdk ? chip(`Target API ${detail.targetSdk}`) : '',
+    detail.bloat ? chip(detail.bloatReason || 'Preinstalled', 'warn', 'Why this is flagged as bloat') : '',
+    detail.installer ? chip(`via ${detail.installer}`, '', 'Installer package') : '',
+    detail.labelSource === 'derived' ? chip('Name is a guess', '', DERIVED_HINT) : '',
+    detail.debuggable ? chip('Debuggable', 'warn', 'Its data directory can be read over adb') : '',
+  ].filter(Boolean).join('');
+  el('ai-tags').innerHTML = tags;
+
+  el('ai-footprint').innerHTML = footprintMarkup(detail);
+
+  const s = detail.permissionSummary || { granted: 0, denied: 0, declared: 0, total: 0 };
+  setText('ai-perm-summary', s.total
+    ? `— ${s.granted} granted, ${s.denied} denied, ${s.declared} not asked`
+    : '');
+  el('ai-permissions').innerHTML = permissionsMarkup(detail);
+
+  el('ai-disable-btn').classList.toggle('hidden', frozen);
+  el('ai-enable-btn').classList.toggle('hidden', !frozen);
+  const system = detail.type !== 'user';
+  const uninstall = el('ai-uninstall-btn');
+  uninstall.title = system
+    ? 'adb usually refuses to remove a preinstalled app — freezing it is the reliable way'
+    : 'Removes the app and its data';
+
+  const notes = [];
+  if (detail.bloat && detail.bloatReason) notes.push(`Flagged as bloat: ${detail.bloatReason.toLowerCase()}.`);
+  if (system) notes.push('Preinstalled apps normally survive an uninstall; freeze them instead.');
+  if (detail.lastUpdate) notes.push(`Last updated ${detail.lastUpdate.slice(0, 10)}.`);
+  setText('ai-note', notes.join(' '));
 }
 
 async function selectApp(app) {
   state.selectedApp = app;
-  qAll('#app-list .list-row').forEach((r) => r.classList.remove('selected'));
+  qAll('#app-list .app-row').forEach((r) => r.classList.toggle('selected', r.dataset.pkg === app.pkg));
   el('app-inspector-empty').classList.add('hidden');
   el('app-inspector-body').classList.remove('hidden');
-  el('ai-pkg').textContent = app.pkg;
-  el('ai-size').textContent = 'Loading…';
-  el('ai-permissions').innerHTML = '';
 
-  const detail = await window.api.getAppDetail(state.selected, app.pkg);
-  el('ai-size').textContent = detail.sizeBytes ? `${(detail.sizeBytes / 1048576).toFixed(1)} MB` : 'Unknown';
-  el('ai-permissions').innerHTML = detail.permissions.length
-    ? detail.permissions.map((p) => `<div>✓ ${p.replace('android.permission.', '')}</div>`).join('')
-    : '<div class="muted">No declared permissions found.</div>';
+  // Draw what the list already knows straight away — the dumpsys round trip takes
+  // a moment and an empty panel reads as a broken click.
+  renderInspector({ ...app, footprint: [], totalBytes: null, totalComplete: false, permissionGroups: [] });
+  setText('ai-note', 'Reading permissions and sizes…');
+
+  try {
+    const detail = await window.api.getAppDetail(state.selected, app.pkg, app);
+    if (state.selectedApp && state.selectedApp.pkg === app.pkg) renderInspector(detail);
+  } catch (err) {
+    setText('ai-note', cleanIpcError(err.message));
+  }
 }
 
-el('ai-clear-btn').onclick = () => state.selectedApp && window.api.clearAppData(state.selected, state.selectedApp.pkg);
-el('ai-disable-btn').onclick = () => state.selectedApp && window.api.disableApp(state.selected, state.selectedApp.pkg).then(loadApps);
-el('ai-enable-btn').onclick = () => state.selectedApp && window.api.enableApp(state.selected, state.selectedApp.pkg).then(loadApps);
-el('ai-uninstall-btn').onclick = async () => {
-  if (!state.selectedApp) return;
-  if (confirm(`Uninstall ${state.selectedApp.pkg}?`)) {
-    await window.api.uninstallApp(state.selected, state.selectedApp.pkg);
+async function runAppAction(action, app) {
+  const target = app || state.selectedApp;
+  if (!target || !state.selected) return;
+  try {
+    if (action === 'disable') {
+      await window.api.disableApp(state.selected, target.pkg);
+      toast(`${target.label} frozen. It stays installed and can be re-enabled.`);
+    } else if (action === 'enable') {
+      await window.api.enableApp(state.selected, target.pkg);
+      toast(`${target.label} re-enabled.`);
+    } else if (action === 'clear') {
+      if (!confirm(`Erase all data and cache for ${target.label}?\n\n${target.pkg}`)) return;
+      await window.api.clearAppData(state.selected, target.pkg);
+      toast(`${target.label} reset to a fresh install.`);
+    } else if (action === 'uninstall') {
+      if (!confirm(`Uninstall ${target.label}?\n\n${target.pkg}`)) return;
+      const out = await window.api.uninstallApp(state.selected, target.pkg);
+      // `adb uninstall` prints Failure on stdout for a preinstalled app.
+      toast(/failure/i.test(String(out || ''))
+        ? `Could not uninstall ${target.label}: ${String(out).trim()}`
+        : `${target.label} uninstalled.`);
+    }
     loadApps();
+  } catch (err) {
+    toast(cleanIpcError(err.message));
   }
-};
+}
+
+el('ai-clear-btn').onclick = () => runAppAction('clear');
+el('ai-disable-btn').onclick = () => runAppAction('disable');
+el('ai-enable-btn').onclick = () => runAppAction('enable');
+el('ai-uninstall-btn').onclick = () => runAppAction('uninstall');
 
 // ---------------------------------------------------------------------- mirror
 
@@ -731,35 +1917,54 @@ qAll('.chip-tab[data-mm]').forEach((tab) => {
 const cleanIpcError = (msg) => msg.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, '');
 
 // ---- camera ----------------------------------------------------------------
-// The lens list and both dropdowns are populated only from what the phone
-// reports. Nothing is offered speculatively: asking scrcpy for a size the sensor
-// does not list is a fatal error, not a downgrade.
+// The lens list and resolution dropdown are populated from what the phone
+// reports. Resolution presets are friendly labels mapped to actual sizes.
 
-const camera = { list: [], selected: null, mic: true, v4l2: false, bridge: null, limits: null };
+const camera = { list: [], selected: null, mic: false, micEnabled: false, v4l2: false, bridge: null, limits: null };
+
+const RES_PRESETS = [
+  { label: 'Auto (sensor default)', value: '' },
+  { label: '480p SD (854 x 480)', value: '854x480' },
+  { label: '720p HD (1280 x 720)', value: '1280x720' },
+  { label: '1080p Full HD (1920 x 1080)', value: '1920x1080' },
+];
+
+const FACING_ICONS = { back: '\uD83D\uDCF7', front: '\uD83D\uDCBB', external: '\uD83D\uDD0C' };
+const FACING_LABELS = { back: 'Rear Main', front: 'Front Facing', external: 'External' };
+const FACING_DESC = { back: 'Primary rear camera', front: 'Selfie camera with built-in autofocus', external: 'USB or accessory camera' };
 
 function setCameraStatus(text, kind = '') {
   const node = el('camera-status');
+  if (!node) return;
   node.textContent = text || '';
   node.className = `mirror-status${kind ? ` ${kind}` : ''}`;
 }
 
 function renderLensList() {
   const box = el('camera-lens-list');
+  if (!box) return;
   box.innerHTML = '';
   if (!camera.list.length) {
-    box.innerHTML = '<div class="muted" style="padding:10px 12px;">Not detected yet.</div>';
+    box.innerHTML = '<div class="cam-lens-empty">No cameras detected. Click &ldquo;Detect cameras&rdquo; above.</div>';
     return;
   }
-  const labels = { back: 'Rear', front: 'Front', external: 'External' };
   camera.list.forEach((cam) => {
-    const row = document.createElement('div');
-    row.className = `list-row${camera.selected === cam.id ? ' selected' : ''}`;
-    const mp = cam.megapixels ? `${cam.megapixels} MP` : '—';
-    row.innerHTML = `<span>${labels[cam.facing] || cam.facing} camera</span>`
-      + `<span class="muted mono">id ${cam.id} · ${mp} · ${cam.maxSize || '—'}</span>`;
-    row.onclick = () => { camera.selected = cam.id; renderLensList(); renderSizeOptions(); };
-    box.appendChild(row);
+    const card = document.createElement('div');
+    card.className = `cam-lens-card${camera.selected === cam.id ? ' selected' : ''}`;
+    const label = FACING_LABELS[cam.facing] || cam.facing;
+    const mp = cam.megapixels ? `${cam.megapixels} MP` : '';
+    const desc = FACING_DESC[cam.facing] || '';
+    card.innerHTML = `<div class="cam-lens-name">${label}${mp ? ` (${mp})` : ''}</div>`
+      + (desc ? `<div class="cam-lens-desc">${desc}</div>` : '');
+    card.onclick = () => { camera.selected = cam.id; renderLensList(); updateLensLabel(); };
+    box.appendChild(card);
   });
+}
+
+function updateLensLabel() {
+  const cam = currentCamera();
+  const lbl = el('camera-lens-label');
+  if (lbl) lbl.textContent = cam ? `(${FACING_LABELS[cam.facing] || cam.facing})` : '';
 }
 
 function currentCamera() {
@@ -769,56 +1974,39 @@ function currentCamera() {
 function renderSizeOptions() {
   const cam = currentCamera();
   const sizeSel = el('camera-size');
-  const fpsSel = el('camera-fps');
-  const highSpeed = el('camera-highspeed').checked;
-  sizeSel.innerHTML = '<option value="">Sensor default</option>';
-  fpsSel.innerHTML = '<option value="">Default fps</option>';
-  el('camera-size-note').textContent = '';
-  if (!cam) return;
-
-  const sizes = highSpeed ? cam.highSpeedSizes : cam.sizes;
-  let blocked = 0;
-  for (const s of sizes) {
+  if (!sizeSel) return;
+  sizeSel.innerHTML = '';
+  RES_PRESETS.forEach((p) => {
     const opt = document.createElement('option');
-    opt.value = s.size;
-    // A megapixel figure is more meaningful next to the raw size than alone.
-    const mp = Math.round((s.width * s.height) / 100000) / 10;
-    opt.textContent = `${s.size} (${mp} MP)${s.fps ? ` · fps ${s.fps.join('/')}` : ''}`;
-    // The sensor genuinely offers these, so they are shown and disabled rather
-    // than hidden: the phone's video encoder is what cannot compress them, and
-    // silently dropping them would look like the app losing resolutions.
-    if (s.encodable === false) {
-      opt.disabled = true;
-      opt.textContent += ' — too large for this phone\'s encoder';
-      blocked += 1;
-    }
+    opt.value = p.value;
+    opt.textContent = p.label;
     sizeSel.appendChild(opt);
+  });
+  if (cam && cam.maxSize) {
+    const info = el('camera-res-info');
+    if (info) info.textContent = cam.maxSize + (cam.megapixels ? ` @ ${cam.megapixels} MP` : '');
   }
-  if (!sizes.length) {
-    sizeSel.innerHTML = `<option value="">${highSpeed ? 'No high-speed sizes on this lens' : 'No sizes reported'}</option>`;
+  const micVal = el('mic-status-value');
+  if (micVal) {
+    if (camera.mic) { micVal.textContent = 'Available'; micVal.className = 'cam-info-value green'; }
+    else { micVal.textContent = 'Not available'; micVal.className = 'cam-info-value yellow'; }
   }
-  const limit = camera.limits && camera.limits.maxWidth
-    ? `Hardware encoder limit: ${camera.limits.maxWidth}x${camera.limits.maxHeight}.` : '';
-  el('camera-size-note').textContent = blocked
-    ? `${limit} ${blocked} size${blocked === 1 ? '' : 's'} the sensor offers cannot be encoded, so ${blocked === 1 ? 'it is' : 'they are'} greyed out.`
-    : limit;
-  for (const f of cam.fps || []) {
-    const opt = document.createElement('option');
-    opt.value = String(f);
-    opt.textContent = `${f} fps`;
-    fpsSel.appendChild(opt);
+  // Show high-speed toggle only if camera has high-speed sizes
+  const hsRow = el('camera-highspeed')?.closest('.cam-info-row');
+  if (hsRow) {
+    const hasHS = cam && cam.highSpeedSizes && cam.highSpeedSizes.length > 0;
+    hsRow.classList.toggle('hidden', !hasHS);
+    if (!hasHS) el('camera-highspeed').checked = false;
   }
-  el('camera-mic').disabled = !camera.mic;
-  el('camera-highspeed').disabled = !cam.highSpeedSizes.length && !highSpeed;
+  const fpsRow = el('camera-fps-row');
+  if (fpsRow && !el('camera-highspeed').checked) fpsRow.classList.add('hidden');
 }
-
-el('camera-highspeed').onchange = renderSizeOptions;
 
 el('camera-refresh-btn').onclick = async () => {
   if (!state.selected) { el('camera-detect-status').textContent = 'Select a device first.'; return; }
   const btn = el('camera-refresh-btn');
   btn.disabled = true;
-  el('camera-detect-status').textContent = 'Asking scrcpy what this phone offers…';
+  el('camera-detect-status').textContent = 'Scanning sensors\u2026';
   try {
     const res = await window.api.listCameras(state.selected);
     camera.list = res.cameras;
@@ -827,9 +2015,10 @@ el('camera-refresh-btn').onclick = async () => {
     camera.limits = res.limits || null;
     camera.selected = res.cameras[0] ? res.cameras[0].id : null;
     el('camera-detect-status').textContent =
-      `${res.cameras.length} camera${res.cameras.length === 1 ? '' : 's'} reported.`;
+      `${res.cameras.length} camera${res.cameras.length === 1 ? '' : 's'} detected.`;
     renderLensList();
     renderSizeOptions();
+    updateLensLabel();
   } catch (err) {
     el('camera-detect-status').textContent = cleanIpcError(err.message);
   } finally {
@@ -837,33 +2026,89 @@ el('camera-refresh-btn').onclick = async () => {
   }
 };
 
+// Mic toggle button
+el('camera-mic-btn').onclick = () => {
+  camera.micEnabled = !camera.micEnabled;
+  const btn = el('camera-mic-btn');
+  btn.classList.toggle('active', camera.micEnabled);
+  const micVal = el('mic-status-value');
+  if (camera.mic) {
+    if (micVal) { micVal.textContent = camera.micEnabled ? 'Enabled' : 'Disabled'; micVal.className = camera.micEnabled ? 'cam-info-value green' : 'cam-info-value yellow'; }
+  }
+};
+
+// High-speed toggle shows/hides fps selector
+el('camera-highspeed').onchange = () => {
+  const fpsRow = el('camera-fps-row');
+  if (fpsRow) fpsRow.classList.toggle('hidden', !el('camera-highspeed').checked);
+};
+
+// --- Camera live feed (periodic screencap in preview area) ---
+let cameraFeedInterval = null;
+function startCameraFeed() {
+  stopCameraFeed();
+  const frame = el('camera-live-frame');
+  const badge = el('camera-live-badge');
+  const placeholder = document.querySelector('#camera-preview .cam-preview-placeholder');
+  if (frame) frame.classList.add('visible');
+  if (badge) badge.classList.remove('hidden');
+  if (placeholder) placeholder.style.display = 'none';
+  let fetching = false;
+  cameraFeedInterval = setInterval(async () => {
+    if (fetching || !state.selected) return;
+    fetching = true;
+    try {
+      const dataUrl = await window.api.cameraFrame(state.selected);
+      if (dataUrl && frame) frame.src = dataUrl;
+    } catch { /* ignore frame errors */ }
+    finally { fetching = false; }
+  }, 1000);
+}
+function stopCameraFeed() {
+  if (cameraFeedInterval) { clearInterval(cameraFeedInterval); cameraFeedInterval = null; }
+  const frame = el('camera-live-frame');
+  const badge = el('camera-live-badge');
+  const placeholder = document.querySelector('#camera-preview .cam-preview-placeholder');
+  if (frame) { frame.classList.remove('visible'); frame.src = ''; }
+  if (badge) badge.classList.add('hidden');
+  if (placeholder) placeholder.style.display = '';
+}
+
 el('camera-start-btn').onclick = async () => {
   if (!state.selected) return;
   const cam = currentCamera();
   const btn = el('camera-start-btn');
   btn.disabled = true;
-  setCameraStatus('Starting the camera stream…', 'busy');
+  setCameraStatus('Starting the camera stream\u2026', 'busy');
   try {
     const opts = {
       serial: state.selected,
       cameraId: cam ? cam.id : undefined,
       size: el('camera-size').value || undefined,
-      fps: el('camera-fps').value ? Number(el('camera-fps').value) : undefined,
       highSpeed: el('camera-highspeed').checked,
-      mic: el('camera-mic').checked,
+      mic: camera.micEnabled && camera.mic,
     };
-    // Only on Linux with a loopback device does a real virtual camera exist; the
-    // sink is passed only then, because the flag is otherwise absent or useless.
+    if (opts.highSpeed) {
+      opts.fps = el('camera-fps').value ? Number(el('camera-fps').value) : 60;
+    }
     if (camera.bridge && camera.bridge.mode === 'v4l2' && camera.bridge.ready) {
       opts.v4l2Device = camera.bridge.devices[0];
     }
     await window.api.startCamera(opts);
     el('camera-state').textContent = 'Streaming';
+    const dot = el('camera-state-dot');
+    if (dot) { dot.className = 'cam-dot streaming'; }
+    btn.classList.add('streaming');
+    startCameraFeed();
     setCameraStatus(opts.v4l2Device
-      ? `Streaming into ${opts.v4l2Device} — other apps can select it as a camera.`
-      : 'Streaming to a preview window.', 'ok');
+      ? `Streaming into ${opts.v4l2Device}`
+      : 'Streaming — camera feed captured from scrcpy window.', 'ok');
   } catch (err) {
     el('camera-state').textContent = 'Standby';
+    const dot = el('camera-state-dot');
+    if (dot) { dot.className = 'cam-dot standby'; }
+    btn.classList.remove('streaming');
+    stopCameraFeed();
     setCameraStatus(cleanIpcError(err.message), 'err');
   } finally {
     btn.disabled = false;
@@ -873,7 +2118,54 @@ el('camera-start-btn').onclick = async () => {
 el('camera-stop-btn').onclick = async () => {
   await window.api.stopCamera();
   el('camera-state').textContent = 'Standby';
+  const dot = el('camera-state-dot');
+  if (dot) { dot.className = 'cam-dot standby'; }
+  el('camera-start-btn').classList.remove('streaming');
+  stopCameraFeed();
   setCameraStatus('Camera stream stopped.');
+};
+
+// Screenshot (capture photo from camera)
+el('camera-screenshot-btn').onclick = async () => {
+  if (!state.selected) return;
+  const btn = el('camera-screenshot-btn');
+  btn.disabled = true;
+  setCameraStatus('Capturing photo\u2026', 'busy');
+  try {
+    const filePath = await window.api.cameraCapturePhoto(state.selected);
+    if (filePath) { toast('Photo saved: ' + filePath.split(/[\\/]/).pop()); setCameraStatus('Photo captured.', 'ok'); }
+    else { setCameraStatus('Capture cancelled.'); }
+  } catch (err) { setCameraStatus('Capture failed: ' + cleanIpcError(err.message), 'err'); }
+  finally { btn.disabled = false; }
+};
+
+// Record (video from camera stream)
+let isRecording = false;
+el('camera-record-btn').onclick = async () => {
+  if (!state.selected) return;
+  const btn = el('camera-record-btn');
+  btn.disabled = true;
+  try {
+    if (!isRecording) {
+      const filePath = await window.api.cameraRecordStart(state.selected);
+      if (filePath) {
+        isRecording = true;
+        btn.classList.add('recording');
+        setCameraStatus('Recording to ' + filePath.split(/[\\/]/).pop() + '\u2026', 'busy');
+      }
+    } else {
+      const filePath = await window.api.cameraRecordStop(state.selected);
+      isRecording = false;
+      btn.classList.remove('recording');
+      if (filePath) { toast('Recording saved: ' + filePath.split(/[\\/]/).pop()); setCameraStatus('Recording saved.', 'ok'); }
+    }
+  } catch (err) {
+    setCameraStatus('Record error: ' + cleanIpcError(err.message), 'err');
+    isRecording = false;
+    btn.classList.remove('recording');
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 el('torch-btn').onclick = async () => {
@@ -882,12 +2174,9 @@ el('torch-btn').onclick = async () => {
   btn.disabled = true;
   try {
     const res = await window.api.toggleTorch(state.selected);
-    // Only claim a state the camera service actually confirmed. The tile click is
-    // a toggle that reports nothing, so without read-back the honest message is
-    // "clicked", not "on".
     setCameraStatus(res && res.state
       ? `Flashlight is ${res.state}.`
-      : 'Flashlight tile clicked — this phone does not report torch state, so check the light itself.', 'ok');
+      : 'Flashlight toggled \u2014 check the phone.', 'ok');
   } catch (err) {
     setCameraStatus(cleanIpcError(err.message), 'err');
   } finally {
@@ -908,7 +2197,11 @@ async function refreshBridge() {
     el('bridge-hint').textContent = '';
   }
   const st = await window.api.cameraStatus().catch(() => null);
-  if (st) el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
+  if (st) {
+    el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
+    const dot = el('camera-state-dot');
+    if (dot) { dot.className = st.running ? 'cam-dot streaming' : 'cam-dot standby'; }
+  }
 }
 
 // ---- audio + now playing ---------------------------------------------------
@@ -1058,6 +2351,54 @@ qAll('.chip-tab[data-bl]').forEach((tab) => {
   };
 });
 
+async function refreshBootloaderStatus() {
+  if (!state.selected) return;
+  const lockEl = el('bl-lock-status');
+  const oemEl = el('bl-oem-status');
+  const fbEl = el('bl-fb-status');
+  const device = state.devices.find((d) => d.serial === state.selected);
+  const inFastboot = device && device.state === 'bootloader';
+
+  if (lockEl) {
+    try {
+      const info = await window.api.getDeviceInfo(state.selected);
+      const locked = info.bootloaderLocked === '1';
+      lockEl.textContent = locked ? 'LOCKED (SECURE)' : 'UNLOCKED';
+      lockEl.className = 'bl-status-badge ' + (locked ? 'locked' : 'unlocked');
+      if (oemEl) {
+        const oem = info['persist.sys.oem_unlock_allowed'];
+        if (oem === '1') { oemEl.textContent = 'Enabled'; oemEl.className = 'bl-info-value green'; }
+        else if (oem === '0') { oemEl.textContent = 'Disabled'; oemEl.className = 'bl-info-value yellow'; }
+        else { oemEl.textContent = 'Unknown'; oemEl.className = 'bl-info-value'; }
+      }
+    } catch {
+      if (lockEl) { lockEl.textContent = 'UNKNOWN'; lockEl.className = 'bl-status-badge locked'; }
+      if (oemEl) { oemEl.textContent = 'N/A'; oemEl.className = 'bl-info-value red'; }
+    }
+  }
+
+  if (fbEl) {
+    if (!inFastboot) {
+      fbEl.textContent = 'Device not in fastboot';
+      fbEl.className = 'bl-info-value yellow';
+    } else {
+      try {
+        const out = await window.api.fastbootDevices();
+        const hasDevice = Array.isArray(out) ? out.length > 0 : String(out).trim().length > 0;
+        fbEl.textContent = hasDevice ? 'Ready' : 'No device';
+        fbEl.className = 'bl-info-value ' + (hasDevice ? 'green' : 'red');
+      } catch {
+        fbEl.textContent = 'Not detected';
+        fbEl.className = 'bl-info-value red';
+      }
+    }
+  }
+}
+
+qAll('.chip-tab[data-bl]').forEach((tab) => {
+  tab.addEventListener('click', () => { if (tab.dataset.bl === 'unlock') refreshBootloaderStatus(); });
+});
+
 el('reboot-bootloader-btn').onclick = async () => {
   el('bootloader-output').textContent = await window.api.rebootBootloader(state.selected).catch((e) => e.message);
 };
@@ -1070,13 +2411,22 @@ el('unlock-btn').onclick = async () => {
 };
 
 let flashImagePath = null;
-el('choose-flash-img-btn').onclick = async () => {
-  const result = await window.api.chooseFlashImage();
-  if (result?.filePath) {
-    flashImagePath = result.filePath;
-    el('flash-img-path').textContent = flashImagePath;
+const flashImgDrop = el('flash-img-drop');
+const flashImgFile = el('flash-img-file');
+const flashImgPath = el('flash-img-path');
+const flashPartLabel = el('flash-partition-label');
+const flashPartition = el('flash-partition');
+
+if (flashPartition) flashPartition.onchange = () => { if (flashPartLabel) flashPartLabel.textContent = flashPartition.value; };
+if (flashImgDrop) flashImgDrop.onclick = () => flashImgFile.click();
+if (flashImgFile) flashImgFile.onchange = () => {
+  const f = flashImgFile.files[0];
+  if (f) {
+    const p = window.api.pathForFile(f);
+    if (p) { flashImagePath = p; flashImgPath.textContent = p.split(/[\\/]/).pop(); flashImgPath.classList.remove('muted'); }
   }
 };
+
 el('flash-btn').onclick = async () => {
   if (!flashImagePath) { alert('Choose an .img file first.'); return; }
   const partition = el('flash-partition').value;
@@ -1114,67 +2464,11 @@ el('run-backup-btn').onclick = async () => {
 // -------------------------------------------------------------- wireless pair
 
 function setPairStatus(text, cls) {
-  const node = el('pair-status');
+  const node = el('wifi-pair-status');
+  if (!node) return;
   node.textContent = text || '';
   node.className = `mirror-status${cls ? ` ${cls}` : ''}`;
 }
-
-el('pair-btn').onclick = () => {
-  setPairStatus('');
-  el('pair-modal').classList.remove('hidden');
-};
-el('pair-cancel-btn').onclick = () => el('pair-modal').classList.add('hidden');
-el('pair-submit-btn').onclick = async () => {
-  const host = el('pair-host').value.trim();
-  const code = el('pair-code').value.trim();
-  const connectPort = el('pair-connect-port').value.trim();
-  // A device that is already paired only needs the connect step, and re-running
-  // `adb pair` with a spent single-use code would just fail. So a port with no code
-  // means "connect only" — that is the way out of "paired but not reachable".
-  const connectOnly = !code && !!connectPort;
-  if (!host) {
-    setPairStatus('Enter the phone\'s host:port.', 'err');
-    return;
-  }
-  if (!code && !connectPort) {
-    setPairStatus('Enter the pairing code — or, if this phone is already paired, '
-      + 'just its connect port.', 'err');
-    return;
-  }
-
-  const btn = el('pair-submit-btn');
-  btn.disabled = true;
-  setPairStatus(connectOnly ? 'Connecting…' : 'Pairing, then connecting…', 'busy');
-  try {
-    if (connectOnly) {
-      // The host field may already carry the pairing port; the connect port is a
-      // different one, so drop any port that is already there. A bare IPv6 literal
-      // has to be bracketed or adb cannot tell the address from the port.
-      const bare = host.replace(/^adb:\/\//, '');
-      const hostOnly = /^[0-9a-f]*:[0-9a-f:]+$/i.test(bare)
-        ? `[${bare}]`
-        : bare.replace(/^(\[[^\]]+\]|[^:]+):\d+$/, '$1');
-      // The modal stays open on success: this is the recovery path out of "paired but
-      // not reachable", and hiding the only place the result is shown would leave the
-      // user guessing whether it worked.
-      setPairStatus(await window.api.connectWireless(`${hostOnly}:${connectPort}`), 'ok');
-      refreshDevices();
-      return;
-    }
-    const res = await window.api.pairWireless(host, code, connectPort);
-    if (res && res.connected) {
-      setPairStatus(res.message, 'ok');
-      el('pair-modal').classList.add('hidden');
-    } else {
-      setPairStatus(res ? res.message : 'Paired, but the connect step did not run.', 'err');
-    }
-    refreshDevices();
-  } catch (err) {
-    setPairStatus(cleanIpcError(err.message), 'err');
-  } finally {
-    btn.disabled = false;
-  }
-};
 
 // ---- QR pairing ------------------------------------------------------------
 //
@@ -1184,13 +2478,6 @@ el('pair-submit-btn').onclick = async () => {
 
 const QR_QUIET = 4; // quiet zone in modules; 4 is the spec minimum
 const QR_TARGET_PX = 320; // the canvas is sized down to a whole number of modules
-
-el('pair-scan-qr-btn').onclick = () => {
-  setPairStatus('');
-  el('pair-modal').classList.add('hidden');
-  el('qr-modal').classList.remove('hidden');
-  startQrPairing();
-};
 
 el('qr-modal-close').onclick = () => closeQrPairing();
 
@@ -1251,33 +2538,20 @@ window.api.onQrPairProgress(({ phase, message, host }) => {
   status.classList.toggle('danger-text', phase === 'error');
 
   if (phase === 'error') {
-    // Don't leave a dead code on screen next to the error: it can no longer be
-    // paired with, and scanning it just makes the phone advertise a name nothing
-    // is watching for.
     const canvas = el('qr-canvas');
     canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
   }
 
-  // Both terminal phases close through closeQrPairing() rather than hiding the
-  // modal directly: main's loop has already finished in these cases, but relying
-  // on that is exactly how a stray session ends up polling behind a closed modal.
   if (phase === 'connected') {
     closeQrPairing();
     setPairStatus(message, 'ok');
     refreshDevices();
   }
   if (phase === 'paired') {
-    // Paired but not reachable. The pairing code is single-use, so redoing the
-    // pairing is the wrong move — all that's missing is the connect port. Prefill
-    // the host and leave the code blank; the form connects without pairing when
-    // only a port is given.
     closeQrPairing();
-    if (host) el('pair-host').value = host;
-    el('pair-code').value = '';
-    el('pair-modal').classList.remove('hidden');
+    openConnectModal('wifi');
+    if (host) el('wifi-ip').value = host.replace(/:\d+$/, '');
     setPairStatus(message, 'err');
-    el('pair-connect-port').focus();
-    refreshDevices();
   }
 });
 
@@ -1319,8 +2593,84 @@ async function loadToolsStatus() {
   });
 }
 
+// ------------------------------------------------------------ startup chooser
+
+function showStartupChooser(devices) {
+  openConnectModal('switch');
+  renderConnectDeviceList();
+}
+
+el('startup-refresh-btn').onclick = async () => {
+  const devices = await window.api.listDevices().catch(() => []);
+  const connected = devices
+    .filter((d) => d.state === 'device')
+    .map((d) => ({ serial: d.serial, model: d.model || d.serial }));
+  if (connected.length <= 1) {
+    el('startup-chooser').classList.add('hidden');
+    if (connected.length === 1) selectDevice(connected[0].serial);
+  } else {
+    showStartupChooser(connected);
+  }
+};
+
+if (window.api.onDeviceAutoSelected) {
+  window.api.onDeviceAutoSelected(async (device) => {
+    state.selected = device.serial;
+    try { await refreshDevices(); } catch {}
+    selectDevice(device.serial);
+  });
+}
+if (window.api.onDeviceChoose) {
+  window.api.onDeviceChoose((devices) => {
+    openConnectModal('switch');
+    renderConnectDeviceList();
+  });
+}
+
 // ----------------------------------------------------------------- startup
 
 setInterval(() => {
-  if (!el('shell').classList.contains('hidden')) refreshDevices();
+  if (!el('shell').classList.contains('hidden')) {
+    refreshDevices();
+    // Safety: if a device is selected, ensure the dashboard is visible and
+    // the connect modal is not blocking it. This catches any race where the
+    // modal was opened before selectDevice() ran.
+    if (state.selected) {
+      const m = el('connect-modal');
+      if (m && !m.classList.contains('hidden')) m.classList.add('hidden');
+      const es = el('empty-state');
+      if (es && !es.classList.contains('hidden')) es.classList.add('hidden');
+      const dg = el('dashboard-grid');
+      if (dg && dg.classList.contains('hidden')) dg.classList.remove('hidden');
+    }
+  }
 }, 4000);
+
+// Show the connect dialog if no device auto-connected after startup.
+setTimeout(() => {
+  if (!state.selected && !el('shell').classList.contains('hidden')) {
+    openConnectModal();
+  }
+}, 3000);
+
+// After the startup modal opens, re-check every 500ms for up to10 seconds
+// to close it as soon as a device is selected. This bridges the gap between
+// the 3-second timeout and the device:auto-selected IPC event.
+(function startupWatchdog() {
+  let checks = 0;
+  const id = setInterval(() => {
+    checks += 1;
+    if (checks > 20 || (state.selected && el('connect-modal') && el('connect-modal').classList.contains('hidden'))) {
+      clearInterval(id);
+      return;
+    }
+    if (state.selected) {
+      const m = el('connect-modal');
+      if (m && !m.classList.contains('hidden')) m.classList.add('hidden');
+      const es = el('empty-state');
+      if (es && !es.classList.contains('hidden')) es.classList.add('hidden');
+      const dg = el('dashboard-grid');
+      if (dg && dg.classList.contains('hidden')) dg.classList.remove('hidden');
+    }
+  }, 500);
+})();

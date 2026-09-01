@@ -54,11 +54,25 @@ desktop machine.
 
 A sidebar (not tabs) drives navigation now:
 
-- **Dashboard** — device summary, battery ring, CPU load/memory, storage
-  breakdown by folder, and quick launchers into the other sections.
+- **Dashboard** — device summary, battery ring (shows current/estimated mAh),
+  CPU load/memory, storage breakdown by folder, and quick launchers into the
+  other sections.
 - **File Explorer** — category shortcuts (Photos/Documents/Videos/Music),
-  a file list, and a File Inspector panel with an image preview (for common
-  image extensions), pull, and delete.
+  clickable storage overview items that navigate to actual device paths,
+  a file list with checkboxes for multi-select, and a File Inspector panel
+  with preview (images, video, text files, PDFs), pull, delete, and file
+  size display. Supports:
+  - **Multi-select** — check multiple files, then batch-download or batch-upload
+  - **Batch download** — pull selected files to a chosen folder on your PC with
+    per-file progress
+  - **Batch upload** — push multiple local files to the current remote directory
+    with per-file progress
+  - **File preview** — images shown inline, videos with playback controls,
+    text files in a scrollable view, PDFs in an embedded viewer
+  - **Breadcrumb navigation** — clickable path segments and a back arrow to
+    navigate parent directories
+  - **Clickable storage items** — Internal storage navigates to
+    `/storage/emulated/0`, SD card navigates to its mount point
 - **App Management** — filter chips (All/User/System/Disabled), search,
   sideload, and an App Diagnostics panel showing APK size, declared
   permissions (scraped from `dumpsys package`), clear-data, disable/enable,
@@ -105,6 +119,13 @@ polished OS-level API, and are worth knowing about before you rely on them:
 - **Fastboot partition flashing** is a real `fastboot flash <partition>
   <img>` — it will happily brick a device if given the wrong image for the
   wrong partition. The confirmation dialog is there for a reason.
+- **File transfers** use `adb pull`/`adb push` which don't report byte-level
+  progress. Batch operations show per-file progress ("3/10 files"). Single-file
+  transfers show an indeterminate progress indicator until completion.
+- **File listing** uses `ls -la` via `adb shell` which requires read
+  permissions on the target directory. System paths like `/data` are
+  inaccessible without root. Internal storage is at `/storage/emulated/0`,
+  SD card paths vary by device (e.g. `/storage/XXXX-XXXX`).
 
 ## Wireless pairing over QR
 

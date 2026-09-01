@@ -12,13 +12,15 @@
 <body>
 
   <div id="titlebar">
-    <div class="titlebar-drag">
-      <span class="logo-dot"></span>
-      <span class="app-name">companion</span>
+    <div class="titlebar-drag titlebar-left">
+      <svg class="titlebar-logo" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/>
+      </svg>
+      <span class="app-name">PC Companion</span>
     </div>
-    <div class="titlebar-status">
-      <span id="status-device" class="mono">No device</span>
+    <div class="titlebar-status titlebar-center">
       <span id="status-dot" class="status-dot"></span>
+      <span id="status-device" class="mono">No device</span>
     </div>
     <div class="titlebar-controls">
       <button id="min-btn" title="Minimize">&#8211;</button>
@@ -39,23 +41,64 @@
 
   <div id="shell" class="hidden">
     <aside id="sidebar">
-      <div class="sidebar-group">
-        <div class="sidebar-label">Core Workstation</div>
-        <button class="nav-item active" data-view="dashboard">Dashboard</button>
-        <button class="nav-item" data-view="files">File Explorer</button>
-        <button class="nav-item" data-view="apps">App Management</button>
-        <button class="nav-item" data-view="mirror">Screen Mirror</button>
-        <button class="nav-item" data-view="console">Power Tools (ADB)</button>
-        <button class="nav-item" data-view="multimedia">Multimedia Hub</button>
-        <button class="nav-item" data-view="hardware">Hardware &amp; Power</button>
-        <button class="nav-item" data-view="bootloader">Bootloader &amp; Backup</button>
+      <div id="sidebar-device-card" class="sidebar-device-card" title="Click to connect or switch device">
+        <div class="sdc-phone-icon">
+          <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/>
+          </svg>
+        </div>
+        <div class="sdc-info">
+          <div class="sdc-name" id="sdc-name">No device connected</div>
+          <div class="sdc-meta">
+            <span id="sdc-conn-type" class="sdc-conn">—</span>
+            <span id="sdc-ip" class="sdc-ip hidden"></span>
+          </div>
+        </div>
       </div>
-      <div class="sidebar-group">
-        <div class="sidebar-label">Utilities</div>
-        <button class="nav-item" id="tools-nav-btn">Binaries &amp; Drivers</button>
-      </div>
-      <div class="sidebar-footer">
-        <button id="device-picker-btn" class="ghost-btn">Devices &amp; pairing</button>
+
+      <div class="sidebar-nav">
+        <div class="sidebar-group">
+          <div class="sidebar-label">Core Workstation</div>
+          <button class="nav-item active" data-view="dashboard">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+            Dashboard
+          </button>
+          <button class="nav-item" data-view="files">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            File Explorer
+          </button>
+          <button class="nav-item" data-view="apps">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h7v7h-7z"/></svg>
+            App Management
+          </button>
+          <button class="nav-item" data-view="mirror">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            Screen Mirror
+          </button>
+          <button class="nav-item" data-view="console">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            Power Tools (ADB)
+          </button>
+          <button class="nav-item" data-view="multimedia">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Multimedia Hub
+          </button>
+          <button class="nav-item" data-view="hardware">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg>
+            Hardware &amp; Power
+          </button>
+          <button class="nav-item" data-view="bootloader">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Bootloader &amp; Backup
+          </button>
+        </div>
+        <div class="sidebar-group">
+          <div class="sidebar-label">Utilities</div>
+          <button class="nav-item" id="tools-nav-btn">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+            Binaries &amp; Drivers
+          </button>
+        </div>
       </div>
     </aside>
 
@@ -68,61 +111,127 @@
         </section>
 
         <div id="dashboard-grid" class="hidden">
-          <div class="card">
-            <div class="card-head">
-              <h3 id="dash-model">Device</h3>
-              <span id="dash-online" class="badge badge-online">Online</span>
+          <!-- Device identity, state and the two actions the user needs most. -->
+          <section class="card dash-header span-2">
+            <div class="dash-header-top">
+              <div class="dash-identity">
+                <div class="dash-title-row">
+                  <span class="dash-avatar" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 19h3"/>
+                    </svg>
+                  </span>
+                  <h3 id="dash-model">Device</h3>
+                  <span class="chip subtle hidden" id="dash-codename"></span>
+                  <span id="dash-online" class="badge badge-online">Online</span>
+                </div>
+                <div class="chip-row" id="dash-chip-row">
+                  <span class="chip mono" id="dash-transport"></span>
+                  <span class="chip mono" id="dash-android"></span>
+                  <span class="chip mono" id="dash-serial"></span>
+                  <span class="chip mono" id="dash-ip"></span>
+                </div>
+              </div>
+              <div class="dash-actions">
+                <button id="dash-refresh" class="round-btn" title="Refresh device data" aria-label="Refresh device data">
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4.5V11h-6"/>
+                  </svg>
+                </button>
+                <button id="dash-disconnect" class="danger-btn">Disconnect</button>
+              </div>
             </div>
-            <div class="chip-row">
-              <span class="chip mono" id="dash-serial"></span>
-              <span class="chip mono" id="dash-android"></span>
-              <span class="chip mono" id="dash-ip"></span>
+            <div class="spec-row">
+              <div class="spec-cell"><span class="k">Security patch</span><span class="v mono" id="dash-secpatch">—</span></div>
+              <div class="spec-cell"><span class="k">SELinux policy</span><span class="v mono" id="dash-selinux">—</span></div>
+              <div class="spec-cell"><span class="k">Bootloader</span><span class="v mono" id="dash-bootloader">—</span></div>
+              <div class="spec-cell"><span class="k">ADB transport</span><span class="v mono" id="dash-transport-detail">—</span></div>
             </div>
-            <div class="data-grid mono compact" id="dash-info-grid"></div>
-          </div>
+          </section>
 
-          <div class="card">
-            <div class="card-head"><h3>Battery station</h3><span id="dash-batt-status" class="badge"></span></div>
+          <!-- Battery -->
+          <section class="card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-apps)"></span>Battery station</h3>
+              <span id="dash-batt-status" class="badge"></span>
+            </div>
             <div class="battery-row">
               <div class="battery-ring-wrap">
                 <div id="battery-ring" class="battery-ring"><span id="battery-pct">—</span></div>
+                <span class="muted tiny" id="dash-batt-eta"></span>
               </div>
               <div class="data-grid mono compact">
+                <div class="data-cell"><span class="k">Power</span><span class="v" id="dash-watts">—</span></div>
+                <div class="data-cell"><span class="k">Temp</span><span class="v" id="dash-temp">—</span></div>
                 <div class="data-cell"><span class="k">Health</span><span class="v" id="dash-health">—</span></div>
                 <div class="data-cell"><span class="k">Cycles</span><span class="v" id="dash-cycles">—</span></div>
-                <div class="data-cell"><span class="k">Temp</span><span class="v" id="dash-temp">—</span></div>
-                <div class="data-cell"><span class="k">Voltage</span><span class="v" id="dash-voltage">—</span></div>
               </div>
             </div>
-          </div>
+            <button class="link-btn" data-view="hardware">Deep battery analytics →</button>
+          </section>
 
-          <div class="card">
-            <div class="card-head"><h3>CPU &amp; memory</h3><span id="dash-procs" class="muted mono"></span></div>
-            <div class="bar-row"><span class="bar-label">Load average</span><span class="mono" id="dash-load">—</span></div>
-            <div class="bar-row"><span class="bar-label">Memory</span><span class="mono" id="dash-mem">—</span></div>
-            <div class="progress-track"><div id="mem-bar" class="progress-fill"></div></div>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h3>Storage</h3><span class="mono muted" id="dash-storage-total"></span></div>
-            <div class="progress-track"><div id="storage-bar" class="progress-fill signal"></div></div>
-            <div class="data-grid mono compact" id="storage-breakdown-grid"></div>
-          </div>
-
-          <div class="card span-2">
-            <div class="card-head"><h3>Quick launchers</h3></div>
-            <div class="launcher-grid">
-              <button class="launcher" data-view="mirror"><span>Screen mirror</span><span class="muted">Start a live session</span></button>
-              <button class="launcher" data-view="apps"><span>App debloat</span><span class="muted">Sideload / disable</span></button>
-              <button class="launcher" data-view="multimedia"><span>Webcam bridge</span><span class="muted">Camera + mic</span></button>
-              <button class="launcher" data-view="console"><span>ADB shell</span><span class="muted">Raw commands</span></button>
+          <!-- CPU -->
+          <section class="card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-videos)"></span>CPU performance &amp; cores</h3>
+              <span id="dash-procs" class="muted mono tiny"></span>
             </div>
-          </div>
+            <div class="metric-row">
+              <div>
+                <span class="metric-label">Overall load</span>
+                <span class="metric-big" id="dash-load">—</span>
+              </div>
+              <div class="metric-right">
+                <span class="metric-label">SoC temp</span>
+                <span class="metric-big" id="dash-soc-temp">—</span>
+              </div>
+            </div>
+            <div class="progress-track"><div id="dash-load-bar" class="progress-fill"></div></div>
+            <div class="cores-label muted tiny" id="dash-cores-label">Cluster frequencies</div>
+            <div class="core-grid" id="dash-cores"></div>
+          </section>
+
+          <!-- RAM -->
+          <section class="card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-audio)"></span><span id="dash-ram-title">System memory</span></h3>
+              <span id="dash-mem-pct" class="badge"></span>
+            </div>
+            <div class="metric-row">
+              <div>
+                <span class="metric-label">Memory footprint</span>
+                <span class="metric-big" id="dash-mem">—</span>
+              </div>
+            </div>
+            <div class="progress-track"><div id="mem-bar" class="progress-fill"></div></div>
+            <div class="data-grid mono compact" id="dash-mem-split"></div>
+          </section>
+
+          <!-- Storage: one card per volume, internal first, then any card. -->
+          <section class="card span-2" id="dash-storage-card">
+            <div class="card-head">
+              <h3><span class="head-dot" style="background:var(--cat-photos)"></span>Storage</h3>
+              <span class="muted mono tiny" id="dash-storage-note"></span>
+            </div>
+            <div id="dash-volumes"></div>
+          </section>
+
+          <section class="card span-2">
+            <div class="card-head"><h3>Quick workstation launchers</h3></div>
+            <div class="launcher-grid" id="dash-launchers"></div>
+          </section>
         </div>
       </section>
 
       <section id="view-files" class="view hidden">
         <div class="view-header"><h2>File Explorer</h2></div>
+        <div id="file-storage-overview" class="file-storage-overview">
+          <div class="file-storage-head">
+            <span class="file-storage-title">Storage spaces</span>
+            <span id="file-storage-note" class="muted tiny"></span>
+          </div>
+          <div id="file-storage-list" class="file-storage-list"></div>
+        </div>
         <div class="chip-tabs" id="file-category-tabs">
           <button class="chip-tab active" data-path="/sdcard/">All files</button>
           <button class="chip-tab" data-path="/sdcard/Pictures">Photos</button>
@@ -132,21 +241,41 @@
         </div>
         <div class="split-panel">
           <div class="glass-card">
+            <div class="breadcrumb-bar">
+              <button id="breadcrumb-back" class="breadcrumb-back" title="Go up one level">&#9664;</button>
+              <div class="breadcrumb-path mono" id="breadcrumb-path"></div>
+            </div>
             <div class="path-bar">
               <input id="remote-path" class="mono" value="/sdcard/" spellcheck="false" />
               <button id="list-files-btn">Go</button>
               <button id="push-file-btn" class="ghost-btn">Upload here</button>
             </div>
+            <div class="file-toolbar">
+              <label class="checkbox-row small"><input type="checkbox" id="file-select-all" /> Select all</label>
+              <span id="file-sel-count" class="muted tiny"></span>
+              <button id="file-download-btn" class="primary-btn tiny" disabled>Download selected</button>
+              <button id="file-upload-btn" class="ghost-btn tiny" disabled>Upload to here</button>
+              <div id="file-transfer-progress" class="transfer-progress hidden">
+                <div class="transfer-bar"><div id="file-transfer-fill" class="transfer-fill"></div></div>
+                <span id="file-transfer-label" class="muted tiny"></span>
+              </div>
+            </div>
             <div id="file-list" class="mono file-list"></div>
+            <div id="file-drop-overlay" class="file-drop-overlay hidden">
+              <div class="file-drop-icon">&#128194;</div>
+              <div class="file-drop-text">Drop files here to upload</div>
+            </div>
           </div>
           <div class="glass-card inspector">
             <h3>File inspector</h3>
-            <div id="file-inspector-empty" class="muted">Select a file to see its details.</div>
+            <div id="file-inspector-empty" class="muted">Select a file or folder to see its details.</div>
             <div id="file-inspector-body" class="hidden">
-              <img id="file-preview-img" class="file-preview hidden" />
+              <div id="file-preview-container"></div>
               <div class="data-cell"><span class="k">Name</span><span class="v mono" id="fi-name"></span></div>
               <div class="data-cell"><span class="k">Path</span><span class="v mono" id="fi-path"></span></div>
-              <button id="fi-pull-btn" class="primary-btn">Copy to PC (Pull)</button>
+              <div class="data-cell"><span class="k">Type</span><span class="v" id="fi-type"></span></div>
+              <div class="data-cell"><span class="k">Size</span><span class="v mono" id="fi-size"></span></div>
+              <button id="fi-pull-btn" class="primary-btn">Download to PC</button>
               <button id="fi-delete-btn" class="danger-btn">Delete from device</button>
             </div>
           </div>
@@ -154,32 +283,84 @@
       </section>
 
       <section id="view-apps" class="view hidden">
-        <div class="view-header"><h2>App Management</h2></div>
-        <div class="chip-tabs" id="app-category-tabs">
-          <button class="chip-tab active" data-filter="all">All</button>
-          <button class="chip-tab" data-filter="user">User</button>
-          <button class="chip-tab" data-filter="system">System</button>
-          <button class="chip-tab" data-filter="disabled">Disabled</button>
+        <div class="view-header">
+          <h2>App Management</h2>
+          <span id="apps-summary" class="muted tiny"></span>
         </div>
-        <div class="apps-toolbar">
-          <input id="app-search" class="mono" placeholder="Search package name…" spellcheck="false" />
-          <button id="install-apk-btn" class="primary-btn">Sideload APK</button>
-        </div>
-        <div class="split-panel">
-          <div class="glass-card">
-            <div id="app-list" class="mono app-list"></div>
+
+        <!-- Sideloading. The whole banner is the drop target, not just the icon,
+             and it stays visible after a drop so the per-file result has
+             somewhere to appear. -->
+        <div id="apk-dropzone" class="dropzone">
+          <div class="dropzone-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v8a2 2 0 0 1-1 1.73l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.73l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="M3.3 7 12 12l8.7-5"/><path d="M12 22V12"/></svg>
           </div>
+          <div class="dropzone-text">
+            <strong>Drag &amp; drop an APK to sideload</strong>
+            <span class="muted tiny">Installed straight onto the device with <span class="mono">adb install -r</span>. Drop several at once — each one is reported on its own.</span>
+          </div>
+          <button id="install-apk-btn" class="primary-btn">Browse APK file</button>
+        </div>
+        <div id="apk-install-log" class="install-log hidden"></div>
+
+        <div class="apps-toolbar">
+          <div class="chip-tabs" id="app-category-tabs"></div>
+          <label class="search-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="app-search" placeholder="Search app or package name…" spellcheck="false" />
+          </label>
+        </div>
+
+        <div class="split-panel apps-panel">
+          <div class="glass-card app-table-card">
+            <div class="app-row app-table-head">
+              <span>Application &amp; package</span>
+              <span>Type</span>
+              <span>Status</span>
+              <span class="num">Size</span>
+              <span class="actions">Actions</span>
+            </div>
+            <div id="app-list" class="app-table"></div>
+          </div>
+
           <div class="glass-card inspector">
-            <h3>App diagnostics</h3>
-            <div id="app-inspector-empty" class="muted">Select an app to see details.</div>
+            <h3>App diagnostics &amp; permissions</h3>
+            <div id="app-inspector-empty" class="muted">Pick an app on the left to see its footprint and what it is allowed to do.</div>
             <div id="app-inspector-body" class="hidden">
-              <div class="data-cell"><span class="k">Package</span><span class="v mono" id="ai-pkg"></span></div>
-              <div class="data-cell"><span class="k">APK size</span><span class="v mono" id="ai-size"></span></div>
-              <div id="ai-permissions" class="permission-list mono"></div>
-              <button id="ai-clear-btn" class="ghost-btn">Clear app cache &amp; data</button>
-              <button id="ai-disable-btn" class="ghost-btn">Disable</button>
-              <button id="ai-enable-btn" class="ghost-btn">Enable</button>
-              <button id="ai-uninstall-btn" class="danger-btn">Uninstall via ADB</button>
+              <div class="ai-head">
+                <div id="ai-avatar" class="app-avatar lg"></div>
+                <div class="ai-head-text">
+                  <div id="ai-label" class="ai-label"></div>
+                  <div id="ai-pkg" class="mono tiny muted"></div>
+                </div>
+              </div>
+              <div id="ai-tags" class="ai-tags"></div>
+
+              <div class="field-label">Storage footprint</div>
+              <div id="ai-footprint" class="footprint"></div>
+
+              <div class="field-label">Declared app permissions <span id="ai-perm-summary" class="muted tiny"></span></div>
+              <div id="ai-permissions" class="permission-groups"></div>
+
+              <div class="ai-actions">
+                <button id="ai-clear-btn" class="act-btn act-neutral">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/><path d="M10 11v5M14 11v5"/></svg>
+                  Clear app cache &amp; data
+                </button>
+                <button id="ai-disable-btn" class="act-btn act-warn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18"/><path d="m5.6 5.6 12.8 12.8M18.4 5.6 5.6 18.4"/></svg>
+                  Freeze / disable (debloat)
+                </button>
+                <button id="ai-enable-btn" class="act-btn act-good">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                  Re-enable app
+                </button>
+                <button id="ai-uninstall-btn" class="act-btn act-danger">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M10 4h4l1 2H9z"/><path d="M6 6l1 14h10l1-14"/></svg>
+                  Uninstall via ADB
+                </button>
+              </div>
+              <div id="ai-note" class="muted tiny"></div>
             </div>
           </div>
         </div>
@@ -283,44 +464,111 @@
         </div>
 
         <div id="mm-webcam" class="glass-card">
-          <div class="card-head">
-            <h3>Camera stream</h3>
-            <span id="camera-state" class="badge-text">Standby</span>
-          </div>
-          <p class="muted">scrcpy reads a camera instead of the screen and draws it in its own window. The lens list and every resolution below come from the phone itself &mdash; a size the sensor does not report would make scrcpy exit, so nothing here is guessed.</p>
+          <div class="split-panel">
+            <!-- Left: Live Feed -->
+            <div class="cam-feed-panel">
+              <div class="cam-feed-header">
+                <div class="cam-feed-title">
+                  <svg class="cam-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l4-2.5v9L16 14"/></svg>
+                  <span>Live Camera Feed</span>
+                  <span id="camera-lens-label" class="cam-lens-tag">(Rear Main)</span>
+                </div>
+                <div class="cam-feed-meta">
+                  <span id="camera-state-dot" class="cam-dot standby"></span>
+                  <span id="camera-state" class="cam-state-text">Standby</span>
+                  <span class="cam-sep">|</span>
+                  <span id="camera-res-info" class="cam-res-info">Detecting&hellip;</span>
+                </div>
+              </div>
+              <div id="camera-preview" class="cam-preview-area">
+                <img id="camera-live-frame" class="cam-live-frame" alt="Camera live feed" />
+                <div class="cam-preview-placeholder">
+                  <svg class="cam-placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+                  <div class="cam-placeholder-text">Webcam Bridge is in Standby</div>
+                  <div class="cam-placeholder-hint">Press the camera button below to start streaming</div>
+                </div>
+                <div id="camera-live-badge" class="cam-live-badge hidden">
+                  <span class="cam-live-dot"></span> LIVE
+                </div>
+              </div>
+              <span id="camera-status" class="mirror-status"></span>
+              <div class="cam-controls-bar">
+                <button id="camera-start-btn" class="cam-main-btn cam-start-main" title="Start camera stream">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l4-2.5v9L16 14"/></svg>
+                </button>
+                <button id="camera-stop-btn" class="cam-main-btn cam-stop-main" title="Stop camera stream">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="2" y1="2" x2="22" y2="22"/><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l4-2.5v9L16 14"/></svg>
+                </button>
+                <button id="camera-screenshot-btn" class="cam-main-btn cam-capture-btn" title="Capture photo from camera">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/></svg>
+                </button>
+                <button id="camera-record-btn" class="cam-main-btn cam-record-btn" title="Record video from camera">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>
+                </button>
+                <div class="cam-controls-spacer"></div>
+                <button id="torch-btn" class="cam-main-btn cam-torch-btn" title="Toggle flashlight">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V18h8v-3.3A7 7 0 0 0 12 2z"/></svg>
+                </button>
+                <button id="camera-mic-btn" class="cam-main-btn cam-mic-btn" title="Toggle microphone">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="1" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4M8 21h8"/></svg>
+                </button>
+              </div>
+            </div>
 
-          <div class="control-bar">
-            <button id="camera-refresh-btn" class="ghost-btn" style="margin-top:0;">Detect cameras</button>
-            <span id="camera-detect-status" class="muted">Press Detect to read this phone's sensors.</span>
-          </div>
+            <!-- Right: Optics & Settings -->
+            <div class="cam-settings-panel">
+              <div class="cam-settings-head">
+                <svg class="cam-head-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                <h3>Optics &amp; Stream Parameters</h3>
+              </div>
 
-          <div class="field-label">Lens</div>
-          <div id="camera-lens-list" class="file-list" style="max-height:170px;">
-            <div class="muted" style="padding:10px 12px;">Not detected yet.</div>
-          </div>
+              <div class="field-label">Sensor / Lens Array</div>
+              <div id="camera-lens-list" class="cam-lens-list">
+                <div class="cam-lens-empty">Press &ldquo;Detect cameras&rdquo; to scan sensors.</div>
+              </div>
+              <button id="camera-refresh-btn" class="ghost-btn cam-detect-btn">
+                <svg class="cam-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.22-8.56"/><path d="M21 3v6h-6"/></svg>
+                Detect cameras
+              </button>
+              <span id="camera-detect-status" class="muted" style="font-size:12px;"></span>
 
-          <div class="path-bar" style="margin-top:12px;">
-            <select id="camera-size" class="mono"><option value="">Sensor default</option></select>
-            <select id="camera-fps" class="mono"><option value="">Default fps</option></select>
-          </div>
-          <div id="camera-size-note" class="muted" style="margin-top:6px;font-size:12px;"></div>
+              <div class="field-label" style="margin-top:14px;">Video Pipeline Resolution</div>
+              <select id="camera-size" class="mono cam-res-select">
+                <option value="">Auto (sensor default)</option>
+                <option value="854x480">480p SD (854 x 480)</option>
+                <option value="1280x720">720p HD (1280 x 720)</option>
+                <option value="1920x1080">1080p Full HD (1920 x 1080)</option>
+              </select>
 
-          <div class="checkbox-list">
-            <label class="checkbox-row"><input type="checkbox" id="camera-mic" /> Forward the phone microphone <span class="muted">(--audio-source=mic)</span></label>
-            <label class="checkbox-row"><input type="checkbox" id="camera-highspeed" /> High-speed mode <span class="muted">(only for sizes listed as high speed)</span></label>
+              <div class="cam-info-grid">
+                <div class="cam-info-row">
+                  <span class="cam-info-label">Microphone:</span>
+                  <span id="mic-status-value" class="cam-info-value green">Checking&hellip;</span>
+                </div>
+                <div class="cam-info-row">
+                  <span class="cam-info-label">High-speed Mode:</span>
+                  <label class="cam-toggle">
+                    <input type="checkbox" id="camera-highspeed" />
+                    <span class="cam-toggle-slider"></span>
+                  </label>
+                </div>
+                <div id="camera-fps-row" class="cam-info-row hidden">
+                  <span class="cam-info-label">High-speed FPS:</span>
+                  <select id="camera-fps" class="mono cam-fps-select">
+                    <option value="60">60 fps</option>
+                    <option value="120" selected>120 fps</option>
+                    <option value="240">240 fps</option>
+                    <option value="480">480 fps</option>
+                  </select>
+                </div>
+              </div>
+            </div>
           </div>
-
-          <div class="control-bar">
-            <button id="camera-start-btn" class="primary-btn" style="margin-top:0;">Start camera stream</button>
-            <button id="camera-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
-            <button id="torch-btn" class="ghost-btn" style="margin-top:0;" title="Toggles the flashlight quick-settings tile — there is no adb torch command">&#128161; Flashlight</button>
-          </div>
-          <p id="camera-status" class="mirror-status"></p>
 
           <div class="note-strip">
             <span class="note-icon">&#9432;</span>
             <div>
-              <strong id="bridge-label">Virtual camera: checking…</strong>
+              <strong id="bridge-label">Virtual camera: checking&hellip;</strong>
               <p id="bridge-hint" class="muted" style="margin:4px 0 0;"></p>
             </div>
           </div>
@@ -494,27 +742,66 @@
         </div>
 
         <div id="bl-unlock" class="split-panel">
-          <div class="glass-card">
-            <h3>Bootloader unlock suite</h3>
-            <p class="muted danger-text">Unlocking wipes all data on the device and may trip a tamper flag or void warranty. The generic command below only works on OEMs that support standard fastboot unlock — some (Xiaomi, OnePlus, Samsung, etc.) require their own account-bound unlock tool instead.</p>
-            <button id="reboot-bootloader-btn" class="ghost-btn">Reboot into bootloader (fastboot mode)</button>
-            <button id="unlock-btn" class="danger-btn">Execute bootloader unlock command</button>
+          <div class="glass-card bl-unlock-suite">
+            <div class="bl-suite-head">
+              <h3>&#128274; Bootloader Unlock Suite</h3>
+              <span id="bl-lock-status" class="bl-status-badge locked">LOCKED (SECURE)</span>
+            </div>
+            <div class="bl-warning-box">
+              <div class="bl-warning-title">&#9888; Security Notice &amp; Factory Reset Warning</div>
+              <p>Unlocking the bootloader allows flashing custom kernels, Magisk root, and GSI ROMs, but will automatically wipe all user data (Factory Reset) and trip Knox/Play Integrity status.</p>
+            </div>
+            <div class="bl-info-row">
+              <span class="bl-info-label">OEM Unlocking in Dev Options:</span>
+              <span id="bl-oem-status" class="bl-info-value green">Checking&hellip;</span>
+            </div>
+            <div class="bl-info-row">
+              <span class="bl-info-label">Fastboot Protocol Link:</span>
+              <span id="bl-fb-status" class="bl-info-value green">Checking&hellip;</span>
+            </div>
+            <button id="reboot-bootloader-btn" class="ghost-btn bl-action-btn">
+              <span class="bl-btn-icon">&#8634;</span> Reboot into Bootloader (Fastboot Mode)
+            </button>
+            <button id="unlock-btn" class="danger-btn bl-action-btn bl-unlock-btn">
+              <span class="bl-btn-icon">&#128275;</span> Execute Bootloader Unlock Command
+            </button>
+            <pre id="bootloader-output" class="mono output-block"></pre>
           </div>
-          <div class="glass-card">
-            <h3>Fastboot partition flasher</h3>
-            <div class="field-label">Target partition</div>
-            <select id="flash-partition" class="mono">
-              <option value="boot">boot (kernel &amp; ramdisk)</option>
+
+          <div class="glass-card bl-flasher-suite">
+            <div class="bl-suite-head">
+              <h3>
+                <svg class="bl-head-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="4" y="4" width="16" height="16" rx="2"/>
+                  <rect x="9" y="9" width="6" height="6"/>
+                  <path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/>
+                </svg>
+                Fastboot Partition Flasher (.img)
+              </h3>
+              <span class="bl-flash-badge mono">fastboot flash</span>
+            </div>
+            <div class="field-label">Target Flash Partition</div>
+            <select id="flash-partition" class="mono bl-partition-select">
+              <option value="boot">boot (Kernel &amp; Ramdisk)</option>
               <option value="recovery">recovery</option>
               <option value="vendor_boot">vendor_boot</option>
               <option value="dtbo">dtbo</option>
               <option value="vbmeta">vbmeta</option>
             </select>
-            <div class="field-label">Image file</div>
-            <button id="choose-flash-img-btn" class="ghost-btn">Choose .img from PC</button>
-            <div id="flash-img-path" class="muted mono"></div>
-            <button id="flash-btn" class="primary-btn">Flash to partition</button>
-            <pre id="bootloader-output" class="mono output-block"></pre>
+            <div class="field-label">Select Image File (.img)</div>
+            <div id="flash-img-drop" class="bl-img-drop-zone">
+              <svg class="bl-upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <div class="bl-img-text">Choose .img from PC</div>
+              <div id="flash-img-path" class="bl-img-filename muted">e.g. magisk_patched_boot.img</div>
+              <input type="file" id="flash-img-file" accept=".img" class="hidden" />
+            </div>
+            <button id="flash-btn" class="primary-btn bl-action-btn bl-flash-btn">
+              <span class="bl-btn-icon">&#9654;</span> Flash to [<span id="flash-partition-label">boot</span>] Partition
+            </button>
           </div>
         </div>
 
@@ -541,32 +828,111 @@
     </main>
   </div>
 
-  <div id="device-modal" class="modal hidden">
+  <div id="startup-chooser" class="modal hidden">
     <div class="modal-card glass-card wide">
       <div class="modal-head">
-        <h3>Devices</h3>
-        <button id="device-modal-close" class="icon-btn">&times;</button>
+        <h3>Select a Device</h3>
+        <span class="muted">Multiple devices detected. Choose one to manage.</span>
       </div>
-      <div id="device-list" class="device-list"></div>
-      <button id="pair-btn" class="ghost-btn">+ Pair wireless</button>
+      <div id="startup-device-list" class="device-list"></div>
+      <div class="modal-actions">
+        <button id="startup-refresh-btn" class="ghost-btn">Refresh</button>
+      </div>
     </div>
   </div>
 
-  <div id="pair-modal" class="modal hidden">
-    <div class="modal-card glass-card">
-      <h3>Pair wireless device</h3>
-      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the fields below, then read the connect port off the main Wireless debugging screen. To pair by QR instead, use "Pair with QR code" — the phone scans a code shown here.</p>
-      <label class="field-label">Pairing host &amp; port <span class="muted">(from the pairing dialog)</span></label>
-      <input id="pair-host" placeholder="192.168.1.23:41235" class="mono" spellcheck="false" />
-      <label class="field-label">Pairing code <span class="muted">(leave blank if already paired — a connect port alone just connects)</span></label>
-      <input id="pair-code" placeholder="123456" class="mono" spellcheck="false" />
-      <label class="field-label">Connect port <span class="muted">(from "IP address &amp; port" — blank auto-detects, but only when pairing)</span></label>
-      <input id="pair-connect-port" placeholder="37123" class="mono" spellcheck="false" />
-      <p id="pair-status" class="mirror-status"></p>
-      <div class="modal-actions">
-        <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
-        <button id="pair-scan-qr-btn" class="ghost-btn">Pair with QR code</button>
-        <button id="pair-submit-btn" class="primary-btn">Pair</button>
+  <div id="connect-modal" class="modal hidden">
+    <div class="modal-card glass-card wide connect-modal-card">
+      <div class="connect-modal-head">
+        <div class="connect-modal-title-row">
+          <svg class="connect-modal-icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/>
+          </svg>
+          <div>
+            <h3>Connect Android Device</h3>
+            <span class="muted">Pair via USB Debugging Cable or Wireless Wi-Fi Mode</span>
+          </div>
+        </div>
+        <button id="connect-modal-close" class="icon-btn">&times;</button>
+      </div>
+
+      <div class="connect-tabs">
+        <button class="connect-tab active" data-ctab="usb">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
+          USB Debugging Mode
+        </button>
+        <button class="connect-tab" data-ctab="wifi">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg>
+          Wireless Wi-Fi Mode
+        </button>
+        <button class="connect-tab" data-ctab="switch">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          Switch Device (<span id="connect-device-count">0</span>)
+        </button>
+      </div>
+
+      <div id="ctab-usb" class="connect-tab-panel active">
+        <div class="connect-info-box">
+          <div class="connect-info-title">HOW TO ENABLE USB DEBUGGING:</div>
+          <ol class="connect-steps">
+            <li>Open Android <strong>Settings</strong> &gt; <strong>About Phone</strong></li>
+            <li>Tap <strong>Build Number</strong> 7 times until Developer Mode is unlocked</li>
+            <li>Go back to <strong>System</strong> &gt; <strong>Developer Options</strong></li>
+            <li>Toggle <strong>USB Debugging</strong> to ON</li>
+            <li>Plug in USB cable and tap "Always allow from this computer" on your phone prompt</li>
+          </ol>
+        </div>
+        <div class="connect-status-bar">
+          <div class="connect-status-left">
+            <span id="usb-daemon-dot" class="connect-daemon-dot"></span>
+            <span class="connect-daemon-label">ADB Local Daemon Port 5037</span>
+            <span id="usb-daemon-status" class="connect-daemon-status">Listening for USB plug events</span>
+          </div>
+          <button id="usb-scan-btn" class="primary-btn connect-scan-btn">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.22-8.56"/><path d="M21 3v6h-6"/></svg>
+            Scan USB Ports
+          </button>
+        </div>
+      </div>
+
+      <div id="ctab-wifi" class="connect-tab-panel">
+        <div class="connect-info-box connect-info-warn">
+          <div class="connect-info-title">Wireless Debugging (Android 11+)</div>
+          <p class="muted" style="margin:4px 0 0;font-size:12px;">Ensure phone and PC are on the same Wi-Fi subnet. In Developer Options &gt; Wireless Debugging, find the device IP address and port.</p>
+        </div>
+        <div class="connect-form">
+          <div class="connect-form-row">
+            <div class="connect-field">
+              <label class="field-label">Phone Wi-Fi IP Address</label>
+              <input id="wifi-ip" class="mono" placeholder="192.168.1.112" spellcheck="false" />
+            </div>
+            <div class="connect-field connect-field-narrow">
+              <label class="field-label">Port</label>
+              <input id="wifi-port" class="mono" placeholder="5555" spellcheck="false" />
+            </div>
+          </div>
+          <div class="connect-field">
+            <label class="field-label">6-Digit Pairing Code <span class="muted">(Optional for initial pair)</span></label>
+            <input id="wifi-code" class="mono" placeholder="e.g. 482910" spellcheck="false" />
+          </div>
+          <button id="wifi-pair-btn" class="primary-btn connect-pair-btn">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg>
+            Pair &amp; Connect Over Wi-Fi
+          </button>
+          <p id="wifi-pair-status" class="mirror-status"></p>
+          <div class="connect-divider"><span>or</span></div>
+          <button id="wifi-qr-btn" class="ghost-btn connect-qr-btn">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="3" height="3"/><line x1="21" y1="14" x2="21" y2="14.01"/><line x1="14" y1="21" x2="14" y2="21.01"/><line x1="21" y1="21" x2="21" y2="21.01"/></svg>
+            Pair with QR Code
+          </button>
+        </div>
+      </div>
+
+      <div id="ctab-switch" class="connect-tab-panel">
+        <div class="connect-switch-label">Available Detected Devices:</div>
+        <div id="connect-device-list" class="connect-device-list">
+          <div class="muted" style="padding:16px;text-align:center;">No devices found. Connect via USB or Wi-Fi first.</div>
+        </div>
       </div>
     </div>
   </div>

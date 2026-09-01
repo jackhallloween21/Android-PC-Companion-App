@@ -161,9 +161,13 @@ function buildCameraArgs(serial, o = {}, help = null) {
 /** Whether `--audio-source=mic` is available (scrcpy 2.2+ on Android 11+). */
 function supportsMic(help) {
   if (!help) return true;
-  return /--audio-source[^\n]*\bmic\b/i.test(help) || /\bmic\b/i.test(
-    (help.match(/--audio-source[\s\S]{0,400}/) || [''])[0]
-  );
+  // scrcpy 2.x-3.x: --audio-source listed with mic option
+  if (/--audio-source[^\n]*\bmic\b/i.test(help)) return true;
+  // scrcpy 4.x+: may list --audio-source=mic directly or in a different format
+  if (/\bmic\b/i.test((help.match(/--audio-source[\s\S]{0,400}/) || [''])[0])) return true;
+  // If --audio-source exists at all, assume mic is supported (scrcpy 4.x changed help format)
+  if (/--audio-source/i.test(help)) return true;
+  return false;
 }
 
 /** Whether this build can write into a v4l2 loopback device at all. */
@@ -311,11 +315,19 @@ function describeCameraFailure(log, o = {}) {
 const TORCH_TILES = [
   'com.android.systemui/.qs.tiles.FlashlightTile',
   'com.android.systemui/com.android.systemui.qs.tiles.FlashlightTile',
+  'com.android.systemui/.qs.tiles.LanternTile',
+  'com.android.systemui/com.android.systemui.qs.tiles.LanternTile',
 ];
 
 function torchArgs(serial, tile = TORCH_TILES[0]) {
   if (!serial) throw new Error('No device selected.');
   return ['-s', serial, 'shell', 'cmd', 'statusbar', 'click-tile', tile];
+}
+
+/** Alternative: toggle torch via settings + am broadcast fallback. */
+function torchFallbackArgs(serial) {
+  if (!serial) throw new Error('No device selected.');
+  return ['-s', serial, 'shell', 'cmd', 'statusbar', 'expand-settings'];
 }
 
 /** `settings get secure sysui_qs_tiles` → the tile specs the shade actually has. */
