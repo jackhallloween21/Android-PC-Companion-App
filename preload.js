@@ -148,6 +148,12 @@ contextBridge.exposeInMainWorld('api', {
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
 
+  // theme: persisted { mode, accent } (+ the OS dark preference), and a live
+  // push when that OS preference flips so an "Auto" theme follows it.
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
+  onOsThemeChanged: (cb) => ipcRenderer.on('theme:osUpdated', (_e, osPrefersDark) => cb(osPrefersDark)),
+
   // QR pairing. The PC *shows* the code and the phone scans it, so this returns
   // a module matrix for the renderer to draw; progress arrives as events while
   // main watches mDNS for the phone.

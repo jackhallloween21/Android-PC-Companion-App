@@ -23,9 +23,35 @@
       <span id="status-device" class="mono">No device</span>
     </div>
     <div class="titlebar-controls">
+      <button id="theme-btn" title="Theme" aria-haspopup="dialog" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
       <button id="min-btn" title="Minimize">&#8211;</button>
       <button id="max-btn" title="Maximize">&#9633;</button>
       <button id="close-btn" title="Close">&times;</button>
+    </div>
+  </div>
+
+  <div id="theme-popover" class="hidden" role="dialog" aria-label="Theme settings">
+    <div class="theme-section">
+      <div class="theme-label">Appearance</div>
+      <div class="theme-mode-seg" role="radiogroup" aria-label="Theme mode">
+        <button class="theme-mode-btn" data-mode="dark" type="button">Dark</button>
+        <button class="theme-mode-btn" data-mode="light" type="button">Light</button>
+        <button class="theme-mode-btn" data-mode="auto" type="button">Auto</button>
+      </div>
+    </div>
+    <div class="theme-section">
+      <div class="theme-label">Accent</div>
+      <div id="theme-swatches" class="theme-swatches"></div>
+      <div class="theme-custom-row">
+        <label for="theme-custom-color">Custom</label>
+        <input type="color" id="theme-custom-color" value="#f5a524" />
+        <span id="theme-custom-hex" class="mono">#f5a524</span>
+      </div>
     </div>
   </div>
 

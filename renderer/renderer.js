@@ -2790,3 +2790,232 @@ setTimeout(() => {
     }
   }, 500);
 })();
+
+// ============================================================= theme picker
+// The sandboxed preload cannot expose src/theme to the renderer (require is
+// limited to electron), so this is a faithful mirror of the value logic in
+// src/theme.js — the same normalisation, contrast maths and mode resolution —
+// kept deliberately in lock-step with it. Main stays the source of truth for
+// what is *persisted*; this only decides what gets *painted*.
+
+const DEFAULT_ACCENT = '#f5a524';
+const DEFAULT_MODE = 'dark';
+const THEME_MODES = ['dark', 'light', 'auto'];
+const LIGHT_BG = '#eef1f6';
+const ACCENT_INK_DARK = '#10151d';
+const ACCENT_INK_LIGHT = '#ffffff';
+const ACCENT_PRESETS = [
+  { name: 'Amber', hex: '#f5a524' },
+  { name: 'Coral', hex: '#fb7185' },
+  { name: 'Teal', hex: '#2dd4bf' },
+  { name: 'Blue', hex: '#3b82f6' },
+  { name: 'Violet', hex: '#8b5cf6' },
+  { name: 'Green', hex: '#22c55e' },
+  { name: 'Cyan', hex: '#38bdf8' },
+  { name: 'Pink', hex: '#ec4899' },
+];
+
+function normalizeHex(input) {
+  if (typeof input !== 'string') return null;
+  let s = input.trim().toLowerCase();
+  if (s.startsWith('#')) s = s.slice(1);
+  if (/^[0-9a-f]{3}$/.test(s)) s = s.split('').map((c) => c + c).join('');
+  if (!/^[0-9a-f]{6}$/.test(s)) return null;
+  return `#${s}`;
+}
+
+function hexToRgb(hex) {
+  const norm = normalizeHex(hex);
+  if (!norm) return null;
+  return {
+    r: parseInt(norm.slice(1, 3), 16),
+    g: parseInt(norm.slice(3, 5), 16),
+    b: parseInt(norm.slice(5, 7), 16),
+  };
+}
+
+function luminance(hex) {
+  const c = hexToRgb(hex);
+  if (!c) return 0;
+  const lin = (v) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+const contrast = (a, b) => (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+
+function accentInkOn(hex) {
+  if (!hexToRgb(hex)) return ACCENT_INK_LIGHT;
+  const L = luminance(hex);
+  return contrast(L, luminance(ACCENT_INK_DARK)) >= contrast(L, luminance(ACCENT_INK_LIGHT))
+    ? ACCENT_INK_DARK
+    : ACCENT_INK_LIGHT;
+}
+
+// Accent-as-text: unchanged on dark, darkened toward black (hue preserved) in
+// 15% steps until it clears WCAG AA on the light ground.
+function accentTextFor(hex, resolvedMode) {
+  const norm = normalizeHex(hex);
+  if (!norm) return DEFAULT_ACCENT;
+  if (resolvedMode !== 'light') return norm;
+  const bgL = luminance(LIGHT_BG);
+  const ratio = (l) => (Math.max(l, bgL) + 0.05) / (Math.min(l, bgL) + 0.05);
+  const toHex = (o) => `#${[o.r, o.g, o.b]
+    .map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0'))
+    .join('')}`;
+  let cur = hexToRgb(norm);
+  for (let i = 0; i < 24; i += 1) {
+    const h = toHex(cur);
+    if (ratio(luminance(h)) >= 4.5) return h;
+    cur = { r: cur.r * 0.85, g: cur.g * 0.85, b: cur.b * 0.85 };
+  }
+  return '#0b0f14';
+}
+
+function resolveMode(mode, osPrefersDark) {
+  const m = THEME_MODES.includes(mode) ? mode : DEFAULT_MODE;
+  if (m === 'auto') return osPrefersDark ? 'dark' : 'light';
+  return m;
+}
+
+// Repaint the whole app: toggle the one light-mode class and push the four
+// accent custom properties inline. In dark mode these equal the stylesheet's
+// :root defaults, so nothing about the original design shifts.
+function applyTheme(mode, accent, osPrefersDark) {
+  const resolved = resolveMode(mode, osPrefersDark);
+  const root = document.documentElement;
+  root.classList.toggle('theme-light', resolved === 'light');
+  const norm = normalizeHex(accent) || DEFAULT_ACCENT;
+  const c = hexToRgb(norm);
+  root.style.setProperty('--accent', norm);
+  root.style.setProperty('--accent-rgb', `${c.r}, ${c.g}, ${c.b}`);
+  root.style.setProperty('--accent-ink', accentInkOn(norm));
+  root.style.setProperty('--accent-text', accentTextFor(norm, resolved));
+}
+
+const themeState = { mode: DEFAULT_MODE, accent: DEFAULT_ACCENT, osPrefersDark: true };
+
+function paintTheme() {
+  applyTheme(themeState.mode, themeState.accent, themeState.osPrefersDark);
+  syncThemeControls();
+}
+
+// Reflect current state onto the popover controls.
+function syncThemeControls() {
+  qAll('.theme-mode-btn').forEach((btn) =>
+    btn.classList.toggle('active', btn.dataset.mode === themeState.mode));
+  const norm = normalizeHex(themeState.accent);
+  qAll('.theme-swatch').forEach((btn) =>
+    btn.classList.toggle('active', normalizeHex(btn.dataset.accent) === norm));
+  const picker = el('theme-custom-color');
+  const hexLabel = el('theme-custom-hex');
+  if (picker && norm) picker.value = norm;
+  if (hexLabel && norm) hexLabel.textContent = norm;
+}
+
+function buildSwatches() {
+  const wrap = el('theme-swatches');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  for (const preset of ACCENT_PRESETS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'theme-swatch';
+    b.dataset.accent = preset.hex;
+    b.title = preset.name;
+    b.setAttribute('aria-label', preset.name);
+    b.style.background = preset.hex;
+    b.onclick = () => chooseAccent(preset.hex);
+    wrap.appendChild(b);
+  }
+}
+
+// Optimistically paint, then persist and re-apply from main's sanitised reply
+// (which also carries the current OS dark preference).
+async function persist(patch) {
+  paintTheme();
+  try {
+    const saved = await window.api.setSettings(patch);
+    themeState.mode = saved.mode;
+    themeState.accent = saved.accent;
+    themeState.osPrefersDark = saved.osPrefersDark;
+    paintTheme();
+  } catch { /* keep the optimistic paint if the write fails */ }
+}
+
+function chooseMode(mode) {
+  themeState.mode = mode;
+  persist({ mode });
+}
+
+function chooseAccent(accent) {
+  themeState.accent = accent;
+  persist({ accent });
+}
+
+function openThemePopover() {
+  el('theme-popover').classList.remove('hidden');
+  el('theme-btn').classList.add('active');
+  el('theme-btn').setAttribute('aria-expanded', 'true');
+}
+function closeThemePopover() {
+  el('theme-popover').classList.add('hidden');
+  el('theme-btn').classList.remove('active');
+  el('theme-btn').setAttribute('aria-expanded', 'false');
+}
+
+async function initTheme() {
+  if (!window.api || !window.api.getSettings) return;
+  buildSwatches();
+
+  qAll('.theme-mode-btn').forEach((btn) => (btn.onclick = () => chooseMode(btn.dataset.mode)));
+
+  const picker = el('theme-custom-color');
+  if (picker) {
+    // Live preview while dragging; only commit (write to disk) on change.
+    picker.addEventListener('input', () => {
+      const norm = normalizeHex(picker.value);
+      if (!norm) return;
+      themeState.accent = norm;
+      paintTheme();
+    });
+    picker.addEventListener('change', () => {
+      const norm = normalizeHex(picker.value);
+      if (norm) chooseAccent(norm);
+    });
+  }
+
+  const gear = el('theme-btn');
+  gear.onclick = (e) => {
+    e.stopPropagation();
+    if (el('theme-popover').classList.contains('hidden')) openThemePopover();
+    else closeThemePopover();
+  };
+  document.addEventListener('click', (e) => {
+    const pop = el('theme-popover');
+    if (pop.classList.contains('hidden')) return;
+    if (pop.contains(e.target) || gear.contains(e.target)) return;
+    closeThemePopover();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !el('theme-popover').classList.contains('hidden')) closeThemePopover();
+  });
+
+  // Follow the OS light/dark preference live while in Auto.
+  window.api.onOsThemeChanged((osPrefersDark) => {
+    themeState.osPrefersDark = osPrefersDark;
+    if (themeState.mode === 'auto') paintTheme();
+  });
+
+  try {
+    const s = await window.api.getSettings();
+    themeState.mode = s.mode;
+    themeState.accent = s.accent;
+    themeState.osPrefersDark = s.osPrefersDark;
+  } catch { /* fall back to the dark/amber defaults already in themeState */ }
+  paintTheme();
+}
+
+initTheme();

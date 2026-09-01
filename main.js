@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
+const { sanitizeSettings } = require('./src/theme');
 const {
   POWER_SCRIPT,
   parsePowerDump,
@@ -164,6 +165,13 @@ function createWindow() {
   // reachable by accident.
   win.webContents.on('did-start-navigation', () => qrPairing.cancel());
   win.on('closed', () => qrPairing.cancel());
+  // When the OS light/dark preference flips, tell the renderer so an "Auto"
+  // theme follows it live. Bound to this window and torn down with it.
+  const onNativeThemeUpdated = () => {
+    if (!win.isDestroyed()) win.webContents.send('theme:osUpdated', nativeTheme.shouldUseDarkColors);
+  };
+  nativeTheme.on('updated', onNativeThemeUpdated);
+  win.on('closed', () => nativeTheme.removeListener('updated', onNativeThemeUpdated));
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -560,6 +568,44 @@ function saveKnown(list) {
   try { fs.writeFileSync(KNOWN_FILE(), JSON.stringify(pruneKnown(list), null, 2)); }
   catch { /* a read-only profile is not worth failing a connection over */ }
 }
+
+// --------------------------------------------------------------- theme settings
+// Persisted exactly like known-devices: a small JSON file in userData.
+// sanitizeSettings (shared with the renderer through src/theme) guarantees a
+// valid { mode, accent } even when the file is absent, hand-edited, or corrupt,
+// so a bad settings.json can never stop the app painting.
+const SETTINGS_FILE = () => path.join(app.getPath('userData'), 'settings.json');
+
+function loadSettings() {
+  try {
+    return sanitizeSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE(), 'utf8')));
+  } catch {
+    return sanitizeSettings(null);
+  }
+}
+
+// Merges a partial patch ({ mode } or { accent }) over what is on disk, so the
+// renderer can save one field without clobbering the other, then re-sanitizes.
+function saveSettings(patch) {
+  const merged = { ...loadSettings(), ...(patch && typeof patch === 'object' ? patch : {}) };
+  const next = sanitizeSettings(merged);
+  try { fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(next, null, 2)); }
+  catch { /* read-only profile: the sanitized value still applies for this run */ }
+  return next;
+}
+
+// osPrefersDark rides along so the renderer can resolve "auto" without a second
+// round-trip; nativeTheme is only valid after app is ready, which holds here
+// because these fire in response to the loaded renderer.
+ipcMain.handle('settings:get', async () => ({
+  ...loadSettings(),
+  osPrefersDark: nativeTheme.shouldUseDarkColors,
+}));
+
+ipcMain.handle('settings:set', async (_e, patch) => ({
+  ...saveSettings(patch),
+  osPrefersDark: nativeTheme.shouldUseDarkColors,
+}));
 
 /** Serials adb currently has attached. */
 async function attachedSerials() {
