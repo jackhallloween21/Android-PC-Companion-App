@@ -1338,6 +1338,15 @@ let appFilter = 'all';
 let appSearch = '';
 let allApps = [];
 
+// Real launcher icons, fetched lazily from the device after the rows are already
+// on screen with their monogram tiles. Kept in a map so switching filters (which
+// rebuilds the row DOM) or re-opening the view repaints instantly instead of
+// asking the phone again. `iconSerial` scopes the cache to one device and the
+// epoch lets a device switch abandon an in-flight sweep.
+const appIcons = new Map();
+let iconSerial = null;
+let iconEpoch = 0;
+
 const APP_TABS = [
   { key: 'all', label: 'All', test: () => true },
   { key: 'user', label: 'User', test: (a) => a.type === 'user' },
@@ -1420,6 +1429,65 @@ function appRowMarkup(app) {
     </span>`;
 }
 
+// Layers a real icon over a monogram tile. The <img> fades in only once it has
+// decoded; if the data URL is somehow unusable it removes itself and the letter
+// underneath stays, so a row is never left blank.
+function setAvatarImage(avatar, dataUrl) {
+  if (!avatar || !dataUrl) return;
+  let img = avatar.querySelector('img.avatar-img');
+  if (!img) {
+    img = document.createElement('img');
+    img.className = 'avatar-img';
+    img.alt = '';
+    img.decoding = 'async';
+    img.onload = () => avatar.classList.add('has-img');
+    img.onerror = () => { img.remove(); avatar.classList.remove('has-img'); };
+    avatar.appendChild(img);
+  }
+  if (img.getAttribute('src') !== dataUrl) img.src = dataUrl;
+}
+
+// Paints a known icon onto every place the package is shown: its table row and,
+// when it is the one open, the inspector tile.
+function paintAppIcon(pkg, dataUrl) {
+  const row = el('app-list') && el('app-list').querySelector(`.app-row[data-pkg="${pkg}"] .app-avatar`);
+  if (row) setAvatarImage(row, dataUrl);
+  if (state.selectedApp && state.selectedApp.pkg === pkg) setAvatarImage(el('ai-avatar'), dataUrl);
+}
+
+// Re-applies whatever is already cached; called after any render that rebuilds
+// rows (filter change, search, reload) so icons do not vanish until re-fetched.
+function paintCachedIcons() {
+  if (iconSerial !== state.selected) return;
+  for (const [pkg, url] of appIcons) paintAppIcon(pkg, url);
+}
+
+// Pulls icons from the device in small batches and paints each batch as it lands,
+// so the grid fills in progressively instead of waiting on the whole phone. The
+// call is best-effort: main.js returns {} when app_process is not lettable, and
+// the monograms simply stay.
+async function fetchAppIcons(serial, pkgs) {
+  if (!serial || !window.api.getAppIcons) return;
+  if (iconSerial !== serial) { appIcons.clear(); iconSerial = serial; }
+  const epoch = (iconEpoch += 1);
+  const pending = pkgs.filter((p) => !appIcons.has(p));
+  for (let i = 0; i < pending.length; i += 40) {
+    const batch = pending.slice(i, i + 40);
+    let map;
+    try {
+      map = await window.api.getAppIcons(serial, batch);
+    } catch {
+      map = {};
+    }
+    // The user switched device or kicked off another sweep — drop this one.
+    if (epoch !== iconEpoch || iconSerial !== serial) return;
+    for (const pkg of Object.keys(map || {})) {
+      appIcons.set(pkg, map[pkg]);
+      paintAppIcon(pkg, map[pkg]);
+    }
+  }
+}
+
 function renderApps() {
   renderAppTabs();
   const container = el('app-list');
@@ -1454,6 +1522,7 @@ function renderApps() {
     });
     container.appendChild(row);
   }
+  paintCachedIcons();
 }
 
 async function loadApps() {
@@ -1462,6 +1531,9 @@ async function loadApps() {
   try {
     allApps = await window.api.listAppsDetailed(state.selected);
     renderApps();
+    // Icons are fetched after the rows exist, so the list is usable immediately
+    // and fills with real launcher art as the phone answers.
+    fetchAppIcons(state.selected, allApps.map((a) => a.pkg));
     // The inspector is showing a snapshot from before the sweep; refresh it so a
     // just-frozen app does not keep offering to be frozen.
     const still = state.selectedApp && allApps.find((a) => a.pkg === state.selectedApp.pkg);
@@ -1630,8 +1702,13 @@ function permissionsMarkup(detail) {
 
 function renderInspector(detail) {
   const avatar = el('ai-avatar');
+  avatar.classList.remove('has-img');
+  const existingImg = avatar.querySelector('img.avatar-img');
+  if (existingImg) existingImg.remove();
   avatar.textContent = detail.monogram || '?';
   avatar.style.background = detail.color || 'var(--panel-strong)';
+  // If we already have this app's real icon, drop it straight onto the tile.
+  if (appIcons.has(detail.pkg)) setAvatarImage(avatar, appIcons.get(detail.pkg));
   setText('ai-label', detail.label || detail.pkg);
   setText('ai-pkg', detail.pkg);
 

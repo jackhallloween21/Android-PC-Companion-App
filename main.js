@@ -57,6 +57,7 @@ const {
   parseDuBytes,
   isInstallable,
   parseInstallResult,
+  parseIconDump,
 } = require('./src/apps');
 // QR pairing lives here, not in preload.js: the preload runs sandboxed, where
 // `require` is a polyfill that only resolves `electron` and a couple of node
@@ -1704,6 +1705,77 @@ ipcMain.handle('apps:uninstall', (_e, { serial, pkg }) => adb(['-s', serial, 'un
 ipcMain.handle('apps:disable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', assertPackage(pkg)]));
 ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'enable', assertPackage(pkg)]));
 ipcMain.handle('apps:clearData', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'clear', assertPackage(pkg)]));
+
+// ---------------------------------------------------------------------------
+// App icons
+//
+// adb exposes no launcher icon: `pm`/`dumpsys` print a numeric resource id, and
+// the bitmap itself only exists inside the APK. Pulling every APK to unzip one
+// PNG would move gigabytes. Instead a ~4 KB dex helper is pushed once and run
+// with `app_process`, exactly as scrcpy runs its server: that gives it a real
+// PackageManager, from which getApplicationIcon() renders each icon to a PNG we
+// read straight off stdout. It runs as the shell user, so a handful of apps
+// with locked-down icons simply do not answer — the UI keeps its monogram tile
+// for those, and for any device where app_process is not lettable at all.
+// ---------------------------------------------------------------------------
+
+const ICON_DEX_REMOTE = '/data/local/tmp/companion-icons.dex';
+
+// Bundled next to smartphone.png. When packaged the app runs from inside
+// app.asar, which the external adb binary cannot read, so the dex is unpacked
+// (see "asarUnpack" in package.json) and reached through app.asar.unpacked.
+//
+// Order matters: Electron patches fs so existsSync() returns true for the path
+// *inside* app.asar, but adb — an external process — cannot stat that virtual
+// path, so pushing it would fail and every icon would fall back to a monogram
+// in the packaged .exe. We therefore try the unpacked copy first. In dev there
+// is no "app.asar" segment, so the replace is a no-op and both entries are the
+// same real path.
+function iconDexPath() {
+  const inApp = path.join(__dirname, 'assets', 'classes.dex');
+  const unpacked = inApp.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+  for (const candidate of [unpacked, inApp]) {
+    try { if (fs.existsSync(candidate)) return candidate; } catch { /* keep looking */ }
+  }
+  return inApp;
+}
+
+// The push is done once per serial and shared between the renderer's batched
+// calls; a failure clears the cache so a later attempt can retry rather than
+// being stuck behind a rejected promise.
+const iconDexPushes = new Map();
+function ensureIconDex(serial) {
+  if (!iconDexPushes.has(serial)) {
+    const dex = iconDexPath();
+    const push = adb(['-s', serial, 'push', dex, ICON_DEX_REMOTE])
+      .then(() => true)
+      .catch((err) => { iconDexPushes.delete(serial); throw err; });
+    iconDexPushes.set(serial, push);
+  }
+  return iconDexPushes.get(serial);
+}
+
+ipcMain.handle('apps:icons', async (_e, { serial, pkgs }) => {
+  const list = (Array.isArray(pkgs) ? pkgs : [])
+    .map((p) => String(p || '').trim())
+    .filter((p) => PKG_RE.test(p));
+  if (!serial || !list.length) return {};
+  try {
+    if (!fs.existsSync(iconDexPath())) return {};
+    await ensureIconDex(serial);
+    // Every id is PKG_RE-checked above, so none can smuggle a shell token into
+    // the app_process command line.
+    const out = await adb([
+      '-s', serial, 'shell',
+      `CLASSPATH=${ICON_DEX_REMOTE}`, 'app_process', '/system/bin',
+      'com.companion.IconExtractor', ...list,
+    ]);
+    return parseIconDump(out);
+  } catch {
+    // No icons is not an error the user needs to see — the monograms stand in.
+    return {};
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Backup

@@ -66,6 +66,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // apps
   listAppsDetailed: (serial) => ipcRenderer.invoke('apps:listDetailed', serial),
+  getAppIcons: (serial, pkgs) => ipcRenderer.invoke('apps:icons', { serial, pkgs }),
   getAppDetail: (serial, pkg, app) => ipcRenderer.invoke('apps:detail', { serial, pkg, app }),
   installApk: (serial) => ipcRenderer.invoke('apps:install', serial),
   // Drag-and-drop sideloading. A dropped File has no usable path in the

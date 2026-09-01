@@ -839,6 +839,39 @@ function parseInstallResult(output) {
   return { ok: false, code, message };
 }
 
+/**
+ * Turns the on-device icon helper's output into a { pkg: dataUrl } map.
+ *
+ * The helper (a tiny dex run with `app_process`, which is the only way to reach
+ * PackageManager.getApplicationIcon from the adb shell without pulling whole
+ * APKs) prints one `ICON:<pkg>:<base64png>` line per app it could render, plus
+ * whatever the runtime writes to stderr — Binder warnings, a stray "WARNING:
+ * linker" line, an occasional stack trace for a package it could not read. So
+ * every line is treated as untrusted: only `ICON:` lines with a plausible
+ * package id and a clean base64 payload are kept, and anything else is dropped
+ * rather than allowed to become a broken <img src>.
+ */
+const ICON_PKG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.]*$/;
+const ICON_B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function parseIconDump(stdout) {
+  const icons = {};
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.startsWith('ICON:')) continue;
+    const body = line.slice(5);
+    const sep = body.indexOf(':');
+    if (sep <= 0) continue;
+    const pkg = body.slice(0, sep).trim();
+    const b64 = body.slice(sep + 1).trim();
+    // A valid PNG is at least a few hundred bytes; a handful of base64 chars is
+    // a truncated line, not an icon, so it is discarded.
+    if (!ICON_PKG_RE.test(pkg) || b64.length < 32 || !ICON_B64_RE.test(b64)) continue;
+    icons[pkg] = `data:image/png;base64,${b64}`;
+  }
+  return icons;
+}
+
 module.exports = {
   KIB, APPS_SCRIPT, parseAppsDump, parsePackageSet, packageFromListLine,
   parseApkPaths, parseInstallers, parseStatSizes, CATALOGUE,
@@ -851,4 +884,5 @@ module.exports = {
   buildAppList, APP_FILTERS, filterApps, countApps,
   NO_SIZE_NOTE, buildAppDetail,
   parseDuBytes, isApkPath, isInstallable, INSTALL_FAILURES, parseInstallResult,
+  parseIconDump,
 };

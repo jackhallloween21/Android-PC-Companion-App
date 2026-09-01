@@ -1152,8 +1152,21 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   display: grid; place-items: center;
   font-size: 11.5px; font-weight: 800; letter-spacing: 0.02em;
   color: #0a0e14;
+  position: relative; overflow: hidden;
 }
 .app-avatar.lg { width: 42px; height: 42px; border-radius: 12px; font-size: 16px; }
+
+/* When the on-device helper returns a real launcher icon it is layered over the
+   monogram tile. The coloured tile stays as the backing so an icon with
+   transparent corners still sits on something, and the monogram letter is
+   hidden (not removed) so it reappears instantly if the image ever fails. */
+.app-avatar .avatar-img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; border-radius: inherit; display: block;
+  opacity: 0; transition: opacity 0.15s ease;
+}
+.app-avatar.has-img { color: transparent; }
+.app-avatar.has-img .avatar-img { opacity: 1; }
 
 .app-ident { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .app-names { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
