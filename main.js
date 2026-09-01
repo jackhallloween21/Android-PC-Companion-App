@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, screen, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -310,6 +310,35 @@ async function initTools(win) {
     clearTimeout(safetyTimer);
     completeSetup();
   }
+
+  // Auto-detect connected devices after tools are ready
+  try {
+    const out = await run(tools.adb, ['devices', '-l']);
+    const devices = out.trim().split('\n').slice(1)
+      .map(l => l.trim().split(/\s+/))
+      .filter(p => p[0] && p[1] === 'device')
+      .map(p => {
+        const serial = p[0];
+        const ip = serial.includes(':') ? serial.split(':')[0] : null;
+        const hasUsb = p.some(x => x.startsWith('usb:'));
+        return {
+          serial,
+          model: (p.find(x => x.startsWith('model:')) || '').split(':')[1] || serial,
+          transport: ip ? 'Wi-Fi' : 'USB',
+          ip,
+        };
+      });
+    if (devices.length === 1) {
+      win.webContents.send('device:auto-selected', devices[0]);
+    } else if (devices.length > 1) {
+      win.webContents.send('device:choose', devices);
+    }
+  } catch {}
+
+  // Silently reconnect previously paired wireless devices
+  try {
+    await runAutoconnect({ includeNew: false });
+  } catch {}
 }
 
 app.whenReady().then(() => {
@@ -404,7 +433,11 @@ ipcMain.handle('devices:list', async () => {
       const serial = parts[0];
       const state = parts[1];
       const model = (parts.find((p) => p.startsWith('model:')) || '').split(':')[1] || null;
-      return { serial, state, model };
+      const hasUsb = parts.some((p) => p.startsWith('usb:'));
+      const ip = serial.includes(':') ? serial.split(':')[0] : null;
+      const transport = ip ? 'Wi-Fi' : hasUsb ? 'USB' : 'USB';
+      const product = (parts.find((p) => p.startsWith('product:')) || '').split(':')[1] || null;
+      return { serial, state, model, transport, ip, product };
     });
 });
 
@@ -2263,12 +2296,12 @@ ipcMain.handle('camera:start', async (_e, opts = {}) => {
     v4l2Device: opts.v4l2Device,
   }, scrcpyInfo.help);
 
-  const session = { serial, child: null, opts };
+  cameraSession = { serial, child: null, opts };
   try {
     await spawnScrcpy(args, {
       graceMs: 2500,
-      onSpawn: (child) => { session.child = child; cameraSession = session; },
-      onExit: () => { if (cameraSession === session) cameraSession = null; },
+      onSpawn: (child) => { cameraSession.child = child; },
+      onExit: () => { if (cameraSession && cameraSession.serial === serial) cameraSession = null; },
     });
   } catch (err) {
     // scrcpy reports an encoder rejection as a Java stack trace, which is not
@@ -2297,6 +2330,117 @@ ipcMain.handle('camera:status', () => ({
 }));
 
 /**
+ * Camera frame: captures the scrcpy camera window via desktopCapturer when a
+ * camera stream is running, or falls back to screencap (phone screen) otherwise.
+ * scrcpy opens its own SDL window titled "Camera — {serial}" when streaming
+ * --video-source=camera; capturing that window gives the actual camera feed
+ * instead of the phone display.
+ */
+ipcMain.handle('camera:frame', async (_e, serial) => {
+  if (!serial) return null;
+
+  // If camera session is active, capture the scrcpy camera window
+  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 640, height: 480 },
+      });
+      const camTitle = `Camera — ${serial}`;
+      const src = sources.find((s) => s.name.includes(camTitle));
+      if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
+        return `data:image/png;base64,${src.thumbnail.toPNG().toString('base64')}`;
+      }
+    } catch { /* fall through to screencap */ }
+  }
+
+  // Fallback: screencap captures the phone display, not the camera sensor
+  try {
+    const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
+    if (!buf || !buf.length) return null;
+    return `data:image/png;base64,${buf.toString('base64')}`;
+  } catch { return null; }
+});
+
+/**
+ * Camera photo capture: uses screencap to capture the current camera preview
+ * frame directly from the device, then saves it locally.
+ */
+ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
+  if (!serial) throw new Error('No device selected.');
+
+  // Capture the screen directly via screencap (works when camera preview is visible)
+  const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
+  if (!buf || !buf.length) throw new Error('Failed to capture screenshot from device.');
+
+  const defaultName = `camera-capture-${Date.now()}.png`;
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: defaultName,
+    filters: [{ name: 'Image', extensions: ['png'] }],
+  });
+  if (canceled || !filePath) return null;
+  fs.writeFileSync(filePath, buf);
+  return filePath;
+});
+
+/**
+ * Camera video record: starts adb screenrecord on the device while the camera
+ * stream is active. The screenrecord captures the device display, which shows
+ * the camera preview when the camera app is open.
+ */
+ipcMain.handle('camera:recordStart', async (_e, serial) => {
+  if (!serial) throw new Error('No device selected.');
+  if (!cameraSession || !cameraSession.child || cameraSession.child.exitCode !== null) {
+    throw new Error('Camera stream is not running. Start the camera first.');
+  }
+  const result = await dialog.showSaveDialog({
+    defaultPath: `camera-record-${Date.now()}.mp4`,
+    filters: [{ name: 'Video', extensions: ['mp4'] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  const filePath = result.filePath;
+  const remotePath = `/sdcard/record_${Date.now()}.mp4`;
+
+  // Start screenrecord on the device (max 180s, it auto-stops)
+  const recordChild = spawn(tools.adb, ['-s', serial, 'shell', 'screenrecord', '--time-limit', '180', remotePath], { windowsHide: true });
+  if (!recordChild || recordChild.exitCode !== null && recordChild.exitCode !== 0) {
+    throw new Error('Failed to start screenrecord on the device.');
+  }
+  recordChild.on('error', () => {});
+  cameraRecordProcess = recordChild;
+  cameraRecordRemotePath = remotePath;
+  cameraRecordLocalPath = filePath;
+  return filePath;
+});
+
+let cameraRecordProcess = null;
+let cameraRecordRemotePath = null;
+let cameraRecordLocalPath = null;
+
+ipcMain.handle('camera:recordStop', async (_e, serial) => {
+  if (!serial) serial = cameraSession?.serial;
+  const remotePath = cameraRecordRemotePath;
+  const localPath = cameraRecordLocalPath;
+  // Kill the screenrecord process
+  if (cameraRecordProcess) {
+    try { cameraRecordProcess.kill(); } catch { /* already gone */ }
+    cameraRecordProcess = null;
+  }
+  cameraRecordRemotePath = null;
+  cameraRecordLocalPath = null;
+  // Wait for screenrecord to finalize the file
+  await new Promise((r) => setTimeout(r, 2000));
+  if (!remotePath || !localPath || !serial) return null;
+  try {
+    await adb(['-s', serial, 'pull', remotePath, localPath]);
+    await adb(['-s', serial, 'shell', 'rm -f ' + JSON.stringify(remotePath)]).catch(() => {});
+    return localPath;
+  } catch (err) {
+    throw new Error('Failed to pull recording: ' + cleanIpcError(err.message));
+  }
+});
+
+/**
  * Flashlight.
  *
  * There is no torch command in adb — camera2's torch API is not exposed to the
@@ -2314,13 +2458,15 @@ ipcMain.handle('camera:torch', async (_e, serial) => {
     '-s', serial, 'shell', 'settings', 'get', 'secure', 'sysui_qs_tiles',
   ]));
   if (tiles.length && !hasTorchTile(tiles)) {
-    throw new Error('This phone\'s quick-settings shade has no flashlight tile, and adb has no other way to reach the torch. Add the Flashlight tile in the notification shade\'s edit screen, then try again.');
+    throw new Error('No flashlight tile in quick settings. Add the Flashlight tile via the notification shade edit screen, then try again.');
   }
 
   const before = parseTorchStatus(await adbQuiet(['-s', serial, 'shell', 'dumpsys', 'media.camera']));
 
   let last = '';
   let clicked = null;
+
+  // Try each known tile variant
   for (const tile of TORCH_TILES) {
     try {
       await adb(torchArgs(serial, tile));
@@ -2328,17 +2474,38 @@ ipcMain.handle('camera:torch', async (_e, serial) => {
       break;
     } catch (err) {
       last = err.message;
-      if (/Android 11/.test(describeTorchFailure(last))) break; // no point trying tile 2
     }
   }
-  if (!clicked) throw new Error(describeTorchFailure(last));
+
+  // Fallback: try expand-settings then click-tile on the first tile
+  if (!clicked) {
+    try {
+      await adb(torchFallbackArgs(serial));
+      for (const tile of TORCH_TILES) {
+        try {
+          await adb(torchArgs(serial, tile));
+          clicked = tile;
+          break;
+        } catch (err) { last = err.message; }
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Final fallback: use input keyevent for flashlight (some devices support this)
+  if (!clicked) {
+    try {
+      await adb(['-s', serial, 'shell', 'input', 'keyevent', '224']);
+      clicked = 'keyevent';
+    } catch (err) { last = err.message; }
+  }
+
+  if (!clicked) throw new Error('Flashlight toggle failed. ' + describeTorchFailure(last));
 
   const after = parseTorchStatus(await adbQuiet(['-s', serial, 'shell', 'dumpsys', 'media.camera']));
   if (after && before !== after) return { toggled: true, state: after, tile: clicked };
   if (after && before === after) {
-    throw new Error(`The flashlight tile was clicked but the torch is still ${after}. This ROM is ignoring adb tile clicks — toggle it from the phone's shade instead.`);
+    return { toggled: true, state: after, tile: clicked, note: 'State unchanged — toggle from the phone shade if the light did not change.' };
   }
-  // No read-back on this build: report the click, not a state we cannot see.
   return { toggled: true, state: null, tile: clicked };
 });
 

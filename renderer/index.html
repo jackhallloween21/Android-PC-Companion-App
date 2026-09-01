@@ -12,13 +12,15 @@
 <body>
 
   <div id="titlebar">
-    <div class="titlebar-drag">
-      <span class="logo-dot"></span>
-      <span class="app-name">companion</span>
+    <div class="titlebar-drag titlebar-left">
+      <svg class="titlebar-logo" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/>
+      </svg>
+      <span class="app-name">PC Companion</span>
     </div>
-    <div class="titlebar-status">
-      <span id="status-device" class="mono">No device</span>
+    <div class="titlebar-status titlebar-center">
       <span id="status-dot" class="status-dot"></span>
+      <span id="status-device" class="mono">No device</span>
     </div>
     <div class="titlebar-controls">
       <button id="min-btn" title="Minimize">&#8211;</button>
@@ -39,23 +41,64 @@
 
   <div id="shell" class="hidden">
     <aside id="sidebar">
-      <div class="sidebar-group">
-        <div class="sidebar-label">Core Workstation</div>
-        <button class="nav-item active" data-view="dashboard">Dashboard</button>
-        <button class="nav-item" data-view="files">File Explorer</button>
-        <button class="nav-item" data-view="apps">App Management</button>
-        <button class="nav-item" data-view="mirror">Screen Mirror</button>
-        <button class="nav-item" data-view="console">Power Tools (ADB)</button>
-        <button class="nav-item" data-view="multimedia">Multimedia Hub</button>
-        <button class="nav-item" data-view="hardware">Hardware &amp; Power</button>
-        <button class="nav-item" data-view="bootloader">Bootloader &amp; Backup</button>
+      <div id="sidebar-device-card" class="sidebar-device-card" title="Click to connect or switch device">
+        <div class="sdc-phone-icon">
+          <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/>
+          </svg>
+        </div>
+        <div class="sdc-info">
+          <div class="sdc-name" id="sdc-name">No device connected</div>
+          <div class="sdc-meta">
+            <span id="sdc-conn-type" class="sdc-conn">—</span>
+            <span id="sdc-ip" class="sdc-ip hidden"></span>
+          </div>
+        </div>
       </div>
-      <div class="sidebar-group">
-        <div class="sidebar-label">Utilities</div>
-        <button class="nav-item" id="tools-nav-btn">Binaries &amp; Drivers</button>
-      </div>
-      <div class="sidebar-footer">
-        <button id="device-picker-btn" class="ghost-btn">Devices &amp; pairing</button>
+
+      <div class="sidebar-nav">
+        <div class="sidebar-group">
+          <div class="sidebar-label">Core Workstation</div>
+          <button class="nav-item active" data-view="dashboard">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+            Dashboard
+          </button>
+          <button class="nav-item" data-view="files">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            File Explorer
+          </button>
+          <button class="nav-item" data-view="apps">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h7v7h-7z"/></svg>
+            App Management
+          </button>
+          <button class="nav-item" data-view="mirror">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            Screen Mirror
+          </button>
+          <button class="nav-item" data-view="console">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            Power Tools (ADB)
+          </button>
+          <button class="nav-item" data-view="multimedia">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Multimedia Hub
+          </button>
+          <button class="nav-item" data-view="hardware">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg>
+            Hardware &amp; Power
+          </button>
+          <button class="nav-item" data-view="bootloader">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Bootloader &amp; Backup
+          </button>
+        </div>
+        <div class="sidebar-group">
+          <div class="sidebar-label">Utilities</div>
+          <button class="nav-item" id="tools-nav-btn">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+            Binaries &amp; Drivers
+          </button>
+        </div>
       </div>
     </aside>
 
@@ -421,44 +464,111 @@
         </div>
 
         <div id="mm-webcam" class="glass-card">
-          <div class="card-head">
-            <h3>Camera stream</h3>
-            <span id="camera-state" class="badge-text">Standby</span>
-          </div>
-          <p class="muted">scrcpy reads a camera instead of the screen and draws it in its own window. The lens list and every resolution below come from the phone itself &mdash; a size the sensor does not report would make scrcpy exit, so nothing here is guessed.</p>
+          <div class="split-panel">
+            <!-- Left: Live Feed -->
+            <div class="cam-feed-panel">
+              <div class="cam-feed-header">
+                <div class="cam-feed-title">
+                  <svg class="cam-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l4-2.5v9L16 14"/></svg>
+                  <span>Live Camera Feed</span>
+                  <span id="camera-lens-label" class="cam-lens-tag">(Rear Main)</span>
+                </div>
+                <div class="cam-feed-meta">
+                  <span id="camera-state-dot" class="cam-dot standby"></span>
+                  <span id="camera-state" class="cam-state-text">Standby</span>
+                  <span class="cam-sep">|</span>
+                  <span id="camera-res-info" class="cam-res-info">Detecting&hellip;</span>
+                </div>
+              </div>
+              <div id="camera-preview" class="cam-preview-area">
+                <img id="camera-live-frame" class="cam-live-frame" alt="Camera live feed" />
+                <div class="cam-preview-placeholder">
+                  <svg class="cam-placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+                  <div class="cam-placeholder-text">Webcam Bridge is in Standby</div>
+                  <div class="cam-placeholder-hint">Press the camera button below to start streaming</div>
+                </div>
+                <div id="camera-live-badge" class="cam-live-badge hidden">
+                  <span class="cam-live-dot"></span> LIVE
+                </div>
+              </div>
+              <span id="camera-status" class="mirror-status"></span>
+              <div class="cam-controls-bar">
+                <button id="camera-start-btn" class="cam-main-btn cam-start-main" title="Start camera stream">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l4-2.5v9L16 14"/></svg>
+                </button>
+                <button id="camera-stop-btn" class="cam-main-btn cam-stop-main" title="Stop camera stream">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="2" y1="2" x2="22" y2="22"/><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M16 10l4-2.5v9L16 14"/></svg>
+                </button>
+                <button id="camera-screenshot-btn" class="cam-main-btn cam-capture-btn" title="Capture photo from camera">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/></svg>
+                </button>
+                <button id="camera-record-btn" class="cam-main-btn cam-record-btn" title="Record video from camera">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>
+                </button>
+                <div class="cam-controls-spacer"></div>
+                <button id="torch-btn" class="cam-main-btn cam-torch-btn" title="Toggle flashlight">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V18h8v-3.3A7 7 0 0 0 12 2z"/></svg>
+                </button>
+                <button id="camera-mic-btn" class="cam-main-btn cam-mic-btn" title="Toggle microphone">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="1" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4M8 21h8"/></svg>
+                </button>
+              </div>
+            </div>
 
-          <div class="control-bar">
-            <button id="camera-refresh-btn" class="ghost-btn" style="margin-top:0;">Detect cameras</button>
-            <span id="camera-detect-status" class="muted">Press Detect to read this phone's sensors.</span>
-          </div>
+            <!-- Right: Optics & Settings -->
+            <div class="cam-settings-panel">
+              <div class="cam-settings-head">
+                <svg class="cam-head-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                <h3>Optics &amp; Stream Parameters</h3>
+              </div>
 
-          <div class="field-label">Lens</div>
-          <div id="camera-lens-list" class="file-list" style="max-height:170px;">
-            <div class="muted" style="padding:10px 12px;">Not detected yet.</div>
-          </div>
+              <div class="field-label">Sensor / Lens Array</div>
+              <div id="camera-lens-list" class="cam-lens-list">
+                <div class="cam-lens-empty">Press &ldquo;Detect cameras&rdquo; to scan sensors.</div>
+              </div>
+              <button id="camera-refresh-btn" class="ghost-btn cam-detect-btn">
+                <svg class="cam-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.22-8.56"/><path d="M21 3v6h-6"/></svg>
+                Detect cameras
+              </button>
+              <span id="camera-detect-status" class="muted" style="font-size:12px;"></span>
 
-          <div class="path-bar" style="margin-top:12px;">
-            <select id="camera-size" class="mono"><option value="">Sensor default</option></select>
-            <select id="camera-fps" class="mono"><option value="">Default fps</option></select>
-          </div>
-          <div id="camera-size-note" class="muted" style="margin-top:6px;font-size:12px;"></div>
+              <div class="field-label" style="margin-top:14px;">Video Pipeline Resolution</div>
+              <select id="camera-size" class="mono cam-res-select">
+                <option value="">Auto (sensor default)</option>
+                <option value="854x480">480p SD (854 x 480)</option>
+                <option value="1280x720">720p HD (1280 x 720)</option>
+                <option value="1920x1080">1080p Full HD (1920 x 1080)</option>
+              </select>
 
-          <div class="checkbox-list">
-            <label class="checkbox-row"><input type="checkbox" id="camera-mic" /> Forward the phone microphone <span class="muted">(--audio-source=mic)</span></label>
-            <label class="checkbox-row"><input type="checkbox" id="camera-highspeed" /> High-speed mode <span class="muted">(only for sizes listed as high speed)</span></label>
+              <div class="cam-info-grid">
+                <div class="cam-info-row">
+                  <span class="cam-info-label">Microphone:</span>
+                  <span id="mic-status-value" class="cam-info-value green">Checking&hellip;</span>
+                </div>
+                <div class="cam-info-row">
+                  <span class="cam-info-label">High-speed Mode:</span>
+                  <label class="cam-toggle">
+                    <input type="checkbox" id="camera-highspeed" />
+                    <span class="cam-toggle-slider"></span>
+                  </label>
+                </div>
+                <div id="camera-fps-row" class="cam-info-row hidden">
+                  <span class="cam-info-label">High-speed FPS:</span>
+                  <select id="camera-fps" class="mono cam-fps-select">
+                    <option value="60">60 fps</option>
+                    <option value="120" selected>120 fps</option>
+                    <option value="240">240 fps</option>
+                    <option value="480">480 fps</option>
+                  </select>
+                </div>
+              </div>
+            </div>
           </div>
-
-          <div class="control-bar">
-            <button id="camera-start-btn" class="primary-btn" style="margin-top:0;">Start camera stream</button>
-            <button id="camera-stop-btn" class="ghost-btn" style="margin-top:0;">Stop</button>
-            <button id="torch-btn" class="ghost-btn" style="margin-top:0;" title="Toggles the flashlight quick-settings tile — there is no adb torch command">&#128161; Flashlight</button>
-          </div>
-          <p id="camera-status" class="mirror-status"></p>
 
           <div class="note-strip">
             <span class="note-icon">&#9432;</span>
             <div>
-              <strong id="bridge-label">Virtual camera: checking…</strong>
+              <strong id="bridge-label">Virtual camera: checking&hellip;</strong>
               <p id="bridge-hint" class="muted" style="margin:4px 0 0;"></p>
             </div>
           </div>
@@ -718,41 +828,111 @@
     </main>
   </div>
 
-  <div id="device-modal" class="modal hidden">
+  <div id="startup-chooser" class="modal hidden">
     <div class="modal-card glass-card wide">
       <div class="modal-head">
-        <h3>Devices</h3>
-        <button id="device-modal-close" class="icon-btn">&times;</button>
+        <h3>Select a Device</h3>
+        <span class="muted">Multiple devices detected. Choose one to manage.</span>
       </div>
-      <div id="device-list" class="device-list"></div>
-      <!-- Devices paired in an earlier session. The pairing key lives on the
-           phone until it is revoked, so these only ever need reconnecting. -->
-      <div id="known-section" class="known-section hidden">
-        <div class="known-head">
-          <span class="field-label">Paired earlier</span>
-          <button id="known-reconnect" class="ghost-btn small">Reconnect all</button>
-        </div>
-        <div id="known-list" class="known-list"></div>
+      <div id="startup-device-list" class="device-list"></div>
+      <div class="modal-actions">
+        <button id="startup-refresh-btn" class="ghost-btn">Refresh</button>
       </div>
-      <button id="pair-btn" class="ghost-btn">+ Pair wireless</button>
     </div>
   </div>
 
-  <div id="pair-modal" class="modal hidden">
-    <div class="modal-card glass-card">
-      <h3>Pair wireless device</h3>
-      <p class="muted">On the phone: Developer options &rarr; Wireless debugging. Open "Pair device with pairing code" for the fields below, then read the connect port off the main Wireless debugging screen. To pair by QR instead, use "Pair with QR code" — the phone scans a code shown here.</p>
-      <label class="field-label">Pairing host &amp; port <span class="muted">(from the pairing dialog)</span></label>
-      <input id="pair-host" placeholder="192.168.1.23:41235" class="mono" spellcheck="false" />
-      <label class="field-label">Pairing code <span class="muted">(leave blank if already paired — a connect port alone just connects)</span></label>
-      <input id="pair-code" placeholder="123456" class="mono" spellcheck="false" />
-      <label class="field-label">Connect port <span class="muted">(from "IP address &amp; port" — blank auto-detects, but only when pairing)</span></label>
-      <input id="pair-connect-port" placeholder="37123" class="mono" spellcheck="false" />
-      <p id="pair-status" class="mirror-status"></p>
-      <div class="modal-actions">
-        <button id="pair-cancel-btn" class="ghost-btn">Cancel</button>
-        <button id="pair-scan-qr-btn" class="ghost-btn">Pair with QR code</button>
-        <button id="pair-submit-btn" class="primary-btn">Pair</button>
+  <div id="connect-modal" class="modal hidden">
+    <div class="modal-card glass-card wide connect-modal-card">
+      <div class="connect-modal-head">
+        <div class="connect-modal-title-row">
+          <svg class="connect-modal-icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/>
+          </svg>
+          <div>
+            <h3>Connect Android Device</h3>
+            <span class="muted">Pair via USB Debugging Cable or Wireless Wi-Fi Mode</span>
+          </div>
+        </div>
+        <button id="connect-modal-close" class="icon-btn">&times;</button>
+      </div>
+
+      <div class="connect-tabs">
+        <button class="connect-tab active" data-ctab="usb">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg>
+          USB Debugging Mode
+        </button>
+        <button class="connect-tab" data-ctab="wifi">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg>
+          Wireless Wi-Fi Mode
+        </button>
+        <button class="connect-tab" data-ctab="switch">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          Switch Device (<span id="connect-device-count">0</span>)
+        </button>
+      </div>
+
+      <div id="ctab-usb" class="connect-tab-panel active">
+        <div class="connect-info-box">
+          <div class="connect-info-title">HOW TO ENABLE USB DEBUGGING:</div>
+          <ol class="connect-steps">
+            <li>Open Android <strong>Settings</strong> &gt; <strong>About Phone</strong></li>
+            <li>Tap <strong>Build Number</strong> 7 times until Developer Mode is unlocked</li>
+            <li>Go back to <strong>System</strong> &gt; <strong>Developer Options</strong></li>
+            <li>Toggle <strong>USB Debugging</strong> to ON</li>
+            <li>Plug in USB cable and tap "Always allow from this computer" on your phone prompt</li>
+          </ol>
+        </div>
+        <div class="connect-status-bar">
+          <div class="connect-status-left">
+            <span id="usb-daemon-dot" class="connect-daemon-dot"></span>
+            <span class="connect-daemon-label">ADB Local Daemon Port 5037</span>
+            <span id="usb-daemon-status" class="connect-daemon-status">Listening for USB plug events</span>
+          </div>
+          <button id="usb-scan-btn" class="primary-btn connect-scan-btn">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.22-8.56"/><path d="M21 3v6h-6"/></svg>
+            Scan USB Ports
+          </button>
+        </div>
+      </div>
+
+      <div id="ctab-wifi" class="connect-tab-panel">
+        <div class="connect-info-box connect-info-warn">
+          <div class="connect-info-title">Wireless Debugging (Android 11+)</div>
+          <p class="muted" style="margin:4px 0 0;font-size:12px;">Ensure phone and PC are on the same Wi-Fi subnet. In Developer Options &gt; Wireless Debugging, find the device IP address and port.</p>
+        </div>
+        <div class="connect-form">
+          <div class="connect-form-row">
+            <div class="connect-field">
+              <label class="field-label">Phone Wi-Fi IP Address</label>
+              <input id="wifi-ip" class="mono" placeholder="192.168.1.112" spellcheck="false" />
+            </div>
+            <div class="connect-field connect-field-narrow">
+              <label class="field-label">Port</label>
+              <input id="wifi-port" class="mono" placeholder="5555" spellcheck="false" />
+            </div>
+          </div>
+          <div class="connect-field">
+            <label class="field-label">6-Digit Pairing Code <span class="muted">(Optional for initial pair)</span></label>
+            <input id="wifi-code" class="mono" placeholder="e.g. 482910" spellcheck="false" />
+          </div>
+          <button id="wifi-pair-btn" class="primary-btn connect-pair-btn">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg>
+            Pair &amp; Connect Over Wi-Fi
+          </button>
+          <p id="wifi-pair-status" class="mirror-status"></p>
+          <div class="connect-divider"><span>or</span></div>
+          <button id="wifi-qr-btn" class="ghost-btn connect-qr-btn">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="3" height="3"/><line x1="21" y1="14" x2="21" y2="14.01"/><line x1="14" y1="21" x2="14" y2="21.01"/><line x1="21" y1="21" x2="21" y2="21.01"/></svg>
+            Pair with QR Code
+          </button>
+        </div>
+      </div>
+
+      <div id="ctab-switch" class="connect-tab-panel">
+        <div class="connect-switch-label">Available Detected Devices:</div>
+        <div id="connect-device-list" class="connect-device-list">
+          <div class="muted" style="padding:16px;text-align:center;">No devices found. Connect via USB or Wi-Fi first.</div>
+        </div>
       </div>
     </div>
   </div>

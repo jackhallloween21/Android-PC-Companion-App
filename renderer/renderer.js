@@ -121,10 +121,91 @@ function refreshView(view) {
   if (view === 'mirror') showScrcpyBuild();
 }
 
-// -------------------------------------------------------------- device modal
+// -------------------------------------------------------------- connect modal
 
-el('device-picker-btn').onclick = () => el('device-modal').classList.remove('hidden');
-el('device-modal-close').onclick = () => el('device-modal').classList.add('hidden');
+function openConnectModal(tab) {
+  el('connect-modal').classList.remove('hidden');
+  if (tab) switchConnectTab(tab);
+}
+function closeConnectModal() {
+  const m = el('connect-modal');
+  if (m) m.classList.add('hidden');
+}
+
+el('sidebar-device-card').onclick = () => openConnectModal();
+el('connect-modal-close').onclick = () => closeConnectModal();
+
+// Tab switching
+document.querySelectorAll('.connect-tab').forEach((btn) => {
+  btn.onclick = () => switchConnectTab(btn.dataset.ctab);
+});
+function switchConnectTab(tab) {
+  document.querySelectorAll('.connect-tab').forEach((b) => b.classList.toggle('active', b.dataset.ctab === tab));
+  document.querySelectorAll('.connect-tab-panel').forEach((p) => p.classList.toggle('active', p.id === `ctab-${tab}`));
+  if (tab === 'switch') renderConnectDeviceList();
+}
+
+// USB scan
+el('usb-scan-btn').onclick = async () => {
+  const btn = el('usb-scan-btn');
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  try {
+    await window.api.autoconnect({ includeNew: true });
+    await refreshDevices();
+  } catch { /* ignore */ }
+  btn.disabled = false;
+  btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.22-8.56"/><path d="M21 3v6h-6"/></svg> Scan USB Ports';
+};
+
+// Wi-Fi pair
+el('wifi-pair-btn').onclick = async () => {
+  const ip = el('wifi-ip').value.trim();
+  const port = el('wifi-port').value.trim();
+  const code = el('wifi-code').value.trim();
+  const statusEl = el('wifi-pair-status');
+  const btn = el('wifi-pair-btn');
+
+  if (!ip) { statusEl.textContent = 'Enter the phone\'s IP address.'; statusEl.className = 'mirror-status err'; return; }
+  if (!port && !code) { statusEl.textContent = 'Enter the port number.'; statusEl.className = 'mirror-status err'; return; }
+
+  btn.disabled = true;
+  statusEl.textContent = code ? 'Pairing, then connecting…' : 'Connecting…';
+  statusEl.className = 'mirror-status busy';
+  try {
+    if (code) {
+      const hostPort = `${ip}:${port}`;
+      const res = await window.api.pairWireless(hostPort, code, port);
+      if (res && res.connected) {
+        statusEl.textContent = res.message;
+        statusEl.className = 'mirror-status ok';
+        closeConnectModal();
+        await refreshDevices();
+      } else {
+        statusEl.textContent = res ? res.message : 'Paired, but connect step did not run.';
+        statusEl.className = 'mirror-status err';
+      }
+    } else {
+      const result = await window.api.connectWireless(`${ip}:${port}`);
+      statusEl.textContent = result || 'Connected.';
+      statusEl.className = 'mirror-status ok';
+      closeConnectModal();
+      await refreshDevices();
+    }
+  } catch (err) {
+    statusEl.textContent = cleanIpcError(err.message);
+    statusEl.className = 'mirror-status err';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// QR from connect modal
+el('wifi-qr-btn').onclick = () => {
+  closeConnectModal();
+  el('qr-modal').classList.remove('hidden');
+  startQrPairing();
+};
 
 async function refreshDevices() {
   const devices = await window.api.listDevices();
@@ -137,88 +218,55 @@ async function refreshDevices() {
   }
   renderDeviceList();
   updateTitlebarStatus();
-  renderKnownDevices();
+  updateSidebarDeviceCard();
+  const cnt = el('connect-device-count');
+  if (cnt) cnt.textContent = String(devices.length);
+  // Safety net: if a device is selected but the dashboard is still showing the
+  // empty state, force it into the correct state. This catches races where
+  // selectDevice() was skipped or threw before hiding the empty state.
+  if (state.selected) {
+    const es = el('empty-state');
+    const dg = el('dashboard-grid');
+    if (es && !es.classList.contains('hidden')) es.classList.add('hidden');
+    if (dg && dg.classList.contains('hidden')) dg.classList.remove('hidden');
+  }
 }
 
-// The remembered list, minus anything already attached — showing a phone as
-// "paired earlier" while it is connected right above would just be confusing.
-async function renderKnownDevices() {
-  const section = el('known-section');
-  const list = el('known-list');
-  let known = [];
-  try { known = await window.api.listKnownDevices(); } catch { /* first run */ }
-
-  const attached = new Set(state.devices.map((d) => d.serial));
-  const offline = known.filter((k) => !attached.has(`${k.host}:${k.port}`));
-  section.classList.toggle('hidden', !offline.length);
-  list.innerHTML = '';
-
-  offline.forEach((k) => {
-    const row = document.createElement('div');
-    row.className = 'known-row';
-    row.innerHTML = `
-      <div class="known-id">
-        <span class="model">${k.label || k.deviceSerial || k.host}</span>
-        <span class="serial mono">${k.host}${k.port ? `:${k.port}` : ''}</span>
-      </div>`;
-    const connect = document.createElement('button');
-    connect.className = 'ghost-btn small';
-    connect.textContent = 'Connect';
-    connect.onclick = async () => {
-      connect.disabled = true;
-      connect.textContent = 'Connecting…';
-      try {
-        // Autoconnect rather than a direct connect to this address: the port may
-        // have changed since it was remembered, and only mDNS knows the new one.
-        const res = await window.api.autoconnect();
-        await refreshDevices();
-        const hit = res.connected.find((c) => c.target.startsWith(`${k.host}:`)) || res.connected[0];
-        if (hit) selectDevice(hit.target);
-        else toast(`Could not reach ${k.host}. Check the phone is on the same network with wireless debugging on.`);
-      } finally {
-        connect.disabled = false;
-        connect.textContent = 'Connect';
-      }
-    };
-    const forget = document.createElement('button');
-    forget.className = 'icon-btn';
-    forget.title = 'Forget this device';
-    forget.textContent = '×';
-    forget.onclick = async () => {
-      await window.api.forgetKnownDevice(k.deviceSerial || k.host);
-      renderKnownDevices();
-    };
-    row.append(connect, forget);
-    list.appendChild(row);
-  });
-}
-
-el('known-reconnect').onclick = async (e) => {
-  e.currentTarget.disabled = true;
-  try { await autoconnectKnown(); } finally { e.currentTarget.disabled = false; }
-  renderKnownDevices();
-};
-
+// Render detected devices in the Switch Device tab of the connect modal.
 function renderDeviceList() {
-  const list = el('device-list');
+  const list = el('connect-device-list');
+  if (!list) return;
   list.innerHTML = '';
   if (!state.devices.length) {
-    list.innerHTML = '<div class="empty-devices">No devices found. Plug in a phone with USB debugging enabled, or pair one wirelessly.</div>';
+    list.innerHTML = '<div class="muted" style="padding:16px;text-align:center;">No devices found. Connect via USB or Wi-Fi first.</div>';
     return;
   }
   state.devices.forEach((d) => {
-    const chip = document.createElement('div');
-    chip.className = 'device-chip' + (state.selected === d.serial ? ' selected' : '');
-    chip.innerHTML = `
-      <div class="row">
-        <span class="status-dot ${d.state === 'device' ? 'online' : ''}"></span>
-        <span class="model">${d.model ? d.model.replace(/_/g, ' ') : d.state}</span>
+    const isActive = state.selected === d.serial;
+    const item = document.createElement('div');
+    item.className = 'connect-device-item' + (isActive ? ' active' : '');
+    const model = d.model ? d.model.replace(/_/g, ' ') : d.serial;
+    const detail = d.ip ? `${d.ip}` : (d.transport || d.serial);
+    item.innerHTML = `
+      <div class="cdi-icon">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18.01"/></svg>
       </div>
-      <div class="serial">${d.serial}</div>
+      <div class="cdi-info">
+        <div class="cdi-name">${model}</div>
+        <div class="cdi-detail">${detail} ${d.transport ? '· ' + d.transport : ''}</div>
+      </div>
+      <div class="cdi-action${isActive ? ' active-badge' : ''}">
+        ${isActive ? '✓ Active' : 'Switch →'}
+      </div>
     `;
-    chip.onclick = () => selectDevice(d.serial);
-    list.appendChild(chip);
+    item.onclick = () => selectDevice(d.serial);
+    list.appendChild(item);
   });
+}
+
+// Renders devices in the sidebar card and connect modal switch list.
+function renderConnectDeviceList() {
+  renderDeviceList();
 }
 
 // Re-attaches phones paired in an earlier session. Runs once at startup: the
@@ -233,8 +281,6 @@ async function autoconnectKnown() {
   await refreshDevices();
   const names = result.connected.map((c) => c.target).join(', ');
   toast(`Reconnected to ${names} — no pairing needed.`);
-  // Nothing was selected before, so adopt what we just found rather than making
-  // the user open the picker.
   if (!state.selected) selectDevice(result.connected[0].target);
 }
 
@@ -242,10 +288,24 @@ function selectDevice(serial) {
   state.selected = serial;
   renderDeviceList();
   updateTitlebarStatus();
-  el('device-modal').classList.add('hidden');
-  el('empty-state').classList.add('hidden');
-  el('dashboard-grid').classList.remove('hidden');
+  updateSidebarDeviceCard();
+  try { closeConnectModal(); } catch {}
+  const es = el('empty-state');
+  const dg = el('dashboard-grid');
+  if (es) es.classList.add('hidden');
+  if (dg) dg.classList.remove('hidden');
   setView(state.activeView);
+  // Double-check after the current paint to catch any race where another
+  // handler re-opened the modal or re-shown the empty state.
+  requestAnimationFrame(() => {
+    if (!state.selected || state.selected !== serial) return;
+    const m = el('connect-modal');
+    if (m && !m.classList.contains('hidden')) m.classList.add('hidden');
+    const e2 = el('empty-state');
+    if (e2 && !e2.classList.contains('hidden')) e2.classList.add('hidden');
+    const d2 = el('dashboard-grid');
+    if (d2 && d2.classList.contains('hidden')) d2.classList.remove('hidden');
+  });
 }
 
 function updateTitlebarStatus() {
@@ -258,6 +318,32 @@ function updateTitlebarStatus() {
   } else {
     label.textContent = 'No device';
     dot.classList.remove('online');
+  }
+}
+
+function updateSidebarDeviceCard() {
+  const card = el('sidebar-device-card');
+  const nameEl = el('sdc-name');
+  const connEl = el('sdc-conn');
+  const ipEl = el('sdc-ip');
+  const device = state.devices.find((d) => d.serial === state.selected);
+
+  if (device) {
+    card.classList.add('connected');
+    nameEl.textContent = device.model ? device.model.replace(/_/g, ' ') : device.serial;
+    const transport = device.transport || 'USB';
+    connEl.innerHTML = `<span class="conn-dot"></span> ${transport} Mode`;
+    if (device.ip) {
+      ipEl.textContent = `IP: ${device.ip}`;
+      ipEl.classList.remove('hidden');
+    } else {
+      ipEl.classList.add('hidden');
+    }
+  } else {
+    card.classList.remove('connected');
+    nameEl.textContent = 'No device connected';
+    connEl.innerHTML = '<span class="conn-dot"></span> —';
+    ipEl.classList.add('hidden');
   }
 }
 
@@ -1831,35 +1917,54 @@ qAll('.chip-tab[data-mm]').forEach((tab) => {
 const cleanIpcError = (msg) => msg.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, '');
 
 // ---- camera ----------------------------------------------------------------
-// The lens list and both dropdowns are populated only from what the phone
-// reports. Nothing is offered speculatively: asking scrcpy for a size the sensor
-// does not list is a fatal error, not a downgrade.
+// The lens list and resolution dropdown are populated from what the phone
+// reports. Resolution presets are friendly labels mapped to actual sizes.
 
-const camera = { list: [], selected: null, mic: true, v4l2: false, bridge: null, limits: null };
+const camera = { list: [], selected: null, mic: false, micEnabled: false, v4l2: false, bridge: null, limits: null };
+
+const RES_PRESETS = [
+  { label: 'Auto (sensor default)', value: '' },
+  { label: '480p SD (854 x 480)', value: '854x480' },
+  { label: '720p HD (1280 x 720)', value: '1280x720' },
+  { label: '1080p Full HD (1920 x 1080)', value: '1920x1080' },
+];
+
+const FACING_ICONS = { back: '\uD83D\uDCF7', front: '\uD83D\uDCBB', external: '\uD83D\uDD0C' };
+const FACING_LABELS = { back: 'Rear Main', front: 'Front Facing', external: 'External' };
+const FACING_DESC = { back: 'Primary rear camera', front: 'Selfie camera with built-in autofocus', external: 'USB or accessory camera' };
 
 function setCameraStatus(text, kind = '') {
   const node = el('camera-status');
+  if (!node) return;
   node.textContent = text || '';
   node.className = `mirror-status${kind ? ` ${kind}` : ''}`;
 }
 
 function renderLensList() {
   const box = el('camera-lens-list');
+  if (!box) return;
   box.innerHTML = '';
   if (!camera.list.length) {
-    box.innerHTML = '<div class="muted" style="padding:10px 12px;">Not detected yet.</div>';
+    box.innerHTML = '<div class="cam-lens-empty">No cameras detected. Click &ldquo;Detect cameras&rdquo; above.</div>';
     return;
   }
-  const labels = { back: 'Rear', front: 'Front', external: 'External' };
   camera.list.forEach((cam) => {
-    const row = document.createElement('div');
-    row.className = `list-row${camera.selected === cam.id ? ' selected' : ''}`;
-    const mp = cam.megapixels ? `${cam.megapixels} MP` : '—';
-    row.innerHTML = `<span>${labels[cam.facing] || cam.facing} camera</span>`
-      + `<span class="muted mono">id ${cam.id} · ${mp} · ${cam.maxSize || '—'}</span>`;
-    row.onclick = () => { camera.selected = cam.id; renderLensList(); renderSizeOptions(); };
-    box.appendChild(row);
+    const card = document.createElement('div');
+    card.className = `cam-lens-card${camera.selected === cam.id ? ' selected' : ''}`;
+    const label = FACING_LABELS[cam.facing] || cam.facing;
+    const mp = cam.megapixels ? `${cam.megapixels} MP` : '';
+    const desc = FACING_DESC[cam.facing] || '';
+    card.innerHTML = `<div class="cam-lens-name">${label}${mp ? ` (${mp})` : ''}</div>`
+      + (desc ? `<div class="cam-lens-desc">${desc}</div>` : '');
+    card.onclick = () => { camera.selected = cam.id; renderLensList(); updateLensLabel(); };
+    box.appendChild(card);
   });
+}
+
+function updateLensLabel() {
+  const cam = currentCamera();
+  const lbl = el('camera-lens-label');
+  if (lbl) lbl.textContent = cam ? `(${FACING_LABELS[cam.facing] || cam.facing})` : '';
 }
 
 function currentCamera() {
@@ -1869,56 +1974,39 @@ function currentCamera() {
 function renderSizeOptions() {
   const cam = currentCamera();
   const sizeSel = el('camera-size');
-  const fpsSel = el('camera-fps');
-  const highSpeed = el('camera-highspeed').checked;
-  sizeSel.innerHTML = '<option value="">Sensor default</option>';
-  fpsSel.innerHTML = '<option value="">Default fps</option>';
-  el('camera-size-note').textContent = '';
-  if (!cam) return;
-
-  const sizes = highSpeed ? cam.highSpeedSizes : cam.sizes;
-  let blocked = 0;
-  for (const s of sizes) {
+  if (!sizeSel) return;
+  sizeSel.innerHTML = '';
+  RES_PRESETS.forEach((p) => {
     const opt = document.createElement('option');
-    opt.value = s.size;
-    // A megapixel figure is more meaningful next to the raw size than alone.
-    const mp = Math.round((s.width * s.height) / 100000) / 10;
-    opt.textContent = `${s.size} (${mp} MP)${s.fps ? ` · fps ${s.fps.join('/')}` : ''}`;
-    // The sensor genuinely offers these, so they are shown and disabled rather
-    // than hidden: the phone's video encoder is what cannot compress them, and
-    // silently dropping them would look like the app losing resolutions.
-    if (s.encodable === false) {
-      opt.disabled = true;
-      opt.textContent += ' — too large for this phone\'s encoder';
-      blocked += 1;
-    }
+    opt.value = p.value;
+    opt.textContent = p.label;
     sizeSel.appendChild(opt);
+  });
+  if (cam && cam.maxSize) {
+    const info = el('camera-res-info');
+    if (info) info.textContent = cam.maxSize + (cam.megapixels ? ` @ ${cam.megapixels} MP` : '');
   }
-  if (!sizes.length) {
-    sizeSel.innerHTML = `<option value="">${highSpeed ? 'No high-speed sizes on this lens' : 'No sizes reported'}</option>`;
+  const micVal = el('mic-status-value');
+  if (micVal) {
+    if (camera.mic) { micVal.textContent = 'Available'; micVal.className = 'cam-info-value green'; }
+    else { micVal.textContent = 'Not available'; micVal.className = 'cam-info-value yellow'; }
   }
-  const limit = camera.limits && camera.limits.maxWidth
-    ? `Hardware encoder limit: ${camera.limits.maxWidth}x${camera.limits.maxHeight}.` : '';
-  el('camera-size-note').textContent = blocked
-    ? `${limit} ${blocked} size${blocked === 1 ? '' : 's'} the sensor offers cannot be encoded, so ${blocked === 1 ? 'it is' : 'they are'} greyed out.`
-    : limit;
-  for (const f of cam.fps || []) {
-    const opt = document.createElement('option');
-    opt.value = String(f);
-    opt.textContent = `${f} fps`;
-    fpsSel.appendChild(opt);
+  // Show high-speed toggle only if camera has high-speed sizes
+  const hsRow = el('camera-highspeed')?.closest('.cam-info-row');
+  if (hsRow) {
+    const hasHS = cam && cam.highSpeedSizes && cam.highSpeedSizes.length > 0;
+    hsRow.classList.toggle('hidden', !hasHS);
+    if (!hasHS) el('camera-highspeed').checked = false;
   }
-  el('camera-mic').disabled = !camera.mic;
-  el('camera-highspeed').disabled = !cam.highSpeedSizes.length && !highSpeed;
+  const fpsRow = el('camera-fps-row');
+  if (fpsRow && !el('camera-highspeed').checked) fpsRow.classList.add('hidden');
 }
-
-el('camera-highspeed').onchange = renderSizeOptions;
 
 el('camera-refresh-btn').onclick = async () => {
   if (!state.selected) { el('camera-detect-status').textContent = 'Select a device first.'; return; }
   const btn = el('camera-refresh-btn');
   btn.disabled = true;
-  el('camera-detect-status').textContent = 'Asking scrcpy what this phone offers…';
+  el('camera-detect-status').textContent = 'Scanning sensors\u2026';
   try {
     const res = await window.api.listCameras(state.selected);
     camera.list = res.cameras;
@@ -1927,9 +2015,10 @@ el('camera-refresh-btn').onclick = async () => {
     camera.limits = res.limits || null;
     camera.selected = res.cameras[0] ? res.cameras[0].id : null;
     el('camera-detect-status').textContent =
-      `${res.cameras.length} camera${res.cameras.length === 1 ? '' : 's'} reported.`;
+      `${res.cameras.length} camera${res.cameras.length === 1 ? '' : 's'} detected.`;
     renderLensList();
     renderSizeOptions();
+    updateLensLabel();
   } catch (err) {
     el('camera-detect-status').textContent = cleanIpcError(err.message);
   } finally {
@@ -1937,33 +2026,89 @@ el('camera-refresh-btn').onclick = async () => {
   }
 };
 
+// Mic toggle button
+el('camera-mic-btn').onclick = () => {
+  camera.micEnabled = !camera.micEnabled;
+  const btn = el('camera-mic-btn');
+  btn.classList.toggle('active', camera.micEnabled);
+  const micVal = el('mic-status-value');
+  if (camera.mic) {
+    if (micVal) { micVal.textContent = camera.micEnabled ? 'Enabled' : 'Disabled'; micVal.className = camera.micEnabled ? 'cam-info-value green' : 'cam-info-value yellow'; }
+  }
+};
+
+// High-speed toggle shows/hides fps selector
+el('camera-highspeed').onchange = () => {
+  const fpsRow = el('camera-fps-row');
+  if (fpsRow) fpsRow.classList.toggle('hidden', !el('camera-highspeed').checked);
+};
+
+// --- Camera live feed (periodic screencap in preview area) ---
+let cameraFeedInterval = null;
+function startCameraFeed() {
+  stopCameraFeed();
+  const frame = el('camera-live-frame');
+  const badge = el('camera-live-badge');
+  const placeholder = document.querySelector('#camera-preview .cam-preview-placeholder');
+  if (frame) frame.classList.add('visible');
+  if (badge) badge.classList.remove('hidden');
+  if (placeholder) placeholder.style.display = 'none';
+  let fetching = false;
+  cameraFeedInterval = setInterval(async () => {
+    if (fetching || !state.selected) return;
+    fetching = true;
+    try {
+      const dataUrl = await window.api.cameraFrame(state.selected);
+      if (dataUrl && frame) frame.src = dataUrl;
+    } catch { /* ignore frame errors */ }
+    finally { fetching = false; }
+  }, 1000);
+}
+function stopCameraFeed() {
+  if (cameraFeedInterval) { clearInterval(cameraFeedInterval); cameraFeedInterval = null; }
+  const frame = el('camera-live-frame');
+  const badge = el('camera-live-badge');
+  const placeholder = document.querySelector('#camera-preview .cam-preview-placeholder');
+  if (frame) { frame.classList.remove('visible'); frame.src = ''; }
+  if (badge) badge.classList.add('hidden');
+  if (placeholder) placeholder.style.display = '';
+}
+
 el('camera-start-btn').onclick = async () => {
   if (!state.selected) return;
   const cam = currentCamera();
   const btn = el('camera-start-btn');
   btn.disabled = true;
-  setCameraStatus('Starting the camera stream…', 'busy');
+  setCameraStatus('Starting the camera stream\u2026', 'busy');
   try {
     const opts = {
       serial: state.selected,
       cameraId: cam ? cam.id : undefined,
       size: el('camera-size').value || undefined,
-      fps: el('camera-fps').value ? Number(el('camera-fps').value) : undefined,
       highSpeed: el('camera-highspeed').checked,
-      mic: el('camera-mic').checked,
+      mic: camera.micEnabled && camera.mic,
     };
-    // Only on Linux with a loopback device does a real virtual camera exist; the
-    // sink is passed only then, because the flag is otherwise absent or useless.
+    if (opts.highSpeed) {
+      opts.fps = el('camera-fps').value ? Number(el('camera-fps').value) : 60;
+    }
     if (camera.bridge && camera.bridge.mode === 'v4l2' && camera.bridge.ready) {
       opts.v4l2Device = camera.bridge.devices[0];
     }
     await window.api.startCamera(opts);
     el('camera-state').textContent = 'Streaming';
+    const dot = el('camera-state-dot');
+    if (dot) { dot.className = 'cam-dot streaming'; }
+    btn.classList.add('streaming');
+    startCameraFeed();
     setCameraStatus(opts.v4l2Device
-      ? `Streaming into ${opts.v4l2Device} — other apps can select it as a camera.`
-      : 'Streaming to a preview window.', 'ok');
+      ? `Streaming into ${opts.v4l2Device}`
+      : 'Streaming — camera feed captured from scrcpy window.', 'ok');
   } catch (err) {
     el('camera-state').textContent = 'Standby';
+    const dot = el('camera-state-dot');
+    if (dot) { dot.className = 'cam-dot standby'; }
+    btn.classList.remove('streaming');
+    stopCameraFeed();
     setCameraStatus(cleanIpcError(err.message), 'err');
   } finally {
     btn.disabled = false;
@@ -1973,7 +2118,54 @@ el('camera-start-btn').onclick = async () => {
 el('camera-stop-btn').onclick = async () => {
   await window.api.stopCamera();
   el('camera-state').textContent = 'Standby';
+  const dot = el('camera-state-dot');
+  if (dot) { dot.className = 'cam-dot standby'; }
+  el('camera-start-btn').classList.remove('streaming');
+  stopCameraFeed();
   setCameraStatus('Camera stream stopped.');
+};
+
+// Screenshot (capture photo from camera)
+el('camera-screenshot-btn').onclick = async () => {
+  if (!state.selected) return;
+  const btn = el('camera-screenshot-btn');
+  btn.disabled = true;
+  setCameraStatus('Capturing photo\u2026', 'busy');
+  try {
+    const filePath = await window.api.cameraCapturePhoto(state.selected);
+    if (filePath) { toast('Photo saved: ' + filePath.split(/[\\/]/).pop()); setCameraStatus('Photo captured.', 'ok'); }
+    else { setCameraStatus('Capture cancelled.'); }
+  } catch (err) { setCameraStatus('Capture failed: ' + cleanIpcError(err.message), 'err'); }
+  finally { btn.disabled = false; }
+};
+
+// Record (video from camera stream)
+let isRecording = false;
+el('camera-record-btn').onclick = async () => {
+  if (!state.selected) return;
+  const btn = el('camera-record-btn');
+  btn.disabled = true;
+  try {
+    if (!isRecording) {
+      const filePath = await window.api.cameraRecordStart(state.selected);
+      if (filePath) {
+        isRecording = true;
+        btn.classList.add('recording');
+        setCameraStatus('Recording to ' + filePath.split(/[\\/]/).pop() + '\u2026', 'busy');
+      }
+    } else {
+      const filePath = await window.api.cameraRecordStop(state.selected);
+      isRecording = false;
+      btn.classList.remove('recording');
+      if (filePath) { toast('Recording saved: ' + filePath.split(/[\\/]/).pop()); setCameraStatus('Recording saved.', 'ok'); }
+    }
+  } catch (err) {
+    setCameraStatus('Record error: ' + cleanIpcError(err.message), 'err');
+    isRecording = false;
+    btn.classList.remove('recording');
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 el('torch-btn').onclick = async () => {
@@ -1982,12 +2174,9 @@ el('torch-btn').onclick = async () => {
   btn.disabled = true;
   try {
     const res = await window.api.toggleTorch(state.selected);
-    // Only claim a state the camera service actually confirmed. The tile click is
-    // a toggle that reports nothing, so without read-back the honest message is
-    // "clicked", not "on".
     setCameraStatus(res && res.state
       ? `Flashlight is ${res.state}.`
-      : 'Flashlight tile clicked — this phone does not report torch state, so check the light itself.', 'ok');
+      : 'Flashlight toggled \u2014 check the phone.', 'ok');
   } catch (err) {
     setCameraStatus(cleanIpcError(err.message), 'err');
   } finally {
@@ -2008,7 +2197,11 @@ async function refreshBridge() {
     el('bridge-hint').textContent = '';
   }
   const st = await window.api.cameraStatus().catch(() => null);
-  if (st) el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
+  if (st) {
+    el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
+    const dot = el('camera-state-dot');
+    if (dot) { dot.className = st.running ? 'cam-dot streaming' : 'cam-dot standby'; }
+  }
 }
 
 // ---- audio + now playing ---------------------------------------------------
@@ -2271,67 +2464,11 @@ el('run-backup-btn').onclick = async () => {
 // -------------------------------------------------------------- wireless pair
 
 function setPairStatus(text, cls) {
-  const node = el('pair-status');
+  const node = el('wifi-pair-status');
+  if (!node) return;
   node.textContent = text || '';
   node.className = `mirror-status${cls ? ` ${cls}` : ''}`;
 }
-
-el('pair-btn').onclick = () => {
-  setPairStatus('');
-  el('pair-modal').classList.remove('hidden');
-};
-el('pair-cancel-btn').onclick = () => el('pair-modal').classList.add('hidden');
-el('pair-submit-btn').onclick = async () => {
-  const host = el('pair-host').value.trim();
-  const code = el('pair-code').value.trim();
-  const connectPort = el('pair-connect-port').value.trim();
-  // A device that is already paired only needs the connect step, and re-running
-  // `adb pair` with a spent single-use code would just fail. So a port with no code
-  // means "connect only" — that is the way out of "paired but not reachable".
-  const connectOnly = !code && !!connectPort;
-  if (!host) {
-    setPairStatus('Enter the phone\'s host:port.', 'err');
-    return;
-  }
-  if (!code && !connectPort) {
-    setPairStatus('Enter the pairing code — or, if this phone is already paired, '
-      + 'just its connect port.', 'err');
-    return;
-  }
-
-  const btn = el('pair-submit-btn');
-  btn.disabled = true;
-  setPairStatus(connectOnly ? 'Connecting…' : 'Pairing, then connecting…', 'busy');
-  try {
-    if (connectOnly) {
-      // The host field may already carry the pairing port; the connect port is a
-      // different one, so drop any port that is already there. A bare IPv6 literal
-      // has to be bracketed or adb cannot tell the address from the port.
-      const bare = host.replace(/^adb:\/\//, '');
-      const hostOnly = /^[0-9a-f]*:[0-9a-f:]+$/i.test(bare)
-        ? `[${bare}]`
-        : bare.replace(/^(\[[^\]]+\]|[^:]+):\d+$/, '$1');
-      // The modal stays open on success: this is the recovery path out of "paired but
-      // not reachable", and hiding the only place the result is shown would leave the
-      // user guessing whether it worked.
-      setPairStatus(await window.api.connectWireless(`${hostOnly}:${connectPort}`), 'ok');
-      refreshDevices();
-      return;
-    }
-    const res = await window.api.pairWireless(host, code, connectPort);
-    if (res && res.connected) {
-      setPairStatus(res.message, 'ok');
-      el('pair-modal').classList.add('hidden');
-    } else {
-      setPairStatus(res ? res.message : 'Paired, but the connect step did not run.', 'err');
-    }
-    refreshDevices();
-  } catch (err) {
-    setPairStatus(cleanIpcError(err.message), 'err');
-  } finally {
-    btn.disabled = false;
-  }
-};
 
 // ---- QR pairing ------------------------------------------------------------
 //
@@ -2341,13 +2478,6 @@ el('pair-submit-btn').onclick = async () => {
 
 const QR_QUIET = 4; // quiet zone in modules; 4 is the spec minimum
 const QR_TARGET_PX = 320; // the canvas is sized down to a whole number of modules
-
-el('pair-scan-qr-btn').onclick = () => {
-  setPairStatus('');
-  el('pair-modal').classList.add('hidden');
-  el('qr-modal').classList.remove('hidden');
-  startQrPairing();
-};
 
 el('qr-modal-close').onclick = () => closeQrPairing();
 
@@ -2408,33 +2538,20 @@ window.api.onQrPairProgress(({ phase, message, host }) => {
   status.classList.toggle('danger-text', phase === 'error');
 
   if (phase === 'error') {
-    // Don't leave a dead code on screen next to the error: it can no longer be
-    // paired with, and scanning it just makes the phone advertise a name nothing
-    // is watching for.
     const canvas = el('qr-canvas');
     canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
   }
 
-  // Both terminal phases close through closeQrPairing() rather than hiding the
-  // modal directly: main's loop has already finished in these cases, but relying
-  // on that is exactly how a stray session ends up polling behind a closed modal.
   if (phase === 'connected') {
     closeQrPairing();
     setPairStatus(message, 'ok');
     refreshDevices();
   }
   if (phase === 'paired') {
-    // Paired but not reachable. The pairing code is single-use, so redoing the
-    // pairing is the wrong move — all that's missing is the connect port. Prefill
-    // the host and leave the code blank; the form connects without pairing when
-    // only a port is given.
     closeQrPairing();
-    if (host) el('pair-host').value = host;
-    el('pair-code').value = '';
-    el('pair-modal').classList.remove('hidden');
+    openConnectModal('wifi');
+    if (host) el('wifi-ip').value = host.replace(/:\d+$/, '');
     setPairStatus(message, 'err');
-    el('pair-connect-port').focus();
-    refreshDevices();
   }
 });
 
@@ -2476,8 +2593,84 @@ async function loadToolsStatus() {
   });
 }
 
+// ------------------------------------------------------------ startup chooser
+
+function showStartupChooser(devices) {
+  openConnectModal('switch');
+  renderConnectDeviceList();
+}
+
+el('startup-refresh-btn').onclick = async () => {
+  const devices = await window.api.listDevices().catch(() => []);
+  const connected = devices
+    .filter((d) => d.state === 'device')
+    .map((d) => ({ serial: d.serial, model: d.model || d.serial }));
+  if (connected.length <= 1) {
+    el('startup-chooser').classList.add('hidden');
+    if (connected.length === 1) selectDevice(connected[0].serial);
+  } else {
+    showStartupChooser(connected);
+  }
+};
+
+if (window.api.onDeviceAutoSelected) {
+  window.api.onDeviceAutoSelected(async (device) => {
+    state.selected = device.serial;
+    try { await refreshDevices(); } catch {}
+    selectDevice(device.serial);
+  });
+}
+if (window.api.onDeviceChoose) {
+  window.api.onDeviceChoose((devices) => {
+    openConnectModal('switch');
+    renderConnectDeviceList();
+  });
+}
+
 // ----------------------------------------------------------------- startup
 
 setInterval(() => {
-  if (!el('shell').classList.contains('hidden')) refreshDevices();
+  if (!el('shell').classList.contains('hidden')) {
+    refreshDevices();
+    // Safety: if a device is selected, ensure the dashboard is visible and
+    // the connect modal is not blocking it. This catches any race where the
+    // modal was opened before selectDevice() ran.
+    if (state.selected) {
+      const m = el('connect-modal');
+      if (m && !m.classList.contains('hidden')) m.classList.add('hidden');
+      const es = el('empty-state');
+      if (es && !es.classList.contains('hidden')) es.classList.add('hidden');
+      const dg = el('dashboard-grid');
+      if (dg && dg.classList.contains('hidden')) dg.classList.remove('hidden');
+    }
+  }
 }, 4000);
+
+// Show the connect dialog if no device auto-connected after startup.
+setTimeout(() => {
+  if (!state.selected && !el('shell').classList.contains('hidden')) {
+    openConnectModal();
+  }
+}, 3000);
+
+// After the startup modal opens, re-check every 500ms for up to10 seconds
+// to close it as soon as a device is selected. This bridges the gap between
+// the 3-second timeout and the device:auto-selected IPC event.
+(function startupWatchdog() {
+  let checks = 0;
+  const id = setInterval(() => {
+    checks += 1;
+    if (checks > 20 || (state.selected && el('connect-modal') && el('connect-modal').classList.contains('hidden'))) {
+      clearInterval(id);
+      return;
+    }
+    if (state.selected) {
+      const m = el('connect-modal');
+      if (m && !m.classList.contains('hidden')) m.classList.add('hidden');
+      const es = el('empty-state');
+      if (es && !es.classList.contains('hidden')) es.classList.add('hidden');
+      const dg = el('dashboard-grid');
+      if (dg && dg.classList.contains('hidden')) dg.classList.remove('hidden');
+    }
+  }, 500);
+})();

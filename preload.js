@@ -112,6 +112,10 @@ contextBridge.exposeInMainWorld('api', {
   cameraStatus: () => ipcRenderer.invoke('camera:status'),
   toggleTorch: (serial) => ipcRenderer.invoke('camera:torch', serial),
   cameraBridge: () => ipcRenderer.invoke('camera:bridge'),
+  cameraCapturePhoto: (serial) => ipcRenderer.invoke('camera:capturePhoto', serial),
+  cameraRecordStart: (serial) => ipcRenderer.invoke('camera:recordStart', serial),
+  cameraRecordStop: (serial) => ipcRenderer.invoke('camera:recordStop', serial),
+  cameraFrame: (serial) => ipcRenderer.invoke('camera:frame', serial),
 
   // fastboot
   fastbootUnlock: (serial) => ipcRenderer.invoke('fastboot:unlock', serial),
@@ -126,6 +130,10 @@ contextBridge.exposeInMainWorld('api', {
 
   // first-run setup progress
   onSetupProgress: (callback) => ipcRenderer.on('setup:progress', (_e, payload) => callback(payload)),
+
+  // auto-detect device selection
+  onDeviceAutoSelected: (cb) => ipcRenderer.on('device:auto-selected', (_e, d) => cb(d)),
+  onDeviceChoose: (cb) => ipcRenderer.on('device:choose', (_e, devices) => cb(devices)),
 
   // window chrome
   minimize: () => ipcRenderer.send('window:minimize'),
