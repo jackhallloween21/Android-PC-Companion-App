@@ -1,6 +1,6 @@
 {
   "name": "android-pc-companion",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "PC companion app for Android devices: mirroring, battery, files, sideloading, app management, bootloader unlock.",
   "main": "main.js",
   "scripts": {
