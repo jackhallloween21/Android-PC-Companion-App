@@ -822,8 +822,30 @@ qAll('#file-category-tabs .chip-tab').forEach((tab) => {
 
 el('list-files-btn').onclick = loadFiles;
 el('push-file-btn').onclick = async () => {
-  await window.api.pushFile(state.selected, el('remote-path').value);
+  if (!state.selected) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPushProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      label.textContent = 'Uploading ' + data.name + '...';
+    } else {
+      fill.style.background = '';
+      fill.style.width = data.percent + '%';
+      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%');
+    }
+  });
+  try {
+    const result = await window.api.pushFile(state.selected, el('remote-path').value);
+    if (result) { toast('Uploaded ' + result.split('/').pop()); label.textContent = 'Done \u2014 ' + result; }
+    else { label.textContent = 'Cancelled.'; }
+  } catch (err) { label.textContent = 'Error: ' + err.message; }
   loadFiles();
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 3000);
 };
 
 // Select-all checkbox
@@ -1027,7 +1049,8 @@ el('file-download-btn').onclick = async () => {
 };
 
 // Batch upload
-el('file-upload-btn').onclick = async () => {
+async function uploadFiles(filePaths) {
+  if (!filePaths || !filePaths.length || !state.selected) return;
   const progress = el('file-transfer-progress');
   const fill = el('file-transfer-fill');
   const label = el('file-transfer-label');
@@ -1047,8 +1070,8 @@ el('file-upload-btn').onclick = async () => {
     }
   });
   try {
-    const results = await window.api.pushBatch(state.selected, el('remote-path').value);
-    if (results) {
+    const results = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths);
+    if (results && results.length) {
       const ok = results.filter((r) => r.ok).length;
       const fail = results.filter((r) => !r.ok).length;
       label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
@@ -1061,7 +1084,61 @@ el('file-upload-btn').onclick = async () => {
     label.textContent = 'Error: ' + err.message;
   }
   setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+}
+
+el('file-upload-btn').onclick = async () => {
+  if (!state.selected) return;
+  const progress = el('file-transfer-progress');
+  const fill = el('file-transfer-fill');
+  const label = el('file-transfer-label');
+  progress.classList.remove('hidden');
+  window.api.onPushProgress((data) => {
+    if (data.percent === -1) {
+      fill.style.width = '100%';
+      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
+      label.textContent = 'Uploading ' + data.name + ' (' + (data.index + 1) + '/' + data.total + ')';
+    } else {
+      fill.style.background = '';
+      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
+      fill.style.width = overall + '%';
+      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
+      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
+    }
+  });
+  try {
+    const results = await window.api.pushBatch(state.selected, el('remote-path').value);
+    if (results && results.length) {
+      const ok = results.filter((r) => r.ok).length;
+      const fail = results.filter((r) => !r.ok).length;
+      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
+      toast('Uploaded ' + ok + ' file(s)');
+    } else { label.textContent = 'Upload cancelled.'; }
+  } catch (err) { label.textContent = 'Error: ' + err.message; }
+  loadFiles();
+  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 };
+
+// Drag-and-drop upload
+(function setupDropZone() {
+  const fileList = el('file-list');
+  const overlay = el('file-drop-overlay');
+  if (!fileList || !overlay) return;
+  let dragCounter = 0;
+  fileList.addEventListener('dragenter', (e) => { e.preventDefault(); e.stopPropagation(); dragCounter++; overlay.classList.remove('hidden'); });
+  fileList.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; overlay.classList.add('hidden'); } });
+  fileList.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
+  fileList.addEventListener('drop', (e) => {
+    e.preventDefault(); e.stopPropagation(); dragCounter = 0; overlay.classList.add('hidden');
+    const files = e.dataTransfer.files;
+    if (!files || !files.length) return;
+    const paths = [];
+    for (let i = 0; i < files.length; i++) {
+      const p = window.api.pathForFile(files[i]);
+      if (p) paths.push(p);
+    }
+    if (paths.length) uploadFiles(paths);
+  });
+})();
 
 // Delete
 el('fi-delete-btn').onclick = async () => {
@@ -2081,6 +2158,54 @@ qAll('.chip-tab[data-bl]').forEach((tab) => {
   };
 });
 
+async function refreshBootloaderStatus() {
+  if (!state.selected) return;
+  const lockEl = el('bl-lock-status');
+  const oemEl = el('bl-oem-status');
+  const fbEl = el('bl-fb-status');
+  const device = state.devices.find((d) => d.serial === state.selected);
+  const inFastboot = device && device.state === 'bootloader';
+
+  if (lockEl) {
+    try {
+      const info = await window.api.getDeviceInfo(state.selected);
+      const locked = info.bootloaderLocked === '1';
+      lockEl.textContent = locked ? 'LOCKED (SECURE)' : 'UNLOCKED';
+      lockEl.className = 'bl-status-badge ' + (locked ? 'locked' : 'unlocked');
+      if (oemEl) {
+        const oem = info['persist.sys.oem_unlock_allowed'];
+        if (oem === '1') { oemEl.textContent = 'Enabled'; oemEl.className = 'bl-info-value green'; }
+        else if (oem === '0') { oemEl.textContent = 'Disabled'; oemEl.className = 'bl-info-value yellow'; }
+        else { oemEl.textContent = 'Unknown'; oemEl.className = 'bl-info-value'; }
+      }
+    } catch {
+      if (lockEl) { lockEl.textContent = 'UNKNOWN'; lockEl.className = 'bl-status-badge locked'; }
+      if (oemEl) { oemEl.textContent = 'N/A'; oemEl.className = 'bl-info-value red'; }
+    }
+  }
+
+  if (fbEl) {
+    if (!inFastboot) {
+      fbEl.textContent = 'Device not in fastboot';
+      fbEl.className = 'bl-info-value yellow';
+    } else {
+      try {
+        const out = await window.api.fastbootDevices();
+        const hasDevice = Array.isArray(out) ? out.length > 0 : String(out).trim().length > 0;
+        fbEl.textContent = hasDevice ? 'Ready' : 'No device';
+        fbEl.className = 'bl-info-value ' + (hasDevice ? 'green' : 'red');
+      } catch {
+        fbEl.textContent = 'Not detected';
+        fbEl.className = 'bl-info-value red';
+      }
+    }
+  }
+}
+
+qAll('.chip-tab[data-bl]').forEach((tab) => {
+  tab.addEventListener('click', () => { if (tab.dataset.bl === 'unlock') refreshBootloaderStatus(); });
+});
+
 el('reboot-bootloader-btn').onclick = async () => {
   el('bootloader-output').textContent = await window.api.rebootBootloader(state.selected).catch((e) => e.message);
 };
@@ -2093,13 +2218,22 @@ el('unlock-btn').onclick = async () => {
 };
 
 let flashImagePath = null;
-el('choose-flash-img-btn').onclick = async () => {
-  const result = await window.api.chooseFlashImage();
-  if (result?.filePath) {
-    flashImagePath = result.filePath;
-    el('flash-img-path').textContent = flashImagePath;
+const flashImgDrop = el('flash-img-drop');
+const flashImgFile = el('flash-img-file');
+const flashImgPath = el('flash-img-path');
+const flashPartLabel = el('flash-partition-label');
+const flashPartition = el('flash-partition');
+
+if (flashPartition) flashPartition.onchange = () => { if (flashPartLabel) flashPartLabel.textContent = flashPartition.value; };
+if (flashImgDrop) flashImgDrop.onclick = () => flashImgFile.click();
+if (flashImgFile) flashImgFile.onchange = () => {
+  const f = flashImgFile.files[0];
+  if (f) {
+    const p = window.api.pathForFile(f);
+    if (p) { flashImagePath = p; flashImgPath.textContent = p.split(/[\\/]/).pop(); flashImgPath.classList.remove('muted'); }
   }
 };
+
 el('flash-btn').onclick = async () => {
   if (!flashImagePath) { alert('Choose an .img file first.'); return; }
   const partition = el('flash-partition').value;

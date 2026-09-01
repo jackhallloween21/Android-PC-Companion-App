@@ -218,6 +218,10 @@
               </div>
             </div>
             <div id="file-list" class="mono file-list"></div>
+            <div id="file-drop-overlay" class="file-drop-overlay hidden">
+              <div class="file-drop-icon">&#128194;</div>
+              <div class="file-drop-text">Drop files here to upload</div>
+            </div>
           </div>
           <div class="glass-card inspector">
             <h3>File inspector</h3>
@@ -628,27 +632,66 @@
         </div>
 
         <div id="bl-unlock" class="split-panel">
-          <div class="glass-card">
-            <h3>Bootloader unlock suite</h3>
-            <p class="muted danger-text">Unlocking wipes all data on the device and may trip a tamper flag or void warranty. The generic command below only works on OEMs that support standard fastboot unlock — some (Xiaomi, OnePlus, Samsung, etc.) require their own account-bound unlock tool instead.</p>
-            <button id="reboot-bootloader-btn" class="ghost-btn">Reboot into bootloader (fastboot mode)</button>
-            <button id="unlock-btn" class="danger-btn">Execute bootloader unlock command</button>
+          <div class="glass-card bl-unlock-suite">
+            <div class="bl-suite-head">
+              <h3>&#128274; Bootloader Unlock Suite</h3>
+              <span id="bl-lock-status" class="bl-status-badge locked">LOCKED (SECURE)</span>
+            </div>
+            <div class="bl-warning-box">
+              <div class="bl-warning-title">&#9888; Security Notice &amp; Factory Reset Warning</div>
+              <p>Unlocking the bootloader allows flashing custom kernels, Magisk root, and GSI ROMs, but will automatically wipe all user data (Factory Reset) and trip Knox/Play Integrity status.</p>
+            </div>
+            <div class="bl-info-row">
+              <span class="bl-info-label">OEM Unlocking in Dev Options:</span>
+              <span id="bl-oem-status" class="bl-info-value green">Checking&hellip;</span>
+            </div>
+            <div class="bl-info-row">
+              <span class="bl-info-label">Fastboot Protocol Link:</span>
+              <span id="bl-fb-status" class="bl-info-value green">Checking&hellip;</span>
+            </div>
+            <button id="reboot-bootloader-btn" class="ghost-btn bl-action-btn">
+              <span class="bl-btn-icon">&#8634;</span> Reboot into Bootloader (Fastboot Mode)
+            </button>
+            <button id="unlock-btn" class="danger-btn bl-action-btn bl-unlock-btn">
+              <span class="bl-btn-icon">&#128275;</span> Execute Bootloader Unlock Command
+            </button>
+            <pre id="bootloader-output" class="mono output-block"></pre>
           </div>
-          <div class="glass-card">
-            <h3>Fastboot partition flasher</h3>
-            <div class="field-label">Target partition</div>
-            <select id="flash-partition" class="mono">
-              <option value="boot">boot (kernel &amp; ramdisk)</option>
+
+          <div class="glass-card bl-flasher-suite">
+            <div class="bl-suite-head">
+              <h3>
+                <svg class="bl-head-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="4" y="4" width="16" height="16" rx="2"/>
+                  <rect x="9" y="9" width="6" height="6"/>
+                  <path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/>
+                </svg>
+                Fastboot Partition Flasher (.img)
+              </h3>
+              <span class="bl-flash-badge mono">fastboot flash</span>
+            </div>
+            <div class="field-label">Target Flash Partition</div>
+            <select id="flash-partition" class="mono bl-partition-select">
+              <option value="boot">boot (Kernel &amp; Ramdisk)</option>
               <option value="recovery">recovery</option>
               <option value="vendor_boot">vendor_boot</option>
               <option value="dtbo">dtbo</option>
               <option value="vbmeta">vbmeta</option>
             </select>
-            <div class="field-label">Image file</div>
-            <button id="choose-flash-img-btn" class="ghost-btn">Choose .img from PC</button>
-            <div id="flash-img-path" class="muted mono"></div>
-            <button id="flash-btn" class="primary-btn">Flash to partition</button>
-            <pre id="bootloader-output" class="mono output-block"></pre>
+            <div class="field-label">Select Image File (.img)</div>
+            <div id="flash-img-drop" class="bl-img-drop-zone">
+              <svg class="bl-upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <div class="bl-img-text">Choose .img from PC</div>
+              <div id="flash-img-path" class="bl-img-filename muted">e.g. magisk_patched_boot.img</div>
+              <input type="file" id="flash-img-file" accept=".img" class="hidden" />
+            </div>
+            <button id="flash-btn" class="primary-btn bl-action-btn bl-flash-btn">
+              <span class="bl-btn-icon">&#9654;</span> Flash to [<span id="flash-partition-label">boot</span>] Partition
+            </button>
           </div>
         </div>
 

@@ -1472,6 +1472,26 @@ ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
   return results;
 });
 
+ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths }) => {
+  if (!filePaths || !filePaths.length) return [];
+  const results = [];
+  for (let i = 0; i < filePaths.length; i++) {
+    const lp = filePaths[i];
+    const name = path.basename(lp);
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 0, bytes: 0, totalBytes: 0 });
+    let totalBytes = 0;
+    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+    try {
+      await adb(['-s', serial, 'push', lp, remoteDir]);
+      results.push({ name, ok: true });
+    } catch (err) {
+      results.push({ name, ok: false, error: err.message });
+    }
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+  }
+  return results;
+});
+
 ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm -rf ' + JSON.stringify(remotePath)]));
 
 // ---------------------------------------------------------------------------

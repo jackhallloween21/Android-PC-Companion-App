@@ -59,6 +59,7 @@ contextBridge.exposeInMainWorld('api', {
   pullBatch: (serial, files, destDir) => ipcRenderer.invoke('files:pullBatch', { serial, files, destDir }),
   pushFile: (serial, remoteDir) => ipcRenderer.invoke('files:push', { serial, remoteDir }),
   pushBatch: (serial, remoteDir) => ipcRenderer.invoke('files:pushBatch', { serial, remoteDir }),
+  pushBatchFiles: (serial, remoteDir, filePaths) => ipcRenderer.invoke('files:pushBatchFiles', { serial, remoteDir, filePaths }),
   deleteFile: (serial, remotePath) => ipcRenderer.invoke('files:delete', { serial, remotePath }),
   onPullProgress: (cb) => ipcRenderer.on('files:pullProgress', (_e, data) => cb(data)),
   onPushProgress: (cb) => ipcRenderer.on('files:pushProgress', (_e, data) => cb(data)),
@@ -114,6 +115,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // fastboot
   fastbootUnlock: (serial) => ipcRenderer.invoke('fastboot:unlock', serial),
+  fastbootDevices: () => ipcRenderer.invoke('fastboot:devices'),
   chooseFlashImage: () => ipcRenderer.invoke('fastboot:flashPartition'),
   flashPartition: (serial, partition, filePath) =>
     ipcRenderer.invoke('fastboot:flashPartitionConfirm', { serial, partition, filePath }),

@@ -695,6 +695,19 @@ button:disabled { opacity: 0.4; cursor: not-allowed; filter: none !important; }
 .transfer-bar { flex: 1; height: 4px; border-radius: 3px; background: var(--track); overflow: hidden; }
 .transfer-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.2s ease; width: 0%; }
 
+/* file drop overlay */
+.file-drop-overlay {
+  position: absolute; inset: 0; z-index: 20; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px;
+  background: rgba(10, 14, 20, 0.92); border: 2px dashed var(--accent);
+  border-radius: var(--radius-md); pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.file-drop-overlay.hidden { display: none; }
+.file-drop-icon { font-size: 48px; opacity: 0.8; }
+.file-drop-text { color: var(--accent); font-size: 14px; font-weight: 600; }
+.file-list { position: relative; }
+
 /* file list checkboxes */
 .file-list .list-row { position: relative; }
 .file-list .list-row .file-cb { accent-color: var(--accent); flex-shrink: 0; margin-right: 6px; }
@@ -1122,3 +1135,86 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   .apps-panel { grid-template-columns: 1fr; }
   .app-row { grid-template-columns: minmax(0, 1fr) 60px 74px 60px 56px; }
 }
+
+/* ===== Bootloader & Fastboot UI ===== */
+
+.bl-suite-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--panel-border);
+}
+.bl-suite-head h3 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.3px; white-space: nowrap; display: flex; align-items: center; gap: 8px; }
+.bl-head-icon { width: 20px; height: 20px; flex-shrink: 0; color: var(--accent); }
+
+/* Status badges */
+.bl-status-badge {
+  padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 700;
+  letter-spacing: 0.5px; white-space: nowrap; flex-shrink: 0;
+}
+.bl-status-badge.locked { background: rgba(245,165,36,0.15); color: #f5a524; border: 1px solid rgba(245,165,36,0.3); }
+.bl-status-badge.unlocked { background: rgba(45,212,191,0.15); color: #2dd4bf; border: 1px solid rgba(45,212,191,0.3); }
+
+/* Warning box */
+.bl-warning-box {
+  background: rgba(245,165,36,0.08); border: 1px solid rgba(245,165,36,0.25);
+  border-radius: var(--radius-md); padding: 14px 16px; margin-bottom: 16px;
+}
+.bl-warning-title { color: #f5a524; font-weight: 700; font-size: 13px; margin-bottom: 6px; }
+.bl-warning-box p { margin: 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
+
+/* Info rows */
+.bl-info-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 14px; margin-bottom: 6px; border-radius: var(--radius-sm);
+  background: var(--panel-strong); border: 1px solid var(--panel-border);
+}
+.bl-info-label { color: var(--text-muted); font-size: 12px; }
+.bl-info-value { font-size: 12px; font-weight: 700; }
+.bl-info-value.green { color: #2dd4bf; }
+.bl-info-value.red { color: var(--danger); }
+.bl-info-value.yellow { color: #f5a524; }
+
+/* Action buttons */
+.bl-action-btn {
+  width: 100%; margin-top: 10px; padding: 11px 16px; font-size: 13px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  border-radius: var(--radius-md); cursor: pointer; transition: all 0.15s ease;
+}
+.bl-btn-icon { font-size: 15px; }
+.bl-unlock-btn { background: rgba(245,165,36,0.18); color: #f5a524; border: 1px solid rgba(245,165,36,0.35); }
+.bl-unlock-btn:hover { background: rgba(245,165,36,0.28); border-color: #f5a524; }
+
+/* Flash suite */
+.bl-flash-badge {
+  padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;
+  background: rgba(100,116,139,0.18); color: var(--text-muted); border: 1px solid var(--panel-border);
+}
+
+/* Partition select */
+.bl-partition-select {
+  width: 100%; padding: 10px 14px; margin-bottom: 14px;
+  background: var(--panel-strong); border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md); color: var(--text-primary); font-size: 13px;
+}
+
+/* Image drop zone */
+.bl-img-drop-zone {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 24px 16px; margin-bottom: 14px; min-height: 100px;
+  border: 2px dashed var(--panel-border); border-radius: var(--radius-md);
+  background: var(--panel-strong); cursor: pointer; transition: all 0.15s ease;
+}
+.bl-img-drop-zone:hover { border-color: var(--accent); background: rgba(56,189,248,0.04); }
+.bl-img-icon { font-size: 32px; opacity: 0.6; }
+.bl-upload-icon { width: 36px; height: 36px; color: var(--text-muted); opacity: 0.6; transition: color 0.15s ease, opacity 0.15s ease; }
+.bl-img-drop-zone:hover .bl-upload-icon { color: var(--accent); opacity: 1; }
+.bl-img-text { color: var(--text-primary); font-size: 13px; font-weight: 600; }
+.bl-img-filename { font-size: 11px; font-family: var(--font-mono); word-break: break-all; text-align: center; max-width: 100%; }
+.bl-img-filename:not(.muted) { color: var(--accent); }
+
+/* Flash button */
+.bl-flash-btn {
+  background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff;
+  border: 1px solid rgba(59,130,246,0.5); font-weight: 700;
+}
+.bl-flash-btn:hover { background: linear-gradient(135deg, #2563eb, #1d4ed8); border-color: #3b82f6; }
+.bl-flash-btn:disabled { opacity: 0.4; cursor: not-allowed; }
