@@ -437,9 +437,10 @@ ipcMain.handle('devices:list', async () => {
       const hasUsb = parts.some((p) => p.startsWith('usb:'));
       const isMdns = serial.startsWith('adb-') || serial.includes('._tcp') || serial.includes('_adb');
       const isIpPort = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+      const isWireless = isIpPort || isMdns || isWirelessSerial(serial);
       const cachedIp = infoCache.get(serial)?.ip || null;
       const ip = isIpPort ? serial.split(':')[0] : cachedIp;
-      const transport = (isIpPort || isMdns || ip) ? 'Wi-Fi' : (hasUsb ? 'USB' : 'USB');
+      const transport = isWireless ? 'Wi-Fi' : (hasUsb ? 'USB' : 'USB');
       const product = (parts.find((p) => p.startsWith('product:')) || '').split(':')[1] || null;
       return { serial, state, model, transport, ip, product };
     });
@@ -946,26 +947,53 @@ ipcMain.handle('control:screenshot', async (_e, serial) => {
 });
 
 let recordProcess = null;
+let recordSerial = null;
 const REMOTE_RECORD_PATH = '/sdcard/companion_record.mp4';
 
-ipcMain.handle('control:recordStart', (_e, serial) => {
+ipcMain.handle('control:recordStart', async (_e, serial) => {
   if (recordProcess) return true;
+  recordSerial = serial;
+  try { await adb(['-s', serial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]); } catch { /* ignore */ }
   recordProcess = spawn(tools.adb, ['-s', serial, 'shell', 'screenrecord', REMOTE_RECORD_PATH]);
   recordProcess.on('exit', () => { recordProcess = null; });
   return true;
 });
 
 ipcMain.handle('control:recordStop', async (_e, serial) => {
-  if (!recordProcess) return null;
-  // screenrecord finalizes the file cleanly on SIGINT; give it a moment
-  // before pulling.
-  recordProcess.kill('SIGINT');
-  recordProcess = null;
-  await new Promise((r) => setTimeout(r, 1200));
-  const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: `recording-${Date.now()}.mp4` });
-  if (canceled || !filePath) return null;
-  await adb(['-s', serial, 'pull', REMOTE_RECORD_PATH, filePath]);
-  await adb(['-s', serial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]);
+  const targetSerial = serial || recordSerial;
+  if (!recordProcess && !targetSerial) return null;
+
+  // Signal remote screenrecord process via SIGINT (signal 2) so Android cleanly
+  // flushes the encoder and writes the MP4 moov atom / trailer.
+  if (targetSerial) {
+    try {
+      await adb(['-s', targetSerial, 'shell', 'pkill -2 screenrecord || killall -2 screenrecord || kill -2 $(pidof screenrecord)']);
+    } catch { /* ignore */ }
+  }
+  if (recordProcess) {
+    try { recordProcess.kill(); } catch { /* ignore */ }
+    recordProcess = null;
+  }
+  recordSerial = null;
+
+  // Give screenrecord a brief moment to finish writing the file to storage
+  await new Promise((r) => setTimeout(r, 1500));
+
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: `recording-${Date.now()}.mp4`,
+    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'All Files', extensions: ['*'] }],
+  });
+  if (canceled || !filePath) {
+    if (targetSerial) {
+      try { await adb(['-s', targetSerial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]); } catch { /* ignore */ }
+    }
+    return null;
+  }
+
+  if (targetSerial) {
+    await adb(['-s', targetSerial, 'pull', REMOTE_RECORD_PATH, filePath]);
+    await adb(['-s', targetSerial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]);
+  }
   return filePath;
 });
 
@@ -1068,16 +1096,24 @@ ipcMain.handle('wireless:connect', async (_e, hostPort) => {
 
 ipcMain.handle('wireless:discover', async () => pickConnectTarget(await adbText(['mdns', 'services'])));
 
-// Drops a device. A wireless serial is `host:port`, which adb can genuinely
-// disconnect; a USB serial cannot be detached from this end, so the caches are
+// Drops a device. A wireless serial is `host:port` or mDNS name, which adb can genuinely
+// disconnect; a physical USB serial cannot be detached from this end, so the caches are
 // cleared and the renderer just deselects it.
 ipcMain.handle('device:disconnect', async (_e, serial) => {
   forgetDevice(serial);
   // The device stays on the autoconnect list: disconnecting is temporary, and
   // the pairing key on the phone is untouched. Use devices:forget to drop it.
   if (isWirelessSerial(serial)) {
-    return { disconnected: true, message: await adbText(['disconnect', serial]) };
+    const msg = await adbText(['disconnect', serial]);
+    return { disconnected: true, message: msg || 'Disconnected' };
   }
+  try {
+    const msg = await adbText(['disconnect', serial]);
+    if (/disconnected/i.test(msg)) {
+      return { disconnected: true, message: msg };
+    }
+  } catch { /* ignore */ }
+
   return {
     disconnected: false,
     message: 'USB devices stay attached until the cable is unplugged — unplug it, '
@@ -2141,7 +2177,10 @@ ipcMain.handle('scrcpy:info', async () => {
 let audioProcess = null;
 
 ipcMain.handle('audio:start', async (_e, serial) => {
-  if (audioProcess) return true;
+  if (audioProcess) {
+    try { audioProcess.kill(); } catch { /* ignore */ }
+    audioProcess = null;
+  }
   await assertDeviceReady(serial);
   const hasAudioSupport = hasAudio(scrcpyInfo);
   if (!hasAudioSupport) {
@@ -2320,6 +2359,10 @@ async function startCameraSession(opts = {}) {
   await assertDeviceReady(serial);
   assertCameraSupport();
   closeCameraSession({ killScrcpy: true });
+  if (audioProcess) {
+    try { audioProcess.kill(); } catch { /* ignore */ }
+    audioProcess = null;
+  }
 
   const dock = opts.dock !== false;
   const canDock = dock && supportsPlacement(scrcpyInfo.help);
@@ -2510,6 +2553,21 @@ ipcMain.handle('camera:toggleMic', async (_e, serial) => {
   return startCameraSession(currOpts);
 });
 
+function cropWindowChrome(nativeImg, isBorderless) {
+  if (!nativeImg || nativeImg.isEmpty() || isBorderless) return nativeImg;
+  const size = nativeImg.getSize();
+  if (size.width < 120 || size.height < 120) return nativeImg;
+  const topBar = Math.min(Math.max(Math.round(size.height * 0.035), 30), 45);
+  const sideMargin = Math.min(Math.max(Math.round(size.width * 0.006), 2), 8);
+  const cropW = Math.max(size.width - sideMargin * 2, 10);
+  const cropH = Math.max(size.height - topBar - sideMargin, 10);
+  try {
+    return nativeImg.crop({ x: sideMargin, y: topBar, width: cropW, height: cropH });
+  } catch {
+    return nativeImg;
+  }
+}
+
 /**
  * Camera frame: captures the scrcpy camera window via desktopCapturer when a
  * camera stream is running, or falls back to screencap (phone screen) otherwise.
@@ -2526,7 +2584,8 @@ ipcMain.handle('camera:frame', async (_e, serial) => {
       const camTitle = cameraWindowTitle(serial);
       const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
       if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
-        return `data:image/png;base64,${src.thumbnail.toPNG().toString('base64')}`;
+        const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
+        return `data:image/png;base64,${cropped.toPNG().toString('base64')}`;
       }
     } catch { /* fall through to screencap */ }
   }
@@ -2551,12 +2610,13 @@ ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
     try {
       const sources = await desktopCapturer.getSources({
         types: ['window'],
-        thumbnailSize: { width: 1920, height: 1080 },
+        thumbnailSize: { width: 3840, height: 2160 },
       });
       const camTitle = cameraWindowTitle(targetSerial);
       const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
       if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
-        buf = src.thumbnail.toPNG();
+        const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
+        buf = cropped.toPNG();
       }
     } catch { /* fall through */ }
   }

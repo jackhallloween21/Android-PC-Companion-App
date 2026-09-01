@@ -333,7 +333,7 @@ function updateSidebarDeviceCard() {
   if (device) {
     card.classList.add('connected');
     nameEl.textContent = device.model ? device.model.replace(/_/g, ' ') : device.serial;
-    const isWireless = device.transport === 'Wi-Fi' || device.ip || device.serial.startsWith('adb-') || device.serial.includes('._tcp') || /^\d{1,3}(?:\.\d{1,3}){3}/.test(device.serial);
+    const isWireless = device.transport === 'Wi-Fi' || device.serial.startsWith('adb-') || device.serial.includes('._tcp') || device.serial.includes('_adb') || /^\d{1,3}(?:\.\d{1,3}){3}/.test(device.serial);
     const transport = isWireless ? 'Wi-Fi' : (device.transport || 'USB');
     if (connEl) connEl.innerHTML = `<span class="conn-dot"></span> ${transport} Mode`;
     const cachedIp = device.ip || (specsCache.get(device.serial)?.info?.ip) || null;
@@ -456,7 +456,7 @@ async function loadDashboard() {
 
   // --- identity -------------------------------------------------------------
   const dev = state.devices.find((d) => d.serial === serial);
-  const wireless = /^\d{1,3}(?:\.\d{1,3}){3}/.test(serial) || serial.startsWith('adb-') || serial.includes('._tcp') || (dev && dev.transport === 'Wi-Fi');
+  const wireless = /^\d{1,3}(?:\.\d{1,3}){3}/.test(serial) || serial.startsWith('adb-') || serial.includes('._tcp') || serial.includes('_adb') || (dev && dev.transport === 'Wi-Fi');
   setText('dash-model', (info['ro.product.model'] || serial).replace(/_/g, ' '));
   const codename = el('dash-codename');
   codename.textContent = info['ro.product.manufacturer'] || '';
@@ -475,7 +475,7 @@ async function loadDashboard() {
   setText('dash-selinux', info.selinux || 'Unknown');
   setText('dash-bootloader', info.bootloaderLocked === '1' ? 'Locked'
     : info.bootloaderLocked === '0' ? 'Unlocked' : 'Unknown');
-  setText('dash-transport-detail', wireless ? `Wi-Fi · ${info.ip || (serial.includes(':') ? serial : 'mDNS')}` : 'USB');
+  setText('dash-transport-detail', wireless ? `Wi-Fi · ${info.ip || (serial.includes(':') ? serial : 'mDNS')}` : (info.ip ? `USB · IP: ${info.ip}` : 'USB'));
 
   // --- battery --------------------------------------------------------------
   const level = power.level ?? 0;

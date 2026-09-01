@@ -53,6 +53,8 @@ test('only the connect endpoint is advertised as connectable', () => {
 test('a wireless serial is told apart from a USB one', () => {
   assert.strictEqual(isWirelessSerial('192.168.1.23:37123'), true);
   assert.strictEqual(isWirelessSerial('[fe80::1]:5555'), true);
+  assert.strictEqual(isWirelessSerial('adb-39041FDJH00BQZ-vWLnDS._adb-tls-connect._tcp.'), true);
+  assert.strictEqual(isWirelessSerial('adb-39041FDJH00BQZ-vWLnDS'), true);
   assert.strictEqual(isWirelessSerial('39041FDJH00BQZ'), false, 'a USB serial cannot be connected to');
   assert.strictEqual(isWirelessSerial(''), false);
 });

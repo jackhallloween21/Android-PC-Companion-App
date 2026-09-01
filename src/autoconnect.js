@@ -62,7 +62,11 @@ function listAdvertised(mdnsOutput) {
 
 /** True for a serial adb can genuinely `connect`/`disconnect`. */
 function isWirelessSerial(serial) {
-  return /^(\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}):\d+$/i.test(String(serial || '').trim());
+  const s = String(serial || '').trim();
+  if (!s) return false;
+  if (/^(\[[0-9a-f:]+\]|\d{1,3}(?:\.\d{1,3}){3})(:\d+)?$/i.test(s)) return true;
+  if (s.startsWith('adb-') || s.includes('._tcp') || s.includes('_adb-tls-connect')) return true;
+  return false;
 }
 
 /**
