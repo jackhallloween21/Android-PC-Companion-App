@@ -103,8 +103,10 @@ contextBridge.exposeInMainWorld('api', {
   startAudio: (serial) => ipcRenderer.invoke('audio:start', serial),
   stopAudio: () => ipcRenderer.invoke('audio:stop'),
   audioStatus: () => ipcRenderer.invoke('audio:status'),
+  setVolume: (serial, level) => ipcRenderer.invoke('audio:setVolume', { serial, level }),
   mediaKey: (serial, action) => ipcRenderer.invoke('media:key', { serial, action }),
   nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', serial),
+  artwork: (serial, uri) => ipcRenderer.invoke('media:artwork', { serial, uri }),
 
   // camera
   listCameras: (serial) => ipcRenderer.invoke('camera:list', serial),

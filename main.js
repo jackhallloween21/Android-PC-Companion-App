@@ -2348,6 +2348,32 @@ ipcMain.handle('audio:stop', () => {
 
 ipcMain.handle('audio:status', () => !!audioProcess);
 
+// Set the device's media volume to a 0-15 level (Android's 16-step scale).
+// Uses `cmd audio` on Android 10+ and falls back to `media volume --set` for
+// older devices, then reports back the actual level so the slider can correct.
+ipcMain.handle('audio:setVolume', async (_e, { serial, level }) => {
+  const clamped = Math.max(0, Math.min(15, Math.round(Number(level) || 0)));
+  // Try `cmd audio set-volume music <level>` (Android 10+).
+  let out = '';
+  try {
+    out = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'set-volume', 'music', String(clamped)]);
+  } catch {
+    // Fallback: `media volume --set <level>` (Android 5-9).
+    try {
+      out = await adb(['-s', serial, 'shell', 'media', 'volume', '--set', String(clamped), '--stream', '3']);
+    } catch (err2) {
+      throw new Error(`Failed to set volume: ${err2.message}`);
+    }
+  }
+  // Read back actual level.
+  try {
+    const volOut = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'music']);
+    const m = volOut.match(/(\d+)/);
+    if (m) return Number(m[1]);
+  } catch { /* ignore */ }
+  return clamped;
+});
+
 const MEDIA_KEYCODES = { playPause: 85, next: 87, previous: 88 };
 
 ipcMain.handle('media:key', (_e, { serial, action }) => {
@@ -2368,6 +2394,26 @@ ipcMain.handle('media:nowPlaying', async (_e, serial) => {
     description: describeTrack(track),
     sessions: parseAllSessions(out).length,
   };
+});
+
+// Pull album-art bitmap from a content:// URI exposed by the media session.
+// Returns a base64 data URL suitable for an <img> src, or null when the pull
+// fails (permissions, missing provider, etc.).
+ipcMain.handle('media:artwork', async (_e, { serial, uri }) => {
+  if (!serial || !uri) return null;
+  try {
+    // `content read` streams the raw bytes; `-a` is not needed for binary.
+    const buf = await adb(['-s', serial, 'shell', 'content', 'read', '--uri', uri]);
+    if (!buf || !buf.length) return null;
+    // Content read may include trailing newlines; strip and decode.
+    const raw = buf.replace(/[\r\n]+$/g, '');
+    if (!raw || raw.includes('No result') || raw.includes('Permission denied')) return null;
+    // The output is raw binary when redirected, but adb may mangle it.
+    // Attempt base64 decode and re-encode to ensure a clean data URL.
+    const b64 = Buffer.from(raw, 'binary').toString('base64');
+    if (b64.length < 100) return null; // too small to be a real image
+    return `data:image/jpeg;base64,${b64}`;
+  } catch { return null; }
 });
 
 // ---------------------------------------------------------------------------

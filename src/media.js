@@ -135,6 +135,16 @@ function parseSession(block) {
     album = clean(parts.slice(2).join(', '));
   }
 
+  // Artwork URI — some sessions expose album art via a content:// icon URI
+  // (e.g. Spotify, YouTube Music). The bitmap itself lives inside the player
+  // process and never appears in the dump, but the URI can be pulled with
+  // `adb shell content read --uri <uri>`. Not all apps set this; when absent
+  // the renderer falls back to the dex-fetched launcher icon.
+  const artUri = (() => {
+    const m = text.match(/\b(?:icon|albumArt|art)=(content:\/\/\S+)/);
+    return m ? m[1] : null;
+  })();
+
   const positionMs = position ? Number(position[1]) : null;
   const durationMs = duration ? Number(duration[1]) : null;
 
@@ -147,6 +157,7 @@ function parseSession(block) {
     title,
     artist,
     album,
+    artUri,
     positionMs: Number.isFinite(positionMs) && positionMs >= 0 ? positionMs : null,
     durationMs: Number.isFinite(durationMs) && durationMs > 0 ? durationMs : null,
     speed: speed && Number.isFinite(Number(speed[1])) ? Number(speed[1]) : null,

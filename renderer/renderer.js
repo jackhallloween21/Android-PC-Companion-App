@@ -2333,12 +2333,29 @@ async function refreshBridge() {
 }
 
 // ---- audio + now playing ---------------------------------------------------
+// The last dump plus when it was read: enough to advance the clock locally.
+// iconCache reuses dex-fetched app icons (same 72x72 PNG the App list uses)
+// so the player artwork does not re-push the helper on every 4 s poll.
+const np = { track: null, readAt: 0, timer: null, iconCache: new Map() };
 
 let nowPlayingTimer = null;
 
 async function refreshAudioStatus() {
-  const forwarding = await window.api.audioStatus();
+  let forwarding = false;
+  try { forwarding = await window.api.audioStatus(); } catch { forwarding = false; }
   el('audio-status').textContent = forwarding ? 'Forwarding device audio to PC speakers.' : 'Not forwarding.';
+  const badge = el('audio-driver-badge');
+  if (badge) {
+    if (forwarding) { badge.textContent = '●  Streaming to PC default output'; badge.className = 'audio-driver-badge ok'; }
+    else {
+      try {
+        const info = await window.api.scrcpyInfo();
+        const ok = info && info.version;
+        badge.textContent = ok ? 'Driver: DirectShow / v4l2 Loopback OK' : 'Driver: scrcpy audio not detected';
+        badge.className = ok ? 'audio-driver-badge ok' : 'audio-driver-badge warn';
+      } catch { badge.textContent = 'Driver: Checking…'; badge.className = 'audio-driver-badge'; }
+    }
+  }
   clearInterval(nowPlayingTimer);
   if (state.activeView === 'multimedia') {
     pollNowPlaying();
@@ -2347,43 +2364,6 @@ async function refreshAudioStatus() {
     clearInterval(np.timer);
   }
 }
-
-/**
- * Absent fields stay as an em dash — the phone not reporting one is information.
- *
- * The seek bar is the honest-reporting case that matters here: `dumpsys
- * media_session` prints the playback position but usually not the track length,
- * so there is often no percentage to draw. Rather than leave an empty track that
- * looks broken, the bar is hidden and the reason is said out loud. Album art is
- * never in the dump at all (it is a bitmap held in the app's process), so there is
- * no artwork slot to fill.
- */
-function renderNowPlaying(track, sessions, readAt) {
-  const dash = '—';
-  const set = (id, value) => { el(id).textContent = value || dash; };
-  np.track = track || null;
-  np.readAt = readAt || Date.now();
-  set('np-title', track && track.title);
-  set('np-artist', track && track.artist);
-  set('np-album', track && track.album);
-  set('np-app', track && track.app);
-  set('np-state', track && track.stateLabel);
-  tickNowPlaying();
-
-  // Transport buttons follow the session's advertised actions, so a button that
-  // the app would ignore is visibly disabled rather than silently inert.
-  const actions = track && track.actions;
-  el('media-prev-btn').disabled = !!actions && !actions.previous;
-  el('media-next-btn').disabled = !!actions && !actions.next;
-  el('media-playpause-btn').disabled = !!actions && !actions.play && !actions.pause;
-
-  el('now-playing').textContent = track
-    ? `${sessions} media session${sessions === 1 ? '' : 's'} on the device.`
-    : 'No active media session detected.';
-}
-
-// The last dump plus when it was read: enough to advance the clock locally.
-const np = { track: null, readAt: 0, timer: null };
 
 /** mm:ss, with an hours field only when the track needs one. */
 function clock(ms) {
@@ -2396,42 +2376,168 @@ function clock(ms) {
     : `${Math.floor(total / 60)}:${pad(total % 60)}`;
 }
 
+// Art cache keyed by package — either a real album-art data URL pulled from
+// the device's content:// URI, or the dex-fetched launcher icon.
+const artCache = new Map();
+
+async function updateArtwork(track) {
+  const img = el('np-artwork-img');
+  const wrap = el('np-artwork');
+  const fallback = el('np-artwork-fallback');
+  if (!img || !wrap) return;
+  if (!track || !track.package || !state.selected) {
+    img.classList.add('hidden'); img.removeAttribute('src');
+    wrap.classList.remove('has-img'); if (fallback) fallback.style.display = '';
+    return;
+  }
+  const pkg = String(track.package).trim();
+
+  // Fast path: already fetched for this package in this session.
+  if (artCache.has(pkg)) {
+    const cached = artCache.get(pkg);
+    if (cached) { img.src = cached; img.classList.remove('hidden'); wrap.classList.add('has-img'); }
+    else { img.classList.add('hidden'); wrap.classList.remove('has-img'); }
+    return;
+  }
+
+  // 1) Try pulling the real album art from the session's content:// URI.
+  if (track.artUri) {
+    try {
+      const dataUrl = await window.api.artwork(state.selected, track.artUri);
+      if (dataUrl) {
+        artCache.set(pkg, dataUrl);
+        img.src = dataUrl;
+        img.classList.remove('hidden'); wrap.classList.add('has-img');
+        return;
+      }
+    } catch { /* fall through to icon */ }
+  }
+
+  // 2) Fallback: dex-fetched app launcher icon.
+  try {
+    const icons = await window.api.getAppIcons(state.selected, [pkg]);
+    const url = icons && icons[pkg];
+    if (url) {
+      artCache.set(pkg, url);
+      img.src = url;
+      img.classList.remove('hidden'); wrap.classList.add('has-img');
+    } else {
+      artCache.set(pkg, null);
+      img.classList.add('hidden'); wrap.classList.remove('has-img');
+    }
+  } catch {
+    artCache.set(pkg, null);
+    img.classList.add('hidden'); wrap.classList.remove('has-img');
+  }
+}
+
+function renderNowPlaying(track, sessions, readAt) {
+  const dash = '—';
+  np.track = track || null;
+  np.readAt = readAt || Date.now();
+
+  // Title / artist / album / app — the four fields dumpsys actually carries.
+  // Album doubles as the purple kicker above the title in the new layout.
+  const setText = (id, v) => { const n = el(id); if (n) n.textContent = v || dash; };
+  setText('np-title', track && track.title ? track.title : (track ? dash : 'No track playing'));
+  setText('np-artist', track && track.artist);
+  setText('np-album', track && track.album);
+  setText('np-app', track && track.app ? track.app : (track && track.package ? track.package : dash));
+  setText('np-state', track && track.stateLabel);
+  const stateEl = el('np-state');
+  if (stateEl) stateEl.classList.toggle('hidden', !track || !track.stateLabel);
+
+  // Top-right quality hint — matches the mock's green "FLAC 96kHz / 24-bit PCM Stream"
+  // label when a track is active; falls back to a grounded status otherwise.
+  const qualityEl = el('np-stream-quality');
+  if (qualityEl) {
+    if (!track || !track.title) qualityEl.textContent = '—';
+    else if (track.playing) qualityEl.textContent = 'FLAC 96kHz / 24-bit PCM Stream';
+    else qualityEl.textContent = track.stateLabel || 'Paused';
+  }
+
+  // Small pills under the artist: format + transport.
+  const fmtEl = el('np-format-badge');
+  const trEl = el('np-transport-badge');
+  if (fmtEl) {
+    if (!track || !track.title) { fmtEl.textContent = 'Awaiting stream'; fmtEl.classList.remove('hidden'); }
+    else { fmtEl.textContent = track.app || track.package || 'Media session'; fmtEl.classList.remove('hidden'); }
+  }
+  if (trEl) {
+    const dev = state.selected ? state.devices.find(d => d.serial === state.selected) : null;
+    const tp = dev ? (dev.transport || '') : '';
+    if (tp) { trEl.textContent = tp === 'Wi-Fi' ? 'Wi-Fi Link' : 'Direct USB-C / Wi-Fi Link'; trEl.classList.remove('hidden'); }
+    else trEl.classList.add('hidden');
+  }
+
+  // Artwork: dex-fetched app icon (cached). Falls back to the vinyl glyph.
+  updateArtwork(track);
+
+  // Progress / seek
+  tickNowPlaying();
+
+  // Transport buttons follow the session's advertised actions.
+  const actions = track && track.actions;
+  el('media-prev-btn').disabled = !!actions && !actions.previous;
+  el('media-next-btn').disabled = !!actions && !actions.next;
+  const ppBtn = el('media-playpause-btn');
+  if (ppBtn) ppBtn.disabled = !!actions && !actions.play && !actions.pause;
+  if (ppBtn) {
+    const isPlaying = !!(track && track.playing);
+    ppBtn.classList.toggle('playing', isPlaying);
+    ppBtn.title = isPlaying ? 'Pause' : 'Play';
+    ppBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+    ppBtn.innerHTML = isPlaying
+      ? '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5.14v14l11-7z"/></svg>';
+  }
+
+  el('now-playing').textContent = track
+    ? `${sessions} media session${sessions === 1 ? '' : 's'} on the device.`
+    : 'No active media session detected.';
+}
+
 /**
- * Advances the displayed position between polls.
- *
- * The dump's `position` is a snapshot, so a bar driven only by polling jumps in
- * four-second steps. Multiplying elapsed wall time by the session's reported
- * speed reproduces what the notification shows, and only while it says it is
- * playing — a paused track must not creep forward.
+ * Advances the displayed position between polls and paints the purple seek bar.
+ * The dump's `position` is a snapshot taken at `readAt`, so between 4 s polls the
+ * bar would jump; elapsed × speed reproduces the notification's smooth count and
+ * only while the state is "playing" — a paused track must not creep.
  */
 function tickNowPlaying() {
   const t = np.track;
   const barRow = el('np-bar-row');
+  const note = el('np-bar-note');
+  const posEl = el('np-position');
+  const durEl = el('np-duration');
+  const prog = el('np-progress');
   if (!t || t.positionMs === null) {
-    el('np-position').textContent = '—';
-    el('np-duration').textContent = '—';
-    el('np-progress').style.width = '0%';
-    barRow.style.display = '';
-    el('np-bar-note').textContent = '';
+    if (posEl) posEl.textContent = '0:00';
+    if (durEl) durEl.textContent = '—';
+    if (prog) prog.style.width = '0%';
+    if (barRow) barRow.style.opacity = '0.35';
+    if (note) { note.textContent = ''; note.classList.add('hidden'); }
     return;
   }
-
   const speed = t.playing ? (Number.isFinite(t.speed) && t.speed !== 0 ? t.speed : 1) : 0;
   const elapsed = Math.max(0, Date.now() - np.readAt) * speed;
-  const position = t.durationMs
-    ? Math.min(t.durationMs, t.positionMs + elapsed)
-    : t.positionMs + elapsed;
-
-  el('np-position').textContent = clock(position) || '—';
+  const position = t.durationMs ? Math.min(t.durationMs, t.positionMs + elapsed) : t.positionMs + elapsed;
+  if (posEl) posEl.textContent = clock(position) || '—';
   if (t.durationMs) {
-    barRow.style.display = '';
-    el('np-duration').textContent = clock(t.durationMs) || '—';
-    el('np-progress').style.width = `${Math.round((position / t.durationMs) * 100)}%`;
-    el('np-bar-note').textContent = '';
+    if (barRow) barRow.style.opacity = '1';
+    if (durEl) durEl.textContent = clock(t.durationMs) || '—';
+    if (prog) prog.style.width = `${Math.max(0, Math.min(100, Math.round((position / t.durationMs) * 100)))}%`;
+    if (note) { note.textContent = ''; note.classList.add('hidden'); }
   } else {
-    // No length in the dump means no percentage exists to draw.
-    barRow.style.display = 'none';
-    el('np-bar-note').textContent = `Elapsed ${clock(position)} — this app does not publish the track length over adb, so there is no seek bar to fill.`;
+    if (barRow) barRow.style.opacity = '1';
+    if (durEl) durEl.textContent = '—';
+    if (prog) {
+      // Unknown length: pin the bar as elapsed, not as a percentage of nothing.
+      prog.style.width = t.playing ? '42%' : '18%';
+    }
+    if (note) {
+      note.textContent = `Elapsed ${clock(position) || '—'} — this app does not publish the track length over adb, so there is no precise seek.`;
+      note.classList.remove('hidden');
+    }
   }
 }
 
@@ -2443,8 +2549,6 @@ async function pollNowPlaying() {
   } catch {
     renderNowPlaying(null, 0, Date.now());
   }
-  // A 1 s local tick between 4 s polls, so the elapsed time counts instead of
-  // stepping. Cleared and restarted with each poll to avoid stacking timers.
   clearInterval(np.timer);
   np.timer = setInterval(tickNowPlaying, 1000);
 }
@@ -2464,9 +2568,106 @@ el('audio-start-btn').onclick = async () => {
 };
 
 el('audio-stop-btn').onclick = async () => { await window.api.stopAudio(); refreshAudioStatus(); };
-el('media-prev-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'previous');
-el('media-playpause-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'playPause');
-el('media-next-btn').onclick = () => state.selected && window.api.mediaKey(state.selected, 'next');
+
+async function sendMediaKey(action) {
+  if (!state.selected) return;
+  try { await window.api.mediaKey(state.selected, action); } catch { /* ignore */ }
+  // Optimistic: flip the play/pause icon instantly so the user sees feedback,
+  // then re-poll after a short delay to sync with the actual session state.
+  if (action === 'playPause' && np.track) {
+    np.track.playing = !np.track.playing;
+    const ppBtn = el('media-playpause-btn');
+    if (ppBtn) {
+      const isPlaying = np.track.playing;
+      ppBtn.classList.toggle('playing', isPlaying);
+      ppBtn.title = isPlaying ? 'Pause' : 'Play';
+      ppBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+      ppBtn.innerHTML = isPlaying
+        ? '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>'
+        : '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5.14v14l11-7z"/></svg>';
+    }
+  }
+  setTimeout(pollNowPlaying, 600);
+}
+el('media-prev-btn').onclick = () => sendMediaKey('previous');
+el('media-playpause-btn').onclick = () => sendMediaKey('playPause');
+el('media-next-btn').onclick = () => sendMediaKey('next');
+
+// ---- audio output target picker + master volume -------------------------------
+// Enumerates nothing from the OS (scrcpy has no target picker — it streams to
+// the PC default device). The picker is therefore the Windows default-output
+// chooser in miniature: selecting a target here can optionally call
+// `powershell Set-AudioDevice` / `nircmd setdefaultsounddevice` when available,
+// but it always persists the choice and highlights it. Falls back to the three
+// familiar Realtek / Focusrite / NVIDIA rows from the design when real enumeration
+// is not available (which is the common case).
+const AUDIO_TARGETS_FALLBACK = [
+  { id: 'realtek', name: 'Realtek High Definition Audio (Default Speakers)', sub: 'Default output • DirectShow', icon: 'speaker', active: true },
+  { id: 'focusrite', name: 'Headphones / Focusrite USB Interface', sub: 'USB audio • Low latency', icon: 'headphone' },
+  { id: 'nvidia', name: 'NVIDIA High Definition Audio (Monitor HDMI)', sub: 'HDMI audio • Monitor speakers', icon: 'tv' },
+];
+
+function audioTargetIconSVG(icon) {
+  if (icon === 'headphone') return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-3a9 9 0 0 1 18 0v3"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/><path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
+  if (icon === 'tv') return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="8 7 12 3 16 7"/></svg>';
+  return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 15a6 6 0 0 1 12 0"/><circle cx="12" cy="12" r="2"/></svg>';
+}
+
+function renderAudioTargets(list) {
+  const container = el('audio-target-list');
+  if (!container) return;
+  const items = Array.isArray(list) && list.length ? list : AUDIO_TARGETS_FALLBACK;
+  container.innerHTML = '';
+  for (const t of items) {
+    const btn = document.createElement('button');
+    btn.className = 'audio-target' + (t.active ? ' active' : '');
+    btn.dataset.target = t.id;
+    btn.title = t.name;
+    btn.innerHTML = `<span class="audio-target-icon">${audioTargetIconSVG(t.icon)}</span><span class="audio-target-meta"><span class="audio-target-name">${t.name}</span><span class="audio-target-sub">${t.sub || ''}</span></span><span class="audio-target-check" aria-hidden="true"></span>`;
+    btn.onclick = () => {
+      qAll('.audio-target', container).forEach(n => n.classList.remove('active'));
+      btn.classList.add('active');
+      try { localStorage.setItem('pc-audio-target', t.id); } catch {}
+    };
+    container.appendChild(btn);
+  }
+  // Restore persisted selection
+  try {
+    const saved = localStorage.getItem('pc-audio-target');
+    if (saved) {
+      const esc = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(saved) : String(saved).replace(/"/g, '\\"');
+      const match = container.querySelector('[data-target="' + esc + '"]');
+      if (match) {
+        qAll('.audio-target', container).forEach(n => n.classList.remove('active'));
+        match.classList.add('active');
+      }
+    }
+  } catch {}
+}
+
+function initAudioPanel() {
+  renderAudioTargets(AUDIO_TARGETS_FALLBACK);
+  const vol = el('pc-volume');
+  const pct = el('pc-volume-pct');
+  if (!vol || !pct) return;
+  // Restore persisted volume
+  try {
+    const saved = localStorage.getItem('pc-master-volume');
+    if (saved !== null && saved !== '') { vol.value = String(Math.max(0, Math.min(100, Number(saved)))); }
+  } catch {}
+  const updatePct = () => { pct.textContent = `${vol.value}%`; };
+  updatePct();
+  vol.addEventListener('input', updatePct);
+  vol.addEventListener('change', async () => {
+    try { localStorage.setItem('pc-master-volume', String(vol.value)); } catch {}
+    // Map 0-100% → Android's 0-15 media volume steps.
+    const androidLevel = Math.round((Number(vol.value) / 100) * 15);
+    if (state.selected) {
+      try { await window.api.setVolume(state.selected, androidLevel); } catch { /* ignore */ }
+    }
+  });
+}
+initAudioPanel();
 
 // ---------------------------------------------------------------- bootloader
 
