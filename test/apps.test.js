@@ -36,6 +36,7 @@ const {
   isApkPath,
   isInstallable,
   parseInstallResult,
+  parseIconDump,
 } = require('../src/apps');
 
 // Real `pm list packages -f` output. The /data/app hash directories genuinely
@@ -355,4 +356,39 @@ test('adb install reports failure on stdout, so the output is classified', () =>
 
   assert.strictEqual(parseInstallResult('').ok, false, 'no output is not success');
   assert.match(parseInstallResult('').message, /no output/);
+});
+
+// The on-device icon helper runs under app_process, so its stdout is mixed in
+// with runtime chatter on stderr-merged shells. A real 1x1 PNG payload is used
+// to prove a clean line survives; everything else must be dropped rather than
+// turned into a broken <img>.
+const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+test('the icon helper output keeps only clean ICON lines', () => {
+  const stdout = [
+    'WARNING: linker: /system/bin/app_process: unused DT entry',
+    `ICON:com.whatsapp:${PNG_1PX}`,
+    `ICON:com.android.settings:${PNG_1PX}`,
+    'java.lang.RuntimeException: could not read com.broken.app',
+    '\tat android.app...',
+    '',
+  ].join('\n');
+  const icons = parseIconDump(stdout);
+  assert.deepStrictEqual(Object.keys(icons).sort(), ['com.android.settings', 'com.whatsapp']);
+  assert.ok(icons['com.whatsapp'].startsWith('data:image/png;base64,iVBOR'),
+    'a kept icon is a png data URL');
+});
+
+test('a malformed or truncated icon line is dropped, never half-rendered', () => {
+  // No payload separator, a stub too short to be a real PNG, and a package id
+  // with an illegal character — none of these may reach the UI.
+  const icons = parseIconDump([
+    'ICON:com.no.payload',
+    'ICON:com.short.stub:AAAA',
+    'ICON:bad pkg name:' + PNG_1PX,
+    'random noise',
+  ].join('\n'));
+  assert.deepStrictEqual(icons, {}, 'nothing plausible enough to draw');
+  assert.deepStrictEqual(parseIconDump(''), {}, 'empty output is an empty map');
+  assert.deepStrictEqual(parseIconDump(null), {}, 'null output does not throw');
 });

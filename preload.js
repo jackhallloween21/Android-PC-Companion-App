@@ -66,6 +66,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // apps
   listAppsDetailed: (serial) => ipcRenderer.invoke('apps:listDetailed', serial),
+  getAppIcons: (serial, pkgs) => ipcRenderer.invoke('apps:icons', { serial, pkgs }),
   getAppDetail: (serial, pkg, app) => ipcRenderer.invoke('apps:detail', { serial, pkg, app }),
   installApk: (serial) => ipcRenderer.invoke('apps:install', serial),
   // Drag-and-drop sideloading. A dropped File has no usable path in the
@@ -102,8 +103,10 @@ contextBridge.exposeInMainWorld('api', {
   startAudio: (serial) => ipcRenderer.invoke('audio:start', serial),
   stopAudio: () => ipcRenderer.invoke('audio:stop'),
   audioStatus: () => ipcRenderer.invoke('audio:status'),
+  setVolume: (serial, level) => ipcRenderer.invoke('audio:setVolume', { serial, level }),
   mediaKey: (serial, action) => ipcRenderer.invoke('media:key', { serial, action }),
   nowPlaying: (serial) => ipcRenderer.invoke('media:nowPlaying', serial),
+  artwork: (serial, uri) => ipcRenderer.invoke('media:artwork', { serial, uri }),
 
   // camera
   listCameras: (serial) => ipcRenderer.invoke('camera:list', serial),
@@ -146,6 +149,12 @@ contextBridge.exposeInMainWorld('api', {
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
+
+  // theme: persisted { mode, accent } (+ the OS dark preference), and a live
+  // push when that OS preference flips so an "Auto" theme follows it.
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
+  onOsThemeChanged: (cb) => ipcRenderer.on('theme:osUpdated', (_e, osPrefersDark) => cb(osPrefersDark)),
 
   // QR pairing. The PC *shows* the code and the phone scans it, so this returns
   // a module matrix for the renderer to draw; progress arrives as events while

@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
+const { sanitizeSettings } = require('./src/theme');
 const {
   POWER_SCRIPT,
   parsePowerDump,
@@ -57,6 +58,7 @@ const {
   parseDuBytes,
   isInstallable,
   parseInstallResult,
+  parseIconDump,
 } = require('./src/apps');
 // QR pairing lives here, not in preload.js: the preload runs sandboxed, where
 // `require` is a polyfill that only resolves `electron` and a couple of node
@@ -163,6 +165,13 @@ function createWindow() {
   // reachable by accident.
   win.webContents.on('did-start-navigation', () => qrPairing.cancel());
   win.on('closed', () => qrPairing.cancel());
+  // When the OS light/dark preference flips, tell the renderer so an "Auto"
+  // theme follows it live. Bound to this window and torn down with it.
+  const onNativeThemeUpdated = () => {
+    if (!win.isDestroyed()) win.webContents.send('theme:osUpdated', nativeTheme.shouldUseDarkColors);
+  };
+  nativeTheme.on('updated', onNativeThemeUpdated);
+  win.on('closed', () => nativeTheme.removeListener('updated', onNativeThemeUpdated));
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -437,9 +446,10 @@ ipcMain.handle('devices:list', async () => {
       const hasUsb = parts.some((p) => p.startsWith('usb:'));
       const isMdns = serial.startsWith('adb-') || serial.includes('._tcp') || serial.includes('_adb');
       const isIpPort = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+      const isWireless = isIpPort || isMdns || isWirelessSerial(serial);
       const cachedIp = infoCache.get(serial)?.ip || null;
       const ip = isIpPort ? serial.split(':')[0] : cachedIp;
-      const transport = (isIpPort || isMdns || ip) ? 'Wi-Fi' : (hasUsb ? 'USB' : 'USB');
+      const transport = isWireless ? 'Wi-Fi' : (hasUsb ? 'USB' : 'USB');
       const product = (parts.find((p) => p.startsWith('product:')) || '').split(':')[1] || null;
       return { serial, state, model, transport, ip, product };
     });
@@ -558,6 +568,44 @@ function saveKnown(list) {
   try { fs.writeFileSync(KNOWN_FILE(), JSON.stringify(pruneKnown(list), null, 2)); }
   catch { /* a read-only profile is not worth failing a connection over */ }
 }
+
+// --------------------------------------------------------------- theme settings
+// Persisted exactly like known-devices: a small JSON file in userData.
+// sanitizeSettings (shared with the renderer through src/theme) guarantees a
+// valid { mode, accent } even when the file is absent, hand-edited, or corrupt,
+// so a bad settings.json can never stop the app painting.
+const SETTINGS_FILE = () => path.join(app.getPath('userData'), 'settings.json');
+
+function loadSettings() {
+  try {
+    return sanitizeSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE(), 'utf8')));
+  } catch {
+    return sanitizeSettings(null);
+  }
+}
+
+// Merges a partial patch ({ mode } or { accent }) over what is on disk, so the
+// renderer can save one field without clobbering the other, then re-sanitizes.
+function saveSettings(patch) {
+  const merged = { ...loadSettings(), ...(patch && typeof patch === 'object' ? patch : {}) };
+  const next = sanitizeSettings(merged);
+  try { fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(next, null, 2)); }
+  catch { /* read-only profile: the sanitized value still applies for this run */ }
+  return next;
+}
+
+// osPrefersDark rides along so the renderer can resolve "auto" without a second
+// round-trip; nativeTheme is only valid after app is ready, which holds here
+// because these fire in response to the loaded renderer.
+ipcMain.handle('settings:get', async () => ({
+  ...loadSettings(),
+  osPrefersDark: nativeTheme.shouldUseDarkColors,
+}));
+
+ipcMain.handle('settings:set', async (_e, patch) => ({
+  ...saveSettings(patch),
+  osPrefersDark: nativeTheme.shouldUseDarkColors,
+}));
 
 /** Serials adb currently has attached. */
 async function attachedSerials() {
@@ -946,26 +994,53 @@ ipcMain.handle('control:screenshot', async (_e, serial) => {
 });
 
 let recordProcess = null;
+let recordSerial = null;
 const REMOTE_RECORD_PATH = '/sdcard/companion_record.mp4';
 
-ipcMain.handle('control:recordStart', (_e, serial) => {
+ipcMain.handle('control:recordStart', async (_e, serial) => {
   if (recordProcess) return true;
+  recordSerial = serial;
+  try { await adb(['-s', serial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]); } catch { /* ignore */ }
   recordProcess = spawn(tools.adb, ['-s', serial, 'shell', 'screenrecord', REMOTE_RECORD_PATH]);
   recordProcess.on('exit', () => { recordProcess = null; });
   return true;
 });
 
 ipcMain.handle('control:recordStop', async (_e, serial) => {
-  if (!recordProcess) return null;
-  // screenrecord finalizes the file cleanly on SIGINT; give it a moment
-  // before pulling.
-  recordProcess.kill('SIGINT');
-  recordProcess = null;
-  await new Promise((r) => setTimeout(r, 1200));
-  const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: `recording-${Date.now()}.mp4` });
-  if (canceled || !filePath) return null;
-  await adb(['-s', serial, 'pull', REMOTE_RECORD_PATH, filePath]);
-  await adb(['-s', serial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]);
+  const targetSerial = serial || recordSerial;
+  if (!recordProcess && !targetSerial) return null;
+
+  // Signal remote screenrecord process via SIGINT (signal 2) so Android cleanly
+  // flushes the encoder and writes the MP4 moov atom / trailer.
+  if (targetSerial) {
+    try {
+      await adb(['-s', targetSerial, 'shell', 'pkill -2 screenrecord || killall -2 screenrecord || kill -2 $(pidof screenrecord)']);
+    } catch { /* ignore */ }
+  }
+  if (recordProcess) {
+    try { recordProcess.kill(); } catch { /* ignore */ }
+    recordProcess = null;
+  }
+  recordSerial = null;
+
+  // Give screenrecord a brief moment to finish writing the file to storage
+  await new Promise((r) => setTimeout(r, 1500));
+
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: `recording-${Date.now()}.mp4`,
+    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'All Files', extensions: ['*'] }],
+  });
+  if (canceled || !filePath) {
+    if (targetSerial) {
+      try { await adb(['-s', targetSerial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]); } catch { /* ignore */ }
+    }
+    return null;
+  }
+
+  if (targetSerial) {
+    await adb(['-s', targetSerial, 'pull', REMOTE_RECORD_PATH, filePath]);
+    await adb(['-s', targetSerial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]);
+  }
   return filePath;
 });
 
@@ -1068,16 +1143,24 @@ ipcMain.handle('wireless:connect', async (_e, hostPort) => {
 
 ipcMain.handle('wireless:discover', async () => pickConnectTarget(await adbText(['mdns', 'services'])));
 
-// Drops a device. A wireless serial is `host:port`, which adb can genuinely
-// disconnect; a USB serial cannot be detached from this end, so the caches are
+// Drops a device. A wireless serial is `host:port` or mDNS name, which adb can genuinely
+// disconnect; a physical USB serial cannot be detached from this end, so the caches are
 // cleared and the renderer just deselects it.
 ipcMain.handle('device:disconnect', async (_e, serial) => {
   forgetDevice(serial);
   // The device stays on the autoconnect list: disconnecting is temporary, and
   // the pairing key on the phone is untouched. Use devices:forget to drop it.
   if (isWirelessSerial(serial)) {
-    return { disconnected: true, message: await adbText(['disconnect', serial]) };
+    const msg = await adbText(['disconnect', serial]);
+    return { disconnected: true, message: msg || 'Disconnected' };
   }
+  try {
+    const msg = await adbText(['disconnect', serial]);
+    if (/disconnected/i.test(msg)) {
+      return { disconnected: true, message: msg };
+    }
+  } catch { /* ignore */ }
+
   return {
     disconnected: false,
     message: 'USB devices stay attached until the cable is unplugged — unplug it, '
@@ -1670,6 +1753,77 @@ ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell
 ipcMain.handle('apps:clearData', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'clear', assertPackage(pkg)]));
 
 // ---------------------------------------------------------------------------
+// App icons
+//
+// adb exposes no launcher icon: `pm`/`dumpsys` print a numeric resource id, and
+// the bitmap itself only exists inside the APK. Pulling every APK to unzip one
+// PNG would move gigabytes. Instead a ~4 KB dex helper is pushed once and run
+// with `app_process`, exactly as scrcpy runs its server: that gives it a real
+// PackageManager, from which getApplicationIcon() renders each icon to a PNG we
+// read straight off stdout. It runs as the shell user, so a handful of apps
+// with locked-down icons simply do not answer — the UI keeps its monogram tile
+// for those, and for any device where app_process is not lettable at all.
+// ---------------------------------------------------------------------------
+
+const ICON_DEX_REMOTE = '/data/local/tmp/companion-icons.dex';
+
+// Bundled next to smartphone.png. When packaged the app runs from inside
+// app.asar, which the external adb binary cannot read, so the dex is unpacked
+// (see "asarUnpack" in package.json) and reached through app.asar.unpacked.
+//
+// Order matters: Electron patches fs so existsSync() returns true for the path
+// *inside* app.asar, but adb — an external process — cannot stat that virtual
+// path, so pushing it would fail and every icon would fall back to a monogram
+// in the packaged .exe. We therefore try the unpacked copy first. In dev there
+// is no "app.asar" segment, so the replace is a no-op and both entries are the
+// same real path.
+function iconDexPath() {
+  const inApp = path.join(__dirname, 'assets', 'classes.dex');
+  const unpacked = inApp.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+  for (const candidate of [unpacked, inApp]) {
+    try { if (fs.existsSync(candidate)) return candidate; } catch { /* keep looking */ }
+  }
+  return inApp;
+}
+
+// The push is done once per serial and shared between the renderer's batched
+// calls; a failure clears the cache so a later attempt can retry rather than
+// being stuck behind a rejected promise.
+const iconDexPushes = new Map();
+function ensureIconDex(serial) {
+  if (!iconDexPushes.has(serial)) {
+    const dex = iconDexPath();
+    const push = adb(['-s', serial, 'push', dex, ICON_DEX_REMOTE])
+      .then(() => true)
+      .catch((err) => { iconDexPushes.delete(serial); throw err; });
+    iconDexPushes.set(serial, push);
+  }
+  return iconDexPushes.get(serial);
+}
+
+ipcMain.handle('apps:icons', async (_e, { serial, pkgs }) => {
+  const list = (Array.isArray(pkgs) ? pkgs : [])
+    .map((p) => String(p || '').trim())
+    .filter((p) => PKG_RE.test(p));
+  if (!serial || !list.length) return {};
+  try {
+    if (!fs.existsSync(iconDexPath())) return {};
+    await ensureIconDex(serial);
+    // Every id is PKG_RE-checked above, so none can smuggle a shell token into
+    // the app_process command line.
+    const out = await adb([
+      '-s', serial, 'shell',
+      `CLASSPATH=${ICON_DEX_REMOTE}`, 'app_process', '/system/bin',
+      'com.companion.IconExtractor', ...list,
+    ]);
+    return parseIconDump(out);
+  } catch {
+    // No icons is not an error the user needs to see — the monograms stand in.
+    return {};
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Backup
 // ---------------------------------------------------------------------------
 
@@ -2141,7 +2295,10 @@ ipcMain.handle('scrcpy:info', async () => {
 let audioProcess = null;
 
 ipcMain.handle('audio:start', async (_e, serial) => {
-  if (audioProcess) return true;
+  if (audioProcess) {
+    try { audioProcess.kill(); } catch { /* ignore */ }
+    audioProcess = null;
+  }
   await assertDeviceReady(serial);
   const hasAudioSupport = hasAudio(scrcpyInfo);
   if (!hasAudioSupport) {
@@ -2191,6 +2348,32 @@ ipcMain.handle('audio:stop', () => {
 
 ipcMain.handle('audio:status', () => !!audioProcess);
 
+// Set the device's media volume to a 0-15 level (Android's 16-step scale).
+// Uses `cmd audio` on Android 10+ and falls back to `media volume --set` for
+// older devices, then reports back the actual level so the slider can correct.
+ipcMain.handle('audio:setVolume', async (_e, { serial, level }) => {
+  const clamped = Math.max(0, Math.min(15, Math.round(Number(level) || 0)));
+  // Try `cmd audio set-volume music <level>` (Android 10+).
+  let out = '';
+  try {
+    out = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'set-volume', 'music', String(clamped)]);
+  } catch {
+    // Fallback: `media volume --set <level>` (Android 5-9).
+    try {
+      out = await adb(['-s', serial, 'shell', 'media', 'volume', '--set', String(clamped), '--stream', '3']);
+    } catch (err2) {
+      throw new Error(`Failed to set volume: ${err2.message}`);
+    }
+  }
+  // Read back actual level.
+  try {
+    const volOut = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'music']);
+    const m = volOut.match(/(\d+)/);
+    if (m) return Number(m[1]);
+  } catch { /* ignore */ }
+  return clamped;
+});
+
 const MEDIA_KEYCODES = { playPause: 85, next: 87, previous: 88 };
 
 ipcMain.handle('media:key', (_e, { serial, action }) => {
@@ -2211,6 +2394,26 @@ ipcMain.handle('media:nowPlaying', async (_e, serial) => {
     description: describeTrack(track),
     sessions: parseAllSessions(out).length,
   };
+});
+
+// Pull album-art bitmap from a content:// URI exposed by the media session.
+// Returns a base64 data URL suitable for an <img> src, or null when the pull
+// fails (permissions, missing provider, etc.).
+ipcMain.handle('media:artwork', async (_e, { serial, uri }) => {
+  if (!serial || !uri) return null;
+  try {
+    // `content read` streams the raw bytes; `-a` is not needed for binary.
+    const buf = await adb(['-s', serial, 'shell', 'content', 'read', '--uri', uri]);
+    if (!buf || !buf.length) return null;
+    // Content read may include trailing newlines; strip and decode.
+    const raw = buf.replace(/[\r\n]+$/g, '');
+    if (!raw || raw.includes('No result') || raw.includes('Permission denied')) return null;
+    // The output is raw binary when redirected, but adb may mangle it.
+    // Attempt base64 decode and re-encode to ensure a clean data URL.
+    const b64 = Buffer.from(raw, 'binary').toString('base64');
+    if (b64.length < 100) return null; // too small to be a real image
+    return `data:image/jpeg;base64,${b64}`;
+  } catch { return null; }
 });
 
 // ---------------------------------------------------------------------------
@@ -2320,6 +2523,10 @@ async function startCameraSession(opts = {}) {
   await assertDeviceReady(serial);
   assertCameraSupport();
   closeCameraSession({ killScrcpy: true });
+  if (audioProcess) {
+    try { audioProcess.kill(); } catch { /* ignore */ }
+    audioProcess = null;
+  }
 
   const dock = opts.dock !== false;
   const canDock = dock && supportsPlacement(scrcpyInfo.help);
@@ -2510,6 +2717,21 @@ ipcMain.handle('camera:toggleMic', async (_e, serial) => {
   return startCameraSession(currOpts);
 });
 
+function cropWindowChrome(nativeImg, isBorderless) {
+  if (!nativeImg || nativeImg.isEmpty() || isBorderless) return nativeImg;
+  const size = nativeImg.getSize();
+  if (size.width < 120 || size.height < 120) return nativeImg;
+  const topBar = Math.min(Math.max(Math.round(size.height * 0.035), 30), 45);
+  const sideMargin = Math.min(Math.max(Math.round(size.width * 0.006), 2), 8);
+  const cropW = Math.max(size.width - sideMargin * 2, 10);
+  const cropH = Math.max(size.height - topBar - sideMargin, 10);
+  try {
+    return nativeImg.crop({ x: sideMargin, y: topBar, width: cropW, height: cropH });
+  } catch {
+    return nativeImg;
+  }
+}
+
 /**
  * Camera frame: captures the scrcpy camera window via desktopCapturer when a
  * camera stream is running, or falls back to screencap (phone screen) otherwise.
@@ -2526,7 +2748,8 @@ ipcMain.handle('camera:frame', async (_e, serial) => {
       const camTitle = cameraWindowTitle(serial);
       const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
       if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
-        return `data:image/png;base64,${src.thumbnail.toPNG().toString('base64')}`;
+        const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
+        return `data:image/png;base64,${cropped.toPNG().toString('base64')}`;
       }
     } catch { /* fall through to screencap */ }
   }
@@ -2551,12 +2774,13 @@ ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
     try {
       const sources = await desktopCapturer.getSources({
         types: ['window'],
-        thumbnailSize: { width: 1920, height: 1080 },
+        thumbnailSize: { width: 3840, height: 2160 },
       });
       const camTitle = cameraWindowTitle(targetSerial);
       const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
       if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
-        buf = src.thumbnail.toPNG();
+        const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
+        buf = cropped.toPNG();
       }
     } catch { /* fall through */ }
   }

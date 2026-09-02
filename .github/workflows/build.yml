@@ -1,7 +1,12 @@
 name: Build Windows EXE
 
 on:
-  workflow_dispatch: # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g. 1.2.3). Falls back to release tag or package.json version.'
+        required: false
+        default: ''
   release:
     types: [published] # Triggers automatically when a release is created/published
 
@@ -16,6 +21,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      # Resolve the version: release tag > manual input > package.json
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = '${{ github.event.release.tag_name }}'
+          if (-not $version) { $version = '${{ inputs.version }}' }
+          $version = $version.Trim().TrimStart('v')
+          if (-not $version) {
+            $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          }
+          Write-Host "Building version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # Update package.json + package-lock.json so the exe/installer
+      # carries the release version instead of the stale repo version.
+      - name: Bump version
+        shell: pwsh
+        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
 
       - run: npm ci
       - run: npm run dist
