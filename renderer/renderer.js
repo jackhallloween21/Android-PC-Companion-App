@@ -775,7 +775,7 @@ async function loadHardware() {
   setText('hw-watts', fmt(power.watts, 2));
   setText('hw-voltage', fmt(power.voltage, 2));
   setText('hw-voltage-mv', power.voltageMv ? `${power.voltageMv} mV` : '');
-  setText('hw-current', fmt(power.current, 2));
+  setText('hw-current', (power.charging ? '+' : '−') + fmt(power.current, 2));
   setText('hw-current-ma', power.currentMa !== null && power.currentMa !== undefined
     ? `${power.charging ? '+' : '−'}${Math.abs(power.currentMa)} mA`
     // With no measured draw, show the negotiated ceiling instead — clearly
@@ -2152,13 +2152,22 @@ el('camera-refresh-btn').onclick = async () => {
 };
 
 // Mic toggle button
-el('camera-mic-btn').onclick = () => {
+el('camera-mic-btn').onclick = async () => {
   camera.micEnabled = !camera.micEnabled;
   const btn = el('camera-mic-btn');
   btn.classList.toggle('active', camera.micEnabled);
   const micVal = el('mic-status-value');
   if (camera.mic) {
     if (micVal) { micVal.textContent = camera.micEnabled ? 'Enabled' : 'Disabled'; micVal.className = camera.micEnabled ? 'cam-info-value green' : 'cam-info-value yellow'; }
+  }
+  const isStreaming = el('camera-state') && el('camera-state').textContent === 'Streaming';
+  if (isStreaming && state.selected) {
+    try {
+      await window.api.cameraToggleMic(state.selected);
+      setCameraStatus('Mic ' + (camera.micEnabled ? 'enabled' : 'disabled') + '.', 'ok');
+    } catch (err) {
+      setCameraStatus('Mic toggle failed: ' + cleanIpcError(err.message), 'err');
+    }
   }
 };
 
