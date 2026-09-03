@@ -136,7 +136,17 @@ if (!serial) {
   }
   window.api.cameraRecordStatus().then((active) => { camRecording = !!active; paintCamRec(); }).catch(() => {});
 
-  action('c-stop', () => window.api.stopCamera(), { busy: 'Stopping camera…' });
+  action('c-stop', () => window.api.stopCamera(), {
+    busy: 'Stopping camera…',
+    done: (res) => {
+      // A stop also ends an in-flight recording (finalized main-side).
+      camRecording = false;
+      paintCamRec();
+      if (res && res.recording) return `Stopped — saved ${String(res.recording).split(/[\\/]/).pop()}`;
+      if (res && res.recordError) return 'Stopped — recording failed';
+      return 'Stopped';
+    },
+  });
 
   action('a-redock', () => window.api.cameraRedock(), {
     done: (ok) => (ok ? 'Snapped back under the video' : 'No docked session'),

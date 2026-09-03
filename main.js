@@ -116,7 +116,19 @@ const {
   parseNowPlaying,
   parseAllSessions,
   describeTrack,
+  collectArtUris,
+  parseAudioVolume,
 } = require('./src/media');
+const {
+  RECORD_STOP_TIMEOUT_MS,
+  RECORD_FLUSH_SETTLE_MS,
+  RECORD_MIN_BYTES,
+  RECORD_TAIL_SCAN_BYTES,
+  RECORD_HEAD_SCAN_BYTES,
+  assessRecording,
+  repairMkvTimestamps,
+  repairMp4Edits,
+} = require('./src/recording');
 
 const tools = { adb: 'adb', fastboot: 'fastboot', scrcpy: 'scrcpy' };
 
@@ -1483,153 +1495,378 @@ ipcMain.handle('files:preview', async (_e, { serial, remotePath }) => {
   return null;
 });
 
-ipcMain.handle('files:pull', async (e, { serial, remotePath }) => {
-  const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: path.basename(remotePath) });
-  if (canceled || !filePath) return null;
-  e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 0 });
-  try {
-    let totalBytes = 0;
-    try {
-      const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remotePath]);
-      totalBytes = parseInt(sizeOut.trim(), 10) || 0;
-    } catch { /* ignore — we'll show indeterminate */ }
-    const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath]);
-    let bytesRead = 0;
-    const ws = fs.createWriteStream(filePath);
-    await new Promise((resolve, reject) => {
-      proc.stdout.on('data', (chunk) => {
-        bytesRead += chunk.length;
-        ws.write(chunk);
-        if (totalBytes > 0) {
-          const pct = Math.min(99, Math.round((bytesRead / totalBytes) * 100));
-          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: pct, bytes: bytesRead, totalBytes });
-        } else {
-          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: -1, bytes: bytesRead, totalBytes: 0 });
-        }
-      });
-      proc.on('close', (code) => {
-        ws.end(() => {
-          if (code === 0) resolve();
-          else reject(new Error('adb exited with code ' + code));
-        });
-      });
-      proc.on('error', (err) => { ws.end(); reject(err); });
-    });
-    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100, bytes: bytesRead, totalBytes: bytesRead });
-    return filePath;
-  } catch (err) {
-    try { await adb(['-s', serial, 'pull', remotePath, filePath]); } catch (fallbackErr) { throw fallbackErr; }
-    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100 });
-    return filePath;
-  }
+// Live transfers: every pull/push runs under a client-supplied id so progress
+// events can be matched to the right transfer (no cross-talk when transfers
+// overlap) and so the UI's Stop button can abort mid-flight. Each scope tracks
+// its child processes for killing; execFile-based calls are short and finish
+// on their own, while loops check the flag between entries.
+let transferSeq = 0;
+const liveTransfers = new Map();
+function transferScope(transferId) {
+  const id = (typeof transferId === 'string' && transferId) || `tc-${Date.now().toString(36)}-${(transferSeq += 1)}`;
+  let scope = liveTransfers.get(id);
+  if (!scope) { scope = { id, cancelled: false, procs: new Set() }; liveTransfers.set(id, scope); }
+  return scope;
+}
+function endTransferScope(scope) { if (scope) liveTransfers.delete(scope.id); }
+function xferCancelled(scope) { return !!(scope && scope.cancelled); }
+function trackProc(scope, proc) {
+  if (!scope || !proc) return proc;
+  scope.procs.add(proc);
+  const drop = () => scope.procs.delete(proc);
+  proc.once('close', drop);
+  proc.once('error', drop);
+  if (scope.cancelled) { try { proc.kill(); } catch {} }
+  return proc;
+}
+function emitXfer(sender, channel, scope, payload) {
+  try { sender.send(channel, { ...payload, transferId: scope ? scope.id : null }); } catch {}
+}
+ipcMain.handle('files:cancelTransfer', async (_e, { transferId }) => {
+  const scope = transferId && liveTransfers.get(transferId);
+  if (!scope) return false;
+  scope.cancelled = true;
+  for (const proc of [...scope.procs]) { try { proc.kill(); } catch {} }
+  return true;
 });
 
-ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
-  if (!destDir) {
-    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
-    if (result.canceled || !result.filePaths.length) return null;
-    destDir = result.filePaths[0];
-  }
-  const results = [];
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 0 });
-    const localPath = path.join(destDir, f.name);
+/** Remote file size in bytes (null when unreadable — e.g. no stat applet). */
+async function remoteFileSize(serial, remotePath) {
+  try {
+    const out = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remotePath]);
+    const n = parseInt(String(out).trim(), 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  } catch { return null; }
+}
+
+ipcMain.handle('files:pull', async (e, { serial, remotePath, sizeHint, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pullProgress', scope, payload);
+  try {
+    const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: path.basename(remotePath) });
+    if (canceled || !filePath) return null;
+    if (xferCancelled(scope)) return null;
+    emit({ index: 0, total: 1, name: path.basename(remotePath), percent: 0 });
     try {
-      let totalBytes = 0;
-      try {
-        const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', f.path]);
-        totalBytes = parseInt(sizeOut.trim(), 10) || 0;
-      } catch { /* ignore */ }
-      const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', f.path]);
+      let totalBytes = await remoteFileSize(serial, remotePath);
+      if (!(totalBytes > 0)) totalBytes = Number(sizeHint) > 0 ? Number(sizeHint) : 0;
+      const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath]));
       let bytesRead = 0;
-      const ws = fs.createWriteStream(localPath);
+      const ws = fs.createWriteStream(filePath);
       await new Promise((resolve, reject) => {
         proc.stdout.on('data', (chunk) => {
           bytesRead += chunk.length;
           ws.write(chunk);
-          const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
-          e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
+          if (totalBytes > 0) {
+            const pct = Math.min(99, Math.round((bytesRead / totalBytes) * 100));
+            emit({ index: 0, total: 1, name: path.basename(remotePath), percent: pct, bytes: bytesRead, totalBytes });
+          } else {
+            emit({ index: 0, total: 1, name: path.basename(remotePath), percent: -1, bytes: bytesRead, totalBytes: 0 });
+          }
         });
-        proc.on('close', (code) => { ws.end(() => code === 0 ? resolve() : reject(new Error('exit ' + code))); });
+        proc.on('close', (code) => {
+          ws.end(() => {
+            if (xferCancelled(scope)) return reject(new Error('Transfer cancelled'));
+            if (code === 0) resolve();
+            else reject(new Error('adb exited with code ' + code));
+          });
+        });
         proc.on('error', (err) => { ws.end(); reject(err); });
       });
-      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
-      results.push({ name: f.name, ok: true, path: localPath });
+      emit({ index: 0, total: 1, name: path.basename(remotePath), percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+      return filePath;
     } catch (err) {
-      try {
-        await adb(['-s', serial, 'pull', f.path, localPath]);
-        results.push({ name: f.name, ok: true, path: localPath });
-      } catch (pullErr) {
-        results.push({ name: f.name, ok: false, error: pullErr.message });
-      }
-      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100 });
+      if (xferCancelled(scope)) return null;
+      try { await adb(['-s', serial, 'pull', remotePath, filePath]); } catch (fallbackErr) { throw fallbackErr; }
+      emit({ index: 0, total: 1, name: path.basename(remotePath), percent: 100 });
+      return filePath;
     }
+  } finally {
+    endTransferScope(scope);
   }
-  return { destDir, results };
 });
 
-ipcMain.handle('files:push', async (e, { serial, remoteDir }) => {
-  const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
-  if (canceled || !filePaths.length) return null;
-  const localPath = filePaths[0];
-  const name = path.basename(localPath);
-  const remotePath = remoteDir.replace(/\/?$/, '/') + name;
-  const totalBytes = fs.statSync(localPath).size;
-  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: -1, bytes: 0, totalBytes });
-  try {
-    const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    await adb(['-s', serial, 'push', localPath, tmpPath]);
-    await adb(['-s', serial, 'shell', 'mv', tmpPath, remotePath]);
-  } catch {
-    await adb(['-s', serial, 'push', localPath, remoteDir]);
-  }
-  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: 100, bytes: totalBytes, totalBytes });
-  return localPath;
-});
+/**
+ * Recursively lists files under a remote directory (paths relative to it),
+ * so a selected folder downloads as a tree instead of being skipped. Uses
+ * NUL separation to survive spaces, quotes, and newlines in names; throws
+ * when the device has no find(1), and the caller falls back to a whole-dir
+ * `adb pull` instead.
+ */
+async function listRemoteFilesRecursive(serial, remoteDir) {
+  const dir = String(remoteDir).replace(/\/?$/, '');
+  const out = await adb(['-s', serial, 'shell', 'find ' + JSON.stringify(dir) + ' -type f -print0']);
+  return String(out || '')
+    .split('\0')
+    .map((p) => p.replace(/\r$/, ''))
+    .filter((p) => p.startsWith(dir + '/'))
+    .map((p) => p.slice(dir.length + 1))
+    .filter(Boolean);
+}
 
-ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
-  const { canceled, filePaths } = await dialog.showOpenDialog({
-    properties: ['openFile', 'multiSelections'],
-    title: 'Select files to upload',
+/**
+ * `adb pull` as a tracked child process (killable for Stop, with a readable
+ * error). The shared adb() helper buffers and cannot be aborted mid-flight.
+ */
+async function adbPullTracked({ serial, remotePath, localPath, scope }) {
+  const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'pull', remotePath, localPath]));
+  proc.stdout.resume();
+  let stderr = '';
+  proc.stderr.on('data', (b) => { stderr = (stderr + b.toString()).slice(-2000); });
+  const code = await new Promise((resolve) => {
+    proc.once('error', () => resolve(null));
+    proc.once('close', (c) => resolve(c));
   });
-  if (canceled || !filePaths.length) return null;
-  const results = [];
-  for (let i = 0; i < filePaths.length; i++) {
-    const lp = filePaths[i];
-    const name = path.basename(lp);
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
-    let totalBytes = 0;
-    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
-    try {
-      await adb(['-s', serial, 'push', lp, remoteDir]);
-      results.push({ name, ok: true });
-    } catch (err) {
-      results.push({ name, ok: false, error: err.message });
-    }
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+  if (xferCancelled(scope)) throw new Error('Transfer cancelled');
+  if (code !== 0) {
+    const detail = stderr.trim().split('\n').filter(Boolean).pop();
+    throw new Error(detail || `adb pull exited with code ${code}`);
   }
-  return results;
+}
+
+ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pullProgress', scope, payload);
+  try {
+    if (!destDir) {
+      const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
+      if (result.canceled || !result.filePaths.length) return null;
+      destDir = result.filePaths[0];
+    }
+    if (xferCancelled(scope)) return null;
+    // Expand selected folders into their contained files with structure
+    // preserved (destDir/<folder>/<relative path>), keeping per-file progress.
+    // A folder that walks empty — genuinely empty, or a device without find —
+    // stays a single whole-directory entry pulled natively below.
+    const queue = [];
+    for (const f of files) {
+      if (xferCancelled(scope)) break;
+      if (!f.isDir) { queue.push({ ...f, localRel: f.name }); continue; }
+      let rels = null;
+      try { rels = await listRemoteFilesRecursive(serial, f.path); } catch { rels = null; }
+      if (!rels || !rels.length) { queue.push({ ...f, isDir: true, localRel: f.name }); continue; }
+      const base = String(f.path).replace(/\/?$/, '');
+      for (const rel of rels) {
+        queue.push({ path: base + '/' + rel, name: f.name + '/' + rel, localRel: path.join(f.name, rel) });
+      }
+    }
+    const results = [];
+    for (let i = 0; i < queue.length; i++) {
+      if (xferCancelled(scope)) break;
+      const f = queue[i];
+      const sizeHint = Number(f.sizeHint) > 0 ? Number(f.sizeHint) : 0;
+      emit({ index: i, total: queue.length, name: f.name, percent: 0, bytes: 0, totalBytes: sizeHint });
+      const localPath = path.join(destDir, f.localRel);
+      if (f.isDir) {
+        // Whole-directory fallback: `adb pull` recurses natively. destDir
+        // exists, so the folder lands as destDir/<name>/… — indeterminate
+        // progress while it runs, since adb reports no per-file signal.
+        // Pre-creating the target also preserves genuinely empty folders,
+        // which `adb pull` alone would silently skip.
+        try {
+          fs.mkdirSync(path.join(destDir, f.name), { recursive: true });
+          await adbPullTracked({ serial, remotePath: f.path, localPath: destDir, scope });
+          results.push({ name: f.name, ok: true, path: path.join(destDir, f.name) });
+        } catch (err) {
+          results.push({ name: f.name, ok: false, error: err.message });
+          if (xferCancelled(scope)) break;
+        }
+        emit({ index: i, total: queue.length, name: f.name, percent: 100 });
+        continue;
+      }
+      try { fs.mkdirSync(path.dirname(localPath), { recursive: true }); } catch { /* ignore */ }
+      try {
+        let totalBytes = await remoteFileSize(serial, f.path);
+        if (!(totalBytes > 0)) totalBytes = sizeHint;
+        const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', f.path]));
+        let bytesRead = 0;
+        const ws = fs.createWriteStream(localPath);
+        await new Promise((resolve, reject) => {
+          proc.stdout.on('data', (chunk) => {
+            bytesRead += chunk.length;
+            ws.write(chunk);
+            const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
+            emit({ index: i, total: queue.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
+          });
+          proc.on('close', (code) => {
+            ws.end(() => {
+              if (xferCancelled(scope)) return reject(new Error('Transfer cancelled'));
+              if (code === 0) resolve();
+              else reject(new Error('exit ' + code));
+            });
+          });
+          proc.on('error', (err) => { ws.end(); reject(err); });
+        });
+        emit({ index: i, total: queue.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+        results.push({ name: f.name, ok: true, path: localPath });
+      } catch (err) {
+        if (xferCancelled(scope)) { results.push({ name: f.name, ok: false, error: 'Transfer cancelled' }); break; }
+        try {
+          await adbPullTracked({ serial, remotePath: f.path, localPath, scope });
+          results.push({ name: f.name, ok: true, path: localPath });
+        } catch (pullErr) {
+          results.push({ name: f.name, ok: false, error: pullErr.message });
+          if (xferCancelled(scope)) break;
+        }
+        emit({ index: i, total: queue.length, name: f.name, percent: 100 });
+      }
+    }
+    const cancelled = xferCancelled(scope);
+    return { destDir, results, cancelled };
+  } finally {
+    endTransferScope(scope);
+  }
 });
 
-ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths }) => {
-  if (!filePaths || !filePaths.length) return [];
-  const results = [];
-  for (let i = 0; i < filePaths.length; i++) {
-    const lp = filePaths[i];
-    const name = path.basename(lp);
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
-    let totalBytes = 0;
-    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+/**
+ * `adb push` as a tracked child process with live byte progress. adb itself
+ * reports nothing until it finishes, so the remote size is polled while it
+ * runs — the UI shows real MBs instead of a stuck indeterminate bar. Single
+ * poll failures (and devices without stat) degrade silently to the old
+ * start/finish events. Resolves on success; throws on failure or user cancel.
+ */
+async function adbPushTracked({ serial, localPath, targetPath, totalBytes, scope, onEvent }) {
+  const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'push', localPath, targetPath]));
+  proc.stdout.resume();
+  proc.stderr.resume();
+  let finished = false;
+  let spawnErr = null;
+  proc.once('error', (err) => { spawnErr = err; });
+  const done = new Promise((resolve) => proc.once('close', (code) => { finished = true; resolve(code); }));
+  if (xferCancelled(scope)) { try { proc.kill(); } catch {} }
+  const t0 = Date.now();
+  while (!finished) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (finished || xferCancelled(scope)) break;
+    if (Date.now() - t0 < 800) continue; // let the transfer actually start
     try {
-      await adb(['-s', serial, 'push', lp, remoteDir]);
-      results.push({ name, ok: true });
-    } catch (err) {
-      results.push({ name, ok: false, error: err.message });
-    }
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+      const bytes = await remoteFileSize(serial, targetPath);
+      if (bytes !== null && bytes >= 0) onEvent(Math.min(bytes, totalBytes || bytes));
+    } catch { /* single poll failures are fine */ }
   }
-  return results;
+  const exitCode = await done;
+  if (xferCancelled(scope)) throw new Error('Transfer cancelled');
+  if (spawnErr && (exitCode === null || exitCode === undefined)) throw spawnErr;
+  if (exitCode !== 0) throw new Error('adb push exited with code ' + exitCode);
+}
+
+ipcMain.handle('files:push', async (e, { serial, remoteDir, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pushProgress', scope, payload);
+  const report = (index, total, name, percent, bytes, totalBytes) => {
+    emit({ index, total, name, percent, bytes: bytes || 0, totalBytes: totalBytes || 0 });
+  };
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
+    if (canceled || !filePaths.length) return null;
+    if (xferCancelled(scope)) return null;
+    const localPath = filePaths[0];
+    const name = path.basename(localPath);
+    const remotePath = remoteDir.replace(/\/?$/, '/') + name;
+    const totalBytes = fs.statSync(localPath).size;
+    const tick = (bytes) => report(0, 1, name,
+      totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1, bytes, totalBytes);
+    report(0, 1, name, -1, 0, totalBytes);
+    try {
+      const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      await adbPushTracked({ serial, localPath, targetPath: tmpPath, totalBytes, scope, onEvent: tick });
+      if (xferCancelled(scope)) {
+        try { await adb(['-s', serial, 'shell', 'rm', '-f', tmpPath]); } catch {}
+        return null;
+      }
+      await adb(['-s', serial, 'shell', 'mv', tmpPath, remotePath]);
+    } catch (err) {
+      if (xferCancelled(scope)) return null;
+      await adbPushTracked({
+        serial, localPath, targetPath: remoteDir, totalBytes, scope,
+        onEvent: (bytes) => report(0, 1, name,
+          totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1, bytes, totalBytes),
+      });
+    }
+    if (xferCancelled(scope)) return null;
+    report(0, 1, name, 100, totalBytes, totalBytes);
+    return localPath;
+  } finally {
+    endTransferScope(scope);
+  }
+});
+
+ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pushProgress', scope, payload);
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections'],
+      title: 'Select files to upload',
+    });
+    if (canceled || !filePaths.length) return null;
+    const results = [];
+    for (let i = 0; i < filePaths.length; i++) {
+      if (xferCancelled(scope)) break;
+      const lp = filePaths[i];
+      const name = path.basename(lp);
+      let totalBytes = 0;
+      try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+      const target = remoteDir.replace(/\/?$/, '/') + name;
+      emit({ index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes });
+      try {
+        await adbPushTracked({
+          serial, localPath: lp, targetPath: target, totalBytes, scope,
+          onEvent: (bytes) => emit({
+            index: i, total: filePaths.length, name,
+            percent: totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1,
+            bytes, totalBytes,
+          }),
+        });
+        results.push({ name, ok: true });
+      } catch (err) {
+        results.push({ name, ok: false, error: xferCancelled(scope) ? 'Transfer cancelled' : err.message });
+        if (xferCancelled(scope)) break;
+      }
+      emit({ index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+    }
+    const cancelled = xferCancelled(scope);
+    return { results, cancelled };
+  } finally {
+    endTransferScope(scope);
+  }
+});
+
+ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pushProgress', scope, payload);
+  try {
+    if (!filePaths || !filePaths.length) return { results: [], cancelled: xferCancelled(scope) };
+    const results = [];
+    for (let i = 0; i < filePaths.length; i++) {
+      if (xferCancelled(scope)) break;
+      const lp = filePaths[i];
+      const name = path.basename(lp);
+      let totalBytes = 0;
+      try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+      const target = remoteDir.replace(/\/?$/, '/') + name;
+      emit({ index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes });
+      try {
+        await adbPushTracked({
+          serial, localPath: lp, targetPath: target, totalBytes, scope,
+          onEvent: (bytes) => emit({
+            index: i, total: filePaths.length, name,
+            percent: totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1,
+            bytes, totalBytes,
+          }),
+        });
+        results.push({ name, ok: true });
+      } catch (err) {
+        results.push({ name, ok: false, error: xferCancelled(scope) ? 'Transfer cancelled' : err.message });
+        if (xferCancelled(scope)) break;
+      }
+      emit({ index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+    }
+    const cancelled = xferCancelled(scope);
+    return { results, cancelled };
+  } finally {
+    endTransferScope(scope);
+  }
 });
 
 ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm -rf ' + JSON.stringify(remotePath)]));
@@ -1859,7 +2096,9 @@ ipcMain.handle('backup:run', async (event, { serial, categories, destDir, includ
 
   if (includeApks) {
     send('Listing installed apps…');
-    const pkgOut = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '-3']);
+    // `--user 0`: bare `pm list` aborts on devices with a broken/parallel
+    // user (seen: "Shell does not have permission to access user 999").
+    const pkgOut = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '-3', '--user', '0']);
     const pkgs = pkgOut.split('\n').map((l) => l.replace('package:', '').trim()).filter(Boolean);
     const apkDir = path.join(destDir, 'apks');
     fs.mkdirSync(apkDir, { recursive: true });
@@ -2348,45 +2587,102 @@ ipcMain.handle('audio:stop', () => {
 
 ipcMain.handle('audio:status', () => !!audioProcess);
 
+// Reads the device's MUSIC stream level. `cmd audio get-volume` exists on
+// Android 10+; older devices only answer via `dumpsys audio`, whose format
+// varies, so parseAudioVolume() tries several shapes. Returns the level the
+// slider needs to position itself honestly after a set or a poll.
+async function readMusicVolume(serial) {
+  try {
+    const volOut = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'music']);
+    const m = volOut.match(/(\d+)/);
+    if (m) return Number(m[1]);
+  } catch { /* fall through */ }
+  try {
+    const volOut2 = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'STREAM_MUSIC']);
+    const m2 = volOut2.match(/(\d+)/);
+    if (m2) return Number(m2[1]);
+  } catch { /* fall through */ }
+  try {
+    const dump = await adb(['-s', serial, 'shell', 'dumpsys', 'audio']);
+    const { index } = parseAudioVolume(dump);
+    if (Number.isFinite(index)) return index;
+  } catch { /* fall through */ }
+  return null;
+}
+
+ipcMain.handle('audio:getVolume', async (_e, serial) => {
+  if (!serial) return { level: null, max: 15 };
+  const level = await readMusicVolume(serial);
+  return { level, max: 15 };
+});
+
 // Set the device's media volume to a 0-15 level (Android's 16-step scale).
 // Uses `cmd audio` on Android 10+ and falls back to `media volume --set` for
 // older devices, then reports back the actual level so the slider can correct.
 ipcMain.handle('audio:setVolume', async (_e, { serial, level }) => {
   const clamped = Math.max(0, Math.min(15, Math.round(Number(level) || 0)));
   // Try `cmd audio set-volume music <level>` (Android 10+).
-  let out = '';
   try {
-    out = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'set-volume', 'music', String(clamped)]);
+    await adb(['-s', serial, 'shell', 'cmd', 'audio', 'set-volume', 'music', String(clamped)]);
   } catch {
     // Fallback: `media volume --set <level>` (Android 5-9).
     try {
-      out = await adb(['-s', serial, 'shell', 'media', 'volume', '--set', String(clamped), '--stream', '3']);
+      await adb(['-s', serial, 'shell', 'media', 'volume', '--set', String(clamped), '--stream', '3']);
     } catch (err2) {
       throw new Error(`Failed to set volume: ${err2.message}`);
     }
   }
-  // Read back actual level.
-  try {
-    const volOut = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'music']);
-    const m = volOut.match(/(\d+)/);
-    if (m) return Number(m[1]);
-  } catch { /* ignore */ }
-  return clamped;
+  // Read back actual level so the UI snaps to truth, not to the request.
+  const actual = await readMusicVolume(serial);
+  return Number.isFinite(actual) ? actual : clamped;
 });
 
-const MEDIA_KEYCODES = { playPause: 85, next: 87, previous: 88 };
+const MEDIA_KEYCODES = { play: 126, pause: 127, playPause: 85, next: 87, previous: 88 };
+const MEDIA_DISPATCH_VERBS = {
+  play: 'play', pause: 'pause', playPause: 'play-pause', next: 'next', previous: 'previous',
+};
+// Package ids are allow-listed so none can smuggle a shell token into the
+// `media dispatch` command line.
+const MEDIA_PKG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.]*$/;
 
-ipcMain.handle('media:key', (_e, { serial, action }) => {
+ipcMain.handle('media:key', async (_e, { serial, action, package: pkg }) => {
   const code = MEDIA_KEYCODES[action];
   if (!code) throw new Error(`Unknown media action: ${action}`);
-  return adb(['-s', serial, 'shell', 'input', 'keyevent', String(code)]);
+  // Targeted dispatch reaches the right player when several sessions exist;
+  // a global keyevent goes to whichever session the system prefers, which is
+  // one reason the phone can pause while the UI still shows "playing".
+  const cleanPkg = pkg && MEDIA_PKG_RE.test(String(pkg).trim()) ? String(pkg).trim() : null;
+  if (cleanPkg && MEDIA_DISPATCH_VERBS[action]) {
+    const verb = MEDIA_DISPATCH_VERBS[action];
+    // `media dispatch` (Android 8-12) moved under `cmd media_session`
+    // (Android 13+); try both before falling back to the global keyevent.
+    try {
+      await adb(['-s', serial, 'shell', 'media', 'dispatch', verb, cleanPkg]);
+      return 'dispatch';
+    } catch { /* try cmd form */ }
+    try {
+      await adb(['-s', serial, 'shell', 'cmd', 'media_session', 'dispatch', verb, cleanPkg]);
+      return 'dispatch';
+    } catch { /* fall through to the global keyevent */ }
+  }
+  await adb(['-s', serial, 'shell', 'input', 'keyevent', String(code)]);
+  return 'keyevent';
 });
 
 ipcMain.handle('media:nowPlaying', async (_e, serial) => {
   const out = await adb(['-s', serial, 'shell', 'dumpsys', 'media_session']);
   const track = parseNowPlaying(out);
+  // Every art URI in the dump, primary first: the artwork fetcher tries them
+  // in order because the first is occasionally a stale placeholder.
+  let artUris = [];
+  try {
+    const all = collectArtUris(out);
+    if (track && track.artUri) artUris = [track.artUri, ...all.filter((u) => u !== track.artUri)];
+    else artUris = all;
+  } catch { artUris = track && track.artUri ? [track.artUri] : []; }
   return {
     track,
+    artUris: artUris.slice(0, 4),
     // When the snapshot was taken. The renderer advances `position` from this so
     // the elapsed time moves between polls instead of jumping every few seconds.
     readAt: Date.now(),
@@ -2396,23 +2692,119 @@ ipcMain.handle('media:nowPlaying', async (_e, serial) => {
   };
 });
 
-// Pull album-art bitmap from a content:// URI exposed by the media session.
-// Returns a base64 data URL suitable for an <img> src, or null when the pull
-// fails (permissions, missing provider, etc.).
+// Album artwork, fetched the same way launcher icons are: adb cannot hand back
+// the bitmap (dumpsys prints only a content:// URI, and `content read` mangles
+// binary over the shell channel), so the bytes are resolved on-device.
+// Order: (1) MediaArtFetcher dex via ContentResolver (downsamples to 512px,
+// JPEG, base64 — the reliable path, same pattern as IconExtractor);
+// (2) on-device base64 pipe (`content read --uri … | base64`), which avoids
+// the shell binary mangling without needing the dex; (3) legacy raw
+// `content read` for very old devices. Returns a data URL or null.
+function sniffArtMime(b64) {
+  if (/^\/9j\//.test(b64)) return 'image/jpeg';
+  if (/^iVBOR/.test(b64)) return 'image/png';
+  if (/^UklGR/.test(b64)) return 'image/webp';
+  if (/^R0lGOD/.test(b64)) return 'image/gif';
+  return 'image/jpeg';
+}
+
+function parseArtDump(stdout, count) {
+  // `ART:<index>:<base64>` lines; indices match the requested URI order.
+  const arts = new Array(count).fill(null);
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.startsWith('ART:')) continue;
+    const body = line.slice(4);
+    const sep = body.indexOf(':');
+    if (sep <= 0) continue;
+    const idx = Number(body.slice(0, sep));
+    const b64 = body.slice(sep + 1).trim();
+    if (!Number.isInteger(idx) || idx < 0 || idx >= count) continue;
+    if (b64.length < 32 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) continue;
+    arts[idx] = `${sniffArtMime(b64) === 'image/png' ? 'data:image/png' : sniffArtMime(b64) === 'image/webp' ? 'data:image/webp' : sniffArtMime(b64) === 'image/gif' ? 'data:image/gif' : 'data:image/jpeg'};base64,${b64}`;
+  }
+  return arts;
+}
+
+async function fetchArtViaDex(serial, uris) {
+  if (!fs.existsSync(iconDexPath())) return new Array(uris.length).fill(null);
+  await ensureIconDex(serial);
+  const clean = uris.map((u) => String(u || '').trim()).filter(Boolean);
+  if (!clean.length) return new Array(uris.length).fill(null);
+  const out = await adb([
+    '-s', serial, 'shell',
+    `CLASSPATH=${ICON_DEX_REMOTE}`, 'app_process', '/system/bin',
+    'com.companion.MediaArtFetcher', ...clean,
+  ]);
+  return parseArtDump(out, clean.length);
+}
+
+async function fetchArtViaBase64Pipe(serial, uri) {
+  // Base64 is encoded ON the device, so the shell channel only ever carries
+  // text. `tr -d` joins the 76-char wrap lines into one payload. Some providers
+  // need an explicit `--user 0`; retry with it when the plain read is empty.
+  const q = JSON.stringify(uri);
+  const cmds = [
+    `content read --uri ${q} 2>/dev/null | base64 2>/dev/null | tr -d '\\n\\r '`,
+    `content read --uri ${q} --user 0 2>/dev/null | base64 2>/dev/null | tr -d '\\n\\r '`,
+  ];
+  for (const cmd of cmds) {
+    let out = '';
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      out = await adb(['-s', serial, 'shell', cmd]);
+    } catch { continue; }
+    const b64 = String(out || '').replace(/\s+/g, '');
+    if (!b64 || b64.includes('Noresult') || b64.includes('Permissiondenied') || b64.length < 100) continue;
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) continue;
+    const mime = sniffArtMime(b64);
+    return `data:${mime};base64,${b64}`;
+  }
+  return null;
+}
+
+ipcMain.handle('media:artworkBatch', async (_e, { serial, uris }) => {
+  const list = (Array.isArray(uris) ? uris : [])
+    .map((u) => String(u || '').trim())
+    .filter((u) => u.startsWith('content://'));
+  if (!serial || !list.length) return [];
+  // 1) Dex helper (one app_process run for the whole batch).
+  try {
+    const arts = await fetchArtViaDex(serial, list);
+    if (arts.some(Boolean)) return arts;
+  } catch { /* fall through */ }
+  // 2) On-device base64 pipe, per URI.
+  const out = [];
+  for (const uri of list) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const url = await fetchArtViaBase64Pipe(serial, uri);
+      out.push(url);
+    } catch { out.push(null); }
+  }
+  return out;
+});
+
 ipcMain.handle('media:artwork', async (_e, { serial, uri }) => {
   if (!serial || !uri) return null;
   try {
-    // `content read` streams the raw bytes; `-a` is not needed for binary.
+    const arts = await fetchArtViaDex(serial, [uri]);
+    if (arts[0]) return arts[0];
+  } catch { /* fall through */ }
+  try {
+    const url = await fetchArtViaBase64Pipe(serial, uri);
+    if (url) return url;
+  } catch { /* fall through to legacy */ }
+  try {
+    // Legacy: raw `content read`. Binary is frequently mangled here, so this
+    // is strictly a last resort for devices where `base64` is missing.
     const buf = await adb(['-s', serial, 'shell', 'content', 'read', '--uri', uri]);
     if (!buf || !buf.length) return null;
-    // Content read may include trailing newlines; strip and decode.
     const raw = buf.replace(/[\r\n]+$/g, '');
     if (!raw || raw.includes('No result') || raw.includes('Permission denied')) return null;
-    // The output is raw binary when redirected, but adb may mangle it.
-    // Attempt base64 decode and re-encode to ensure a clean data URL.
     const b64 = Buffer.from(raw, 'binary').toString('base64');
-    if (b64.length < 100) return null; // too small to be a real image
-    return `data:image/jpeg;base64,${b64}`;
+    if (b64.length < 100) return null;
+    return `data:${sniffArtMime(b64)};base64,${b64}`;
   } catch { return null; }
 });
 
@@ -2522,6 +2914,13 @@ async function startCameraSession(opts = {}) {
   const { serial } = opts;
   await assertDeviceReady(serial);
   assertCameraSupport();
+  // If a recording is in flight and this restart would abandon it (mic toggle,
+  // camera switch, rotate, …), finalize the file first instead of corrupting it
+  // with the hard kill below. Best-effort: the restart itself must not fail
+  // because of a recording; the file stays valid on disk either way.
+  if (cameraRecordingFile && opts.record !== cameraRecordingFile) {
+    try { await finalizeCameraRecording(); } catch { cameraRecordingFile = null; }
+  }
   closeCameraSession({ killScrcpy: true });
   if (audioProcess) {
     try { audioProcess.kill(); } catch { /* ignore */ }
@@ -2645,10 +3044,20 @@ async function applyCameraZoom(zoom) {
 
 ipcMain.handle('camera:start', async (_e, opts = {}) => startCameraSession(opts));
 
-ipcMain.handle('camera:stop', () => {
-  const wasOpen = !!cameraSession;
+ipcMain.handle('camera:stop', async () => {
+  const wasOpen = !!cameraSession || !!cameraRecordingFile;
+  // Stopping mid-record must finalize the file, not corrupt it: without this
+  // the recorder is hard-killed and the MP4 never gets its moov index.
+  // Never throws for a bad recording — the stream still stops; the outcome
+  // rides along for the UI to report.
+  let recording = null;
+  let recordError = null;
+  if (cameraRecordingFile) {
+    try { recording = await finalizeCameraRecording(); }
+    catch (err) { recordError = err.message; }
+  }
   closeCameraSession({ killScrcpy: true });
-  return wasOpen;
+  return { stopped: wasOpen, recording, recordError };
 });
 
 ipcMain.handle('camera:status', () => ({
@@ -2658,6 +3067,7 @@ ipcMain.handle('camera:status', () => ({
   mic: cameraSession ? !!cameraSession.micActive : false,
   docked: !!(cameraSession && cameraSession.bar),
   zoom: cameraSession ? cameraSession.zoom : 1,
+  recording: !!cameraRecordingFile,
 }));
 
 ipcMain.handle('camera:setZoom', (_e, zoom) => applyCameraZoom(zoom));
@@ -2734,8 +3144,11 @@ function cropWindowChrome(nativeImg, isBorderless) {
 }
 
 /**
- * Camera frame: captures the scrcpy camera window via desktopCapturer when a
- * camera stream is running, or falls back to screencap (phone screen) otherwise.
+ * Camera frame: captures the scrcpy camera window via desktopCapturer while a
+ * camera stream is running, else null (the renderer shows its standby
+ * placeholder). Deliberately no screencap fallback: showing the phone screen
+ * inside the camera preview — notably right after Stop — lies about what the
+ * camera sees, which is exactly the confusion it caused.
  */
 ipcMain.handle('camera:frame', async (_e, serial) => {
   if (!serial) return null;
@@ -2752,14 +3165,9 @@ ipcMain.handle('camera:frame', async (_e, serial) => {
         const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
         return `data:image/png;base64,${cropped.toPNG().toString('base64')}`;
       }
-    } catch { /* fall through to screencap */ }
+    } catch { /* no frame this tick */ }
   }
-
-  try {
-    const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
-    if (!buf || !buf.length) return null;
-    return `data:image/png;base64,${buf.toString('base64')}`;
-  } catch { return null; }
+  return null;
 });
 
 /**
@@ -2807,8 +3215,141 @@ ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
 let cameraRecordingFile = null;
 
 /**
+ * Stops an scrcpy child the way its recorder needs: a graceful close lets it
+ * flush the encoder and write the MP4 moov trailer; a hard kill leaves video
+ * bytes with no index — a file that exists but no player will open.
+ *
+ * Windows has no SIGINT for child processes (Node's kill() is TerminateProcess),
+ * but the camera scrcpy runs with a real window (windowsHide: false), so plain
+ * `taskkill /PID` delivers WM_CLOSE → SDL_QUIT → clean recorder shutdown.
+ * POSIX gets SIGINT. Anything still alive after the grace window is force-killed.
+ *
+ * Returns 'exited' | 'force-killed' | 'already-exited'.
+ */
+async function stopScrcpyGracefully(child, { timeoutMs = RECORD_STOP_TIMEOUT_MS } = {}) {
+  if (!child || child.exitCode !== null) return 'already-exited';
+  const exited = new Promise((resolve) => { child.once('exit', () => resolve(true)); });
+  // The exit may already have happened between the check above and the
+  // listener attach (for a process that died on its own): don't hang then.
+  if (child.exitCode !== null) return 'exited';
+  let signaled = false;
+  if (process.platform === 'win32' && child.pid) {
+    try { await run('taskkill', ['/PID', String(child.pid)]); signaled = true; }
+    catch { /* window already gone: fall through to kill */ }
+  } else {
+    try { child.kill('SIGINT'); signaled = true; }
+    catch { /* fall through */ }
+  }
+  if (!signaled) { try { child.kill(); } catch {} }
+  const winner = await Promise.race([
+    exited.then(() => 'exited'),
+    new Promise((r) => setTimeout(() => r('timeout'), timeoutMs)),
+  ]);
+  if (winner === 'timeout') {
+    try {
+      if (process.platform === 'win32' && child.pid) await run('taskkill', ['/F', '/PID', String(child.pid)]);
+      else child.kill('SIGKILL');
+    } catch {}
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 2000))]);
+    return 'force-killed';
+  }
+  return 'exited';
+}
+
+/**
+ * Repairs a skewed recording in place when possible: some devices emit video
+ * timestamps minutes after the audio's (frozen frame + phantom duration),
+ * with perfect deltas — shifting the late track back fixes the file. Reads
+ * the whole file (recordings are tens of MB); skips absurd sizes. Returns
+ * true only when the file was rewritten AND the rewritten bytes re-verify.
+ */
+function repairRecordingFileInPlace(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.mkv' && ext !== '.webm' && ext !== '.mp4' && ext !== '.m4v' && ext !== '.mov') return false;
+  let st;
+  try { st = fs.statSync(filePath); } catch { return false; }
+  if (!st.isFile() || st.size < RECORD_MIN_BYTES || st.size > 1024 * 1024 * 1024) return false;
+  let buf;
+  try { buf = fs.readFileSync(filePath); } catch { return false; }
+  let fixed = null;
+  try {
+    fixed = (ext === '.mp4' || ext === '.m4v' || ext === '.mov') ? repairMp4Edits(buf) : repairMkvTimestamps(buf);
+  } catch { return false; }
+  if (!fixed || fixed === buf) return false;
+  try {
+    const headSize = Math.min(fixed.length, RECORD_HEAD_SCAN_BYTES);
+    const head = fixed.subarray(0, headSize);
+    const tailSize = Math.min(fixed.length, RECORD_TAIL_SCAN_BYTES);
+    const tail = fixed.subarray(fixed.length - tailSize);
+    if (!assessRecording({ head, tail, size: fixed.length, ext }).ok) return false;
+  } catch { return false; }
+  try { fs.writeFileSync(filePath, fixed); } catch { return false; }
+  return true;
+}
+
+/** Reads a finished recording off disk and judges it playable (see src/recording). */
+function verifyRecordingFile(filePath) {
+  let st;
+  try { st = fs.statSync(filePath); }
+  catch { return { ok: false, reason: 'no file was written', bytes: 0 }; }
+  if (!st.isFile() || st.size < RECORD_MIN_BYTES) {
+    return { ok: false, reason: 'file is empty', bytes: st.isFile() ? st.size : 0 };
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      // The MKV Info block (with Duration) sits in the first bytes; give the
+      // EBML scan room, while MP4 only needs its 12-byte ftyp.
+      const headSize = Math.min(st.size, RECORD_HEAD_SCAN_BYTES);
+      const head = Buffer.alloc(headSize);
+      fs.readSync(fd, head, 0, headSize, 0);
+      const tailSize = Math.min(st.size, RECORD_TAIL_SCAN_BYTES);
+      const tail = Buffer.alloc(tailSize);
+      fs.readSync(fd, tail, 0, tailSize, st.size - tailSize);
+      const res = assessRecording({ head, tail, size: st.size, ext });
+      return { ...res, bytes: st.size };
+    } finally { fs.closeSync(fd); }
+  } catch (err) {
+    return { ok: false, reason: err.message, bytes: st.size };
+  }
+}
+
+/**
+ * Ends the in-flight camera recording and returns the verified file path.
+ * Detaches the session first (without killing) so the recorder's exit cannot
+ * tear down fresh state, stops it gracefully, lets the file flush, then
+ * verifies playability. Throws an honest error for a dead file instead of
+ * handing back a path no player will open. The live preview session is left
+ * for the caller to restart or stop.
+ */
+async function finalizeCameraRecording() {
+  const filePath = cameraRecordingFile;
+  cameraRecordingFile = null;
+  if (!filePath) return null;
+  const recChild = cameraSession && cameraSession.child ? cameraSession.child : null;
+  // Detach without killing: the exit handler below becomes a no-op for it.
+  closeCameraSession({ killScrcpy: false });
+  if (recChild) await stopScrcpyGracefully(recChild);
+  // Let the OS flush the last muxed bytes before inspecting.
+  await new Promise((r) => setTimeout(r, RECORD_FLUSH_SETTLE_MS));
+  // Repair skewed A/V timelines (device timestamp quirk) before verifying.
+  try { repairRecordingFileInPlace(filePath); } catch { /* fall through to verify */ }
+  const check = verifyRecordingFile(filePath);
+  if (!check.ok) {
+    const hint = path.extname(filePath).toLowerCase() === '.mp4'
+      ? 'Try again, ideally saving as .mkv.'
+      : 'The recorder did not shut down cleanly — try recording again and stop with the Record button.';
+    throw new Error(`Recording did not finalize (${check.reason}). ${hint}`);
+  }
+  return filePath;
+}
+
+/**
  * Camera video record: records the pristine hardware-encoded camera stream
- * directly to a local MP4 file on the PC using scrcpy's native --record.
+ * directly to a local file on the PC using scrcpy's native --record.
+ * MKV is the default because it stays playable even if the recorder dies
+ * mid-stream; MP4 remains selectable but needs the clean shutdown below.
  */
 ipcMain.handle('camera:recordStart', async (_e, serial) => {
   const targetSerial = serial || cameraSession?.serial;
@@ -2816,30 +3357,45 @@ ipcMain.handle('camera:recordStart', async (_e, serial) => {
   if (!cameraSession || !cameraSession.child || cameraSession.child.exitCode !== null) {
     throw new Error('Camera stream is not running. Start the camera first.');
   }
+  if (cameraRecordingFile) throw new Error('Already recording — stop the current recording first.');
 
-  const defaultName = `camera-record-${Date.now()}.mp4`;
+  const defaultName = `camera-record-${Date.now()}.mkv`;
   const { canceled, filePath } = await dialog.showSaveDialog({
     defaultPath: defaultName,
-    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'MKV Video', extensions: ['mkv'] }],
+    filters: [{ name: 'MKV Video', extensions: ['mkv'] }, { name: 'MP4 Video', extensions: ['mp4'] }],
   });
   if (canceled || !filePath) return null;
 
   cameraRecordingFile = filePath;
   const currOpts = { ...cameraSession.opts, record: filePath };
-  await startCameraSession(currOpts);
+  try {
+    await startCameraSession(currOpts);
+  } catch (err) {
+    cameraRecordingFile = null;
+    throw err;
+  }
   return filePath;
 });
 
 ipcMain.handle('camera:recordStop', async () => {
-  const filePath = cameraRecordingFile;
-  cameraRecordingFile = null;
-  if (!filePath) return null;
-
-  if (cameraSession) {
-    const currOpts = { ...cameraSession.opts };
-    delete currOpts.record;
-    await startCameraSession(currOpts);
+  if (!cameraRecordingFile) return null;
+  const recSession = cameraSession;
+  const recSerial = recSession ? recSession.serial : null;
+  const recOpts = recSession ? { ...recSession.opts } : null;
+  // Finalize first (verifies playability). The preview restart below runs
+  // either way so a bad file never also kills the live view — but a corrupt
+  // file is still reported, not hidden behind the restart.
+  let filePath = null;
+  let finalizeErr = null;
+  try { filePath = await finalizeCameraRecording(); }
+  catch (err) { finalizeErr = err; }
+  if (recOpts) {
+    delete recOpts.record;
+    if (!recOpts.serial && recSerial) recOpts.serial = recSerial;
+    try { await startCameraSession(recOpts); }
+    catch (err) { if (!finalizeErr) throw err; }
   }
+  if (finalizeErr) throw finalizeErr;
   return filePath;
 });
 
