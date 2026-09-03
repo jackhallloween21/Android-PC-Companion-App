@@ -949,6 +949,8 @@ const TransferCenter = {
   done: false,
   cancelled: false,
   failed: false,
+  cancelling: false,
+  transferId: null,
   direction: 'download', // 'download' | 'upload'
   items: [], // { name, isDir, status: queued|active|done|failed, bytes, totalBytes, percent, error }
   from: '',
@@ -963,6 +965,8 @@ const TransferCenter = {
     this.done = false;
     this.cancelled = false;
     this.failed = false;
+    this.cancelling = false;
+    this.transferId = `tc-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}`;
     this.direction = direction === 'upload' ? 'upload' : 'download';
     this.items = (Array.isArray(items) ? items : []).map((it) => ({
       name: it && it.name ? String(it.name) : 'Preparing…',
@@ -977,7 +981,19 @@ const TransferCenter = {
     el('transfer-pill').classList.add('hidden');
     el('tc-icon').textContent = this.direction === 'upload' ? '⬆' : '⬇';
     el('transfer-pill-icon').textContent = this.direction === 'upload' ? '⬆' : '⬇';
-    this.render();
+    const stopBtn = el('tc-stop');
+    if (stopBtn) { stopBtn.classList.remove('hidden'); stopBtn.disabled = false; stopBtn.textContent = 'Stop'; }
+    this.render(true);
+  },
+
+  async stop() {
+    if (!this.active || this.done || this.cancelling) return;
+    this.cancelling = true;
+    const stopBtn = el('tc-stop');
+    if (stopBtn) { stopBtn.disabled = true; stopBtn.textContent = 'Stopping…'; }
+    try { await window.api.cancelTransfer(this.transferId); } catch { /* the in-flight call still resolves */ }
+    // The UI settles when the transfer call returns (cancelled flag); the
+    // button stays disabled until then so Stop can't double-fire.
   },
 
   rowFor(data) {
@@ -1080,7 +1096,13 @@ const TransferCenter = {
         : this.done ? (isUp ? 'Upload complete' : 'Download complete')
         : (isUp ? 'Uploading Files' : 'Downloading Files');
       el('tc-count').textContent = `${snap.total} item${snap.total === 1 ? '' : 's'}`;
-      el('tc-pct').textContent = this.done && snap.doneCount === snap.total && snap.total ? '100%' : pctText;
+      // Headline: percent when totals are known, else the bytes actually moved
+      // (a stuck "0%" while gigabytes flow is the worst possible feedback).
+      const movedOnly = !this.done && snap.known === 0 && snap.done > 0;
+      el('tc-pct').textContent = movedOnly ? formatSize(snap.done)
+        : (this.done && snap.doneCount === snap.total && snap.total ? '100%' : pctText);
+      el('tc-complete-word').textContent = this.cancelling ? 'cancelling…'
+        : movedOnly ? 'transferred' : 'complete';
       const spd = this.done ? 0 : this.speed();
       const remaining = snap.known - snap.done;
       el('tc-eta').textContent = this.done ? (snap.doneCount === snap.total && snap.total ? 'Finished' : '')
@@ -1193,9 +1215,17 @@ const TransferCenter = {
     if (typeof destDir === 'string' && destDir) this.to = destDir;
     this.done = true;
     this.cancelled = !!cancelled;
+    this.cancelling = false;
     this.failed = !!error || (Array.isArray(results) && results.some((r) => r && !r.ok));
+    if (this.cancelled) {
+      for (const it of this.items) {
+        if (it.status !== 'done') { it.status = 'queued'; it.percent = 0; }
+      }
+    }
+    const stopBtn = el('tc-stop');
+    if (stopBtn) stopBtn.classList.add('hidden');
     el('transfer-pill').classList.add('hidden');
-    this.render();
+    this.render(true);
   },
 
   fail(err) {
@@ -1223,6 +1253,7 @@ const TransferCenter = {
 };
 
 el('tc-close').onclick = () => TransferCenter.hide();
+el('tc-stop').onclick = () => TransferCenter.stop();
 el('tc-collapse').onclick = () => {
   TransferCenter.collapsed = !TransferCenter.collapsed;
   el('tc-body').classList.toggle('hidden', TransferCenter.collapsed);
@@ -1230,18 +1261,24 @@ el('tc-collapse').onclick = () => {
 };
 el('transfer-pill').onclick = () => TransferCenter.show();
 // One persistent listener per direction (also fixes the old per-transfer leak).
+// The transferId match keeps a previous transfer's late events from painting
+// over a newer one running the same direction.
 window.api.onPushProgress((data) => {
-  if (TransferCenter.active && !TransferCenter.done && TransferCenter.direction === 'upload') TransferCenter.onEvent(data);
+  if (!TransferCenter.active || TransferCenter.done || TransferCenter.direction !== 'upload') return;
+  if (data && data.transferId && data.transferId !== TransferCenter.transferId) return;
+  TransferCenter.onEvent(data);
 });
 window.api.onPullProgress((data) => {
-  if (TransferCenter.active && !TransferCenter.done && TransferCenter.direction === 'download') TransferCenter.onEvent(data);
+  if (!TransferCenter.active || TransferCenter.done || TransferCenter.direction !== 'download') return;
+  if (data && data.transferId && data.transferId !== TransferCenter.transferId) return;
+  TransferCenter.onEvent(data);
 });
 
 el('push-file-btn').onclick = async () => {
   if (!state.selected) return;
   TransferCenter.start({ direction: 'upload', items: [], from: 'This PC', to: 'Phone ' + el('remote-path').value });
   try {
-    const result = await window.api.pushFile(state.selected, el('remote-path').value);
+    const result = await window.api.pushFile(state.selected, el('remote-path').value, { transferId: TransferCenter.transferId });
     if (result) { TransferCenter.finish({ single: result }); toast('Uploaded ' + result.split('/').pop()); }
     else { TransferCenter.cancel(); }
   } catch (err) { TransferCenter.fail(err); }
@@ -1263,7 +1300,8 @@ function syncFileSelection() {
     if (cb && cb.checked) {
       const fp = row.dataset.fullpath;
       const isDir = row.dataset.isdir === '1';
-      const item = { path: fp, name: row.dataset.name, _isDir: isDir };
+      const size = row.dataset.size === '' ? null : Number(row.dataset.size);
+      const item = { path: fp, name: row.dataset.name, _isDir: isDir, _size: Number.isFinite(size) ? size : null };
       state.selectedFiles.add(item);
     }
   });
@@ -1283,6 +1321,8 @@ async function loadFiles() {
     const parsed = lines.map((line) => {
       const trimmed = line.trim();
       if (!trimmed) return null;
+      // `ls -la` prints a `total N` summary as its first line — not an entry.
+      if (/^total\s+\d+\s*$/.test(trimmed)) return null;
       const parts = trimmed.split(/\s+/);
       if (parts.length < 8) return { isDir: false, isLink: false, size: null, name: trimmed };
       const perms = parts[0];
@@ -1306,6 +1346,7 @@ async function loadFiles() {
       row.dataset.fullpath = fullPath;
       row.dataset.name = item.name;
       row.dataset.isdir = item.isDir ? '1' : '0';
+      row.dataset.size = Number.isFinite(item.size) ? String(item.size) : '';
       row.innerHTML = '<input type="checkbox" class="file-cb" /><span class="name"><span class="file-icon">' + icon + '</span><span class="fname">' + esc(item.name) + '</span></span><span class="meta">' + sizeStr + '</span>';
       const cb = row.querySelector('.file-cb');
       cb.onclick = (e) => { e.stopPropagation(); syncFileSelection(); };
@@ -1339,7 +1380,7 @@ async function loadFiles() {
 }
 
 async function selectFile(name, fullPath, itemInfo) {
-  state.selectedFile = { name, fullPath };
+  state.selectedFile = { name, fullPath, size: itemInfo && Number.isFinite(itemInfo.size) ? itemInfo.size : null };
   qAll('#file-list .list-row').forEach((r) => r.classList.remove('selected'));
   el('file-inspector-empty').classList.add('hidden');
   el('file-inspector-body').classList.remove('hidden');
@@ -1392,7 +1433,9 @@ el('fi-pull-btn').onclick = async () => {
     to: 'This PC',
   });
   try {
-    const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath);
+    const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath, {
+      sizeHint: state.selectedFile.size, transferId: TransferCenter.transferId,
+    });
     if (saved) { TransferCenter.finish({ single: saved, destDir: saved }); toast('Saved to ' + saved); }
     else { TransferCenter.cancel(); }
   } catch (err) { TransferCenter.fail(err); }
@@ -1410,8 +1453,12 @@ el('file-download-btn').onclick = async () => {
     to: 'This PC',
   });
   try {
-    const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop(), isDir: !!f._isDir })));
-    if (res) {
+    const res = await window.api.pullBatch(state.selected, files.map((f) => ({
+      path: f.path, name: f.name || f.path.split('/').pop(), isDir: !!f._isDir, sizeHint: f._size || 0,
+    })), undefined, { transferId: TransferCenter.transferId });
+    if (res && res.cancelled) {
+      TransferCenter.cancel();
+    } else if (res) {
       const ok = res.results.filter((r) => r.ok).length;
       TransferCenter.finish({ results: res.results, destDir: res.destDir });
       toast('Downloaded ' + ok + ' item(s) to ' + res.destDir);
@@ -1433,10 +1480,13 @@ async function uploadFiles(filePaths) {
     to: 'Phone ' + el('remote-path').value,
   });
   try {
-    const results = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths);
-    if (results && results.length) {
-      const ok = results.filter((r) => r.ok).length;
-      TransferCenter.finish({ results });
+    const res = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths, { transferId: TransferCenter.transferId });
+    const list = res && res.results ? res.results : [];
+    if (res && res.cancelled) {
+      TransferCenter.cancel();
+    } else if (list.length) {
+      const ok = list.filter((r) => r.ok).length;
+      TransferCenter.finish({ results: list });
       toast('Uploaded ' + ok + ' file(s)');
       loadFiles();
     } else {
@@ -1455,10 +1505,13 @@ el('file-upload-btn').onclick = async () => {
     to: 'Phone ' + el('remote-path').value,
   });
   try {
-    const results = await window.api.pushBatch(state.selected, el('remote-path').value);
-    if (results && results.length) {
-      TransferCenter.finish({ results });
-      toast('Uploaded ' + results.filter((r) => r.ok).length + ' file(s)');
+    const res = await window.api.pushBatch(state.selected, el('remote-path').value, { transferId: TransferCenter.transferId });
+    const list = res && res.results ? res.results : [];
+    if (res && res.cancelled) {
+      TransferCenter.cancel();
+    } else if (list.length) {
+      TransferCenter.finish({ results: list });
+      toast('Uploaded ' + list.filter((r) => r.ok).length + ' file(s)');
     } else { TransferCenter.cancel(); }
   } catch (err) { TransferCenter.fail(err); }
   loadFiles();
@@ -2604,7 +2657,92 @@ async function refreshBridge() {
       if (!st.recording) setCameraStatus('Recording ended.');
     }
   }
+  refreshWebcamStatus().catch(() => {});
 }
+
+// --- Native virtual webcam (Windows, softcam) --------------------------------
+// Feeds this camera to Zoom/Meet/Teams as "DirectShow Softcam" with no OBS.
+// The toggle is explicit because first use raises one UAC prompt to register
+// the driver; declining it just flips the toggle back with an explanation.
+async function refreshWebcamStatus() {
+  const val = el('webcam-status-value');
+  const toggle = el('camera-webcam');
+  let st = null;
+  try { st = await window.api.webcamStatus(); } catch { return; }
+  if (!st) return;
+  if (!st.supported) {
+    if (toggle) { toggle.checked = false; toggle.disabled = true; }
+    if (val) { val.textContent = 'Windows only'; val.className = 'cam-info-value'; }
+    return;
+  }
+  if (toggle) toggle.disabled = false;
+  if (!val) return;
+  if (st.running) {
+    val.textContent = 'Live';
+    val.className = 'cam-info-value green';
+    if (toggle) toggle.checked = true;
+  } else if (!st.bridgePresent || !st.ffmpegPresent) {
+    val.textContent = 'Binaries missing';
+    val.className = 'cam-info-value yellow';
+  } else if (!st.registered) {
+    val.textContent = 'Needs one-time setup';
+    val.className = 'cam-info-value yellow';
+  } else {
+    val.textContent = 'Ready';
+    val.className = 'cam-info-value green';
+  }
+}
+
+el('camera-webcam').onchange = async () => {
+  const toggle = el('camera-webcam');
+  const val = el('webcam-status-value');
+  const paint = (text, cls) => {
+    if (val) { val.textContent = text; val.className = `cam-info-value${cls ? ` ${cls}` : ''}`; }
+  };
+  if (!toggle.checked) {
+    try { await window.api.webcamStop(); } catch { /* already stopped */ }
+    paint('Off', '');
+    setCameraStatus('Virtual webcam stopped.');
+    return;
+  }
+  if (!state.selected) {
+    paint('No device', 'yellow');
+    toggle.checked = false;
+    return;
+  }
+  const cam = currentCamera();
+  const size = (el('camera-size') && el('camera-size').value) || '1280x720';
+  const fps = (el('camera-framerate') && Number(el('camera-framerate').value)) || 30;
+  const bitrate = (el('camera-bitrate') && Number(el('camera-bitrate').value)) || 8;
+  try {
+    const pre = await window.api.webcamStatus().catch(() => null);
+    if (pre && pre.supported && !pre.registered && pre.installerPresent) {
+      paint('Requesting admin to register virtual camera…', 'yellow');
+      setCameraStatus('Registering the virtual camera driver (one UAC prompt)…', 'busy');
+      await window.api.webcamRegister();
+    }
+  } catch (err) {
+    paint('Setup declined', 'yellow');
+    toggle.checked = false;
+    setCameraStatus('Virtual webcam setup failed: ' + cleanIpcError(err.message), 'err');
+    return;
+  }
+  paint('Starting…', 'yellow');
+  setCameraStatus('Starting virtual webcam…', 'busy');
+  try {
+    const res = await window.api.webcamStart({
+      serial: state.selected,
+      cameraId: cam ? cam.id : undefined,
+      size, fps, bitrate,
+    });
+    paint(`Live ${res.width}x${res.height}@${res.fps}`, 'green');
+    setCameraStatus('Phone camera is live as "DirectShow Softcam" — pick it in Zoom/Meet/Teams.', 'ok');
+  } catch (err) {
+    toggle.checked = false;
+    paint('Failed', 'yellow');
+    setCameraStatus('Virtual webcam failed: ' + cleanIpcError(err.message), 'err');
+  }
+};
 
 // ---- audio + now playing ---------------------------------------------------
 // The last dump plus when it was read: enough to advance the clock locally.

@@ -605,6 +605,17 @@
                     <option value="480">480 fps</option>
                   </select>
                 </div>
+                <div class="cam-info-row">
+                  <span class="cam-info-label">PC webcam:</span>
+                  <label class="cam-toggle" title="Feed this camera to other PC apps as a virtual webcam (Windows)">
+                    <input type="checkbox" id="camera-webcam" />
+                    <span class="cam-toggle-slider"></span>
+                  </label>
+                </div>
+                <div class="cam-info-row">
+                  <span class="cam-info-label">Webcam status:</span>
+                  <span id="webcam-status-value" class="cam-info-value">Checking&hellip;</span>
+                </div>
               </div>
             </div>
           </div>
@@ -1074,12 +1085,13 @@
       <span id="tc-title" class="tc-title">Transferring Files</span>
       <span id="tc-count" class="tc-count-pill">0 items</span>
       <span class="tc-head-spacer"></span>
+      <button id="tc-stop" class="ghost-btn tiny hidden" title="Stop this transfer">Stop</button>
       <button id="tc-collapse" class="icon-btn" title="Collapse">&#9662;</button>
       <button id="tc-close" class="icon-btn" title="Close">&times;</button>
     </div>
     <div id="tc-body">
       <div class="tc-overall-row">
-        <span id="tc-pct" class="tc-pct">0%</span><span class="tc-complete muted">complete</span>
+        <span id="tc-pct" class="tc-pct">0%</span><span id="tc-complete-word" class="tc-complete muted">complete</span>
         <span class="tc-head-spacer"></span>
         <span id="tc-eta" class="tc-eta">Calculating&hellip;</span>
       </div>

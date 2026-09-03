@@ -31,7 +31,10 @@
       "!tools/**",
       "!r8.jar",
       "!temp_src/**",
-      "!temp_classes/**"
+      "!temp_classes/**",
+      "!native/**",
+      "!softcam/**",
+      "!.github/**"
     ],
     "win": {
       "target": "nsis",

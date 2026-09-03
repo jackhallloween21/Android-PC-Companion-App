@@ -53,7 +53,7 @@ Full-featured file manager for your device storage:
 - **Torch control** with multi-tile flash support
 - **Audio forwarding** + media transport controls (play/pause/next/prev)
 - Now-playing display with track info
-- **Use the phone as a PC webcam** — via OBS Virtual Camera (Windows/macOS) or v4l2 loopback (Linux); see [🎥 Use Your Phone as a Webcam](#-use-your-phone-as-a-webcam) below
+- **Use the phone as a PC webcam** — native virtual camera on Windows (no OBS needed), OBS bridge on macOS, v4l2 loopback on Linux; see [🎥 Use Your Phone as a Webcam](#-use-your-phone-as-a-webcam) below
 
 ### 🔋 Hardware & Power
 Fuller battery + device-spec readout — health, temperature, cycle count (where the kernel exposes it), voltage, and SoC details.
@@ -166,9 +166,22 @@ Each release ships a Windows installer (`Companion Setup x.x.x.exe`). Just run i
 
 The Multimedia tab streams any phone camera to your PC. To make other apps (Zoom, Meet, Teams, Discord) see it as a webcam, bridge it through a virtual-camera driver. The Camera tab's bridge status tells you which route applies on your machine.
 
-### Windows / macOS — via OBS Studio
+### Windows — native virtual camera (no OBS needed)
 
-Windows has no built-in virtual camera, so the route is [OBS Studio](https://obsproject.com/) (free, signed driver — the app detects it and reports *"OBS Virtual Camera available"*).
+The app ships a [softcam](https://github.com/tshino/softcam)-based bridge (MIT-licensed): the phone camera feeds straight into a self-registered DirectShow device, so conferencing apps list it directly.
+
+1. Connect your phone and open the **Multimedia** tab. In *Optics & Stream Parameters*, flip **PC webcam** on.
+2. First use asks one UAC prompt to register the driver — approve it once, never again.
+3. The status reads *Live 1280x720@30*. In Zoom/Meet/Teams/Discord, pick **DirectShow Softcam** as the camera. If it doesn't appear, restart that app once.
+4. Flip the toggle off (or quit the app) when you're done.
+
+> **Prerequisites:** the bridge needs `softcam.dll` + `softcam-bridge.exe` (plus `softcam_installer.exe` for the one-time registration) in `assets/softcam/`, and an `ffmpeg.exe`. **Release builds carry the softcam binaries automatically** — GitHub Actions compiles them (x64) on a Windows runner from [tshino/softcam](https://github.com/tshino/softcam) plus the bundled bridge source, so no local Visual Studio is needed. A plain `git clone` leaves `assets/softcam/` empty (just a `.gitkeep`); to run the native camera from a source checkout, download the `softcam-native-x64` artifact from a CI run or build it yourself per [`native/softcam-bridge/README.md`](native/softcam-bridge/README.md). ffmpeg is **not** bundled: stock static builds are GPL, which would contaminate this MIT app. Easiest: `winget install -e --id BtbN.FFmpeg.LGPL.Shared.8.1` (LGPL-licensed, lands on PATH where the app finds it; keep its DLLs next to the exe). Alternatively point `APC_FFMPEG_PATH` at any LGPL `ffmpeg.exe`. The status line tells you exactly which piece is missing. (The virtual camera is 64-bit; 32-bit-only camera apps won't list it yet.)
+>
+> **Mic:** the virtual camera carries video only. The camera tab's mic toggle still forwards the phone mic to your PC speakers through the separate audio path — for calls, pair the Softcam video with your usual microphone.
+
+### Windows / macOS fallback — via OBS Studio
+
+If the native bridge isn't set up, the classic route still works: [OBS Studio](https://obsproject.com/) (free, signed driver — the app detects it and reports *"OBS Virtual Camera available"*).
 
 1. Connect your phone, open the **Multimedia** tab, pick a lens/resolution and press **Start** — a window titled `Camera — <serial>` appears. Keep it open.
 2. Open OBS → **Sources** → **+** → **Window Capture** → select the `Camera — <serial>` window (crop/fit with right-click → *Transform* if needed).
@@ -184,8 +197,6 @@ sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Camera"
 ```
 
 Reopen the Camera tab — it will report *v4l2 loopback ready* with the device (e.g. `/dev/video2`). Start the stream and pick **Phone Camera** as the camera in any app. (Needs a scrcpy build with `--v4l2-sink` — distro packages have it; the tab warns you otherwise.)
-
-> **Mic:** the camera tab's mic toggle forwards the phone mic into the stream audio (heard on PC speakers). The OBS route above carries video — for calls, pair it with your usual microphone, or use OBS's audio monitoring to route it.
 
 ---
 
@@ -257,6 +268,7 @@ Android-PC-Companion-App/
 │   ├── storage.js           #   Storage breakdown (dumpsys diskstats + df)
 │   ├── theme.js             #   Accent colors & light/dark/auto themes
 │   ├── winmove.js           #   Move/resize the foreign scrcpy window (Windows)
+│   ├── webcam.js            #   Phone camera → softcam virtual webcam (Windows)
 │   └── wireless.js          #   Wireless debugging helpers (pair vs connect ports)
 │
 ├── renderer/                # UI layer
@@ -268,11 +280,13 @@ Android-PC-Companion-App/
 │
 ├── test/                    # Node test-runner suite (one file per src module)
 ├── tools/                   # Dev utilities (icon builder)
-├── assets/                  # Bundled resources
+├── native/                  # Native helpers compiled in CI (not packaged as source)
+│   └── softcam-bridge/      #   BGR24 stdin → softcam Sender API → DirectShow camera
+├── assets/                  # Bundled resources (incl. CI-built softcam/ binaries)
 │
 └── .github/workflows/
-    └── build.yml            # CI: builds the exe on release, auto-bumps version
-                             #   from the release tag, attaches it to the release
+    └── build.yml            # CI: builds softcam.dll + bridge (x64), then the exe on
+                             #   release; auto-bumps version from the tag & attaches it
 ```
 
 ---
@@ -297,7 +311,7 @@ Honest engineering notes — real functionality, best-effort data sources:
 - **Battery cycle count** reads `/sys/class/power_supply/battery/cycle_count`, missing on some kernels → shows "N/A", not a fake number
 - **Console command parsing** splits on whitespace — quoted args with spaces won't parse; it's for one-liners, not a full shell
 - **Fastboot flashing** will brick a device given the wrong image — that's why the confirmation dialog exists
-- **Camera feed** displays in-app, with a bridge-status row that routes it to other apps: OBS Virtual Camera on Windows/macOS, direct v4l2 loopback on Linux — see [🎥 Use Your Phone as a Webcam](#-use-your-phone-as-a-webcam)
+- **Camera feed** displays in-app, with a bridge-status row that routes it to other apps: native softcam virtual camera on Windows (OBS as fallback), OBS Virtual Camera on macOS, direct v4l2 loopback on Linux — see [🎥 Use Your Phone as a Webcam](#-use-your-phone-as-a-webcam)
 
 ---
 

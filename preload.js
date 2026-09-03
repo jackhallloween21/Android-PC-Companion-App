@@ -55,11 +55,12 @@ contextBridge.exposeInMainWorld('api', {
   // files
   listFiles: (serial, remotePath) => ipcRenderer.invoke('files:list', { serial, remotePath }),
   previewFile: (serial, remotePath) => ipcRenderer.invoke('files:preview', { serial, remotePath }),
-  pullFile: (serial, remotePath) => ipcRenderer.invoke('files:pull', { serial, remotePath }),
-  pullBatch: (serial, files, destDir) => ipcRenderer.invoke('files:pullBatch', { serial, files, destDir }),
-  pushFile: (serial, remoteDir) => ipcRenderer.invoke('files:push', { serial, remoteDir }),
-  pushBatch: (serial, remoteDir) => ipcRenderer.invoke('files:pushBatch', { serial, remoteDir }),
-  pushBatchFiles: (serial, remoteDir, filePaths) => ipcRenderer.invoke('files:pushBatchFiles', { serial, remoteDir, filePaths }),
+  pullFile: (serial, remotePath, opts) => ipcRenderer.invoke('files:pull', { serial, remotePath, ...(opts || {}) }),
+  pullBatch: (serial, files, destDir, opts) => ipcRenderer.invoke('files:pullBatch', { serial, files, destDir, ...(opts || {}) }),
+  pushFile: (serial, remoteDir, opts) => ipcRenderer.invoke('files:push', { serial, remoteDir, ...(opts || {}) }),
+  pushBatch: (serial, remoteDir, opts) => ipcRenderer.invoke('files:pushBatch', { serial, remoteDir, ...(opts || {}) }),
+  pushBatchFiles: (serial, remoteDir, filePaths, opts) => ipcRenderer.invoke('files:pushBatchFiles', { serial, remoteDir, filePaths, ...(opts || {}) }),
+  cancelTransfer: (transferId) => ipcRenderer.invoke('files:cancelTransfer', { transferId }),
   deleteFile: (serial, remotePath) => ipcRenderer.invoke('files:delete', { serial, remotePath }),
   onPullProgress: (cb) => ipcRenderer.on('files:pullProgress', (_e, data) => cb(data)),
   onPushProgress: (cb) => ipcRenderer.on('files:pushProgress', (_e, data) => cb(data)),
@@ -128,6 +129,12 @@ contextBridge.exposeInMainWorld('api', {
   cameraSwitch: (serial) => ipcRenderer.invoke('camera:switch', serial),
   cameraRotate: (serial) => ipcRenderer.invoke('camera:rotate', serial),
   cameraToggleMic: (serial) => ipcRenderer.invoke('camera:toggleMic', serial),
+
+  // native virtual webcam (Windows, softcam)
+  webcamStatus: () => ipcRenderer.invoke('webcam:status'),
+  webcamStart: (opts) => ipcRenderer.invoke('webcam:start', opts),
+  webcamStop: () => ipcRenderer.invoke('webcam:stop'),
+  webcamRegister: () => ipcRenderer.invoke('webcam:register'),
 
   // fastboot
   fastbootUnlock: (serial) => ipcRenderer.invoke('fastboot:unlock', serial),

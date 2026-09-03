@@ -113,6 +113,10 @@ const {
   describeBridge,
 } = require('./src/camera');
 const {
+  buildScrcpyCameraArgs,
+  startWebcamBridge,
+} = require('./src/webcam');
+const {
   parseNowPlaying,
   parseAllSessions,
   describeTrack,
@@ -1495,44 +1499,94 @@ ipcMain.handle('files:preview', async (_e, { serial, remotePath }) => {
   return null;
 });
 
-ipcMain.handle('files:pull', async (e, { serial, remotePath }) => {
-  const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: path.basename(remotePath) });
-  if (canceled || !filePath) return null;
-  e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 0 });
+// Live transfers: every pull/push runs under a client-supplied id so progress
+// events can be matched to the right transfer (no cross-talk when transfers
+// overlap) and so the UI's Stop button can abort mid-flight. Each scope tracks
+// its child processes for killing; execFile-based calls are short and finish
+// on their own, while loops check the flag between entries.
+let transferSeq = 0;
+const liveTransfers = new Map();
+function transferScope(transferId) {
+  const id = (typeof transferId === 'string' && transferId) || `tc-${Date.now().toString(36)}-${(transferSeq += 1)}`;
+  let scope = liveTransfers.get(id);
+  if (!scope) { scope = { id, cancelled: false, procs: new Set() }; liveTransfers.set(id, scope); }
+  return scope;
+}
+function endTransferScope(scope) { if (scope) liveTransfers.delete(scope.id); }
+function xferCancelled(scope) { return !!(scope && scope.cancelled); }
+function trackProc(scope, proc) {
+  if (!scope || !proc) return proc;
+  scope.procs.add(proc);
+  const drop = () => scope.procs.delete(proc);
+  proc.once('close', drop);
+  proc.once('error', drop);
+  if (scope.cancelled) { try { proc.kill(); } catch {} }
+  return proc;
+}
+function emitXfer(sender, channel, scope, payload) {
+  try { sender.send(channel, { ...payload, transferId: scope ? scope.id : null }); } catch {}
+}
+ipcMain.handle('files:cancelTransfer', async (_e, { transferId }) => {
+  const scope = transferId && liveTransfers.get(transferId);
+  if (!scope) return false;
+  scope.cancelled = true;
+  for (const proc of [...scope.procs]) { try { proc.kill(); } catch {} }
+  return true;
+});
+
+/** Remote file size in bytes (null when unreadable — e.g. no stat applet). */
+async function remoteFileSize(serial, remotePath) {
   try {
-    let totalBytes = 0;
+    const out = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remotePath]);
+    const n = parseInt(String(out).trim(), 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  } catch { return null; }
+}
+
+ipcMain.handle('files:pull', async (e, { serial, remotePath, sizeHint, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pullProgress', scope, payload);
+  try {
+    const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: path.basename(remotePath) });
+    if (canceled || !filePath) return null;
+    if (xferCancelled(scope)) return null;
+    emit({ index: 0, total: 1, name: path.basename(remotePath), percent: 0 });
     try {
-      const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remotePath]);
-      totalBytes = parseInt(sizeOut.trim(), 10) || 0;
-    } catch { /* ignore — we'll show indeterminate */ }
-    const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath]);
-    let bytesRead = 0;
-    const ws = fs.createWriteStream(filePath);
-    await new Promise((resolve, reject) => {
-      proc.stdout.on('data', (chunk) => {
-        bytesRead += chunk.length;
-        ws.write(chunk);
-        if (totalBytes > 0) {
-          const pct = Math.min(99, Math.round((bytesRead / totalBytes) * 100));
-          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: pct, bytes: bytesRead, totalBytes });
-        } else {
-          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: -1, bytes: bytesRead, totalBytes: 0 });
-        }
-      });
-      proc.on('close', (code) => {
-        ws.end(() => {
-          if (code === 0) resolve();
-          else reject(new Error('adb exited with code ' + code));
+      let totalBytes = await remoteFileSize(serial, remotePath);
+      if (!(totalBytes > 0)) totalBytes = Number(sizeHint) > 0 ? Number(sizeHint) : 0;
+      const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath]));
+      let bytesRead = 0;
+      const ws = fs.createWriteStream(filePath);
+      await new Promise((resolve, reject) => {
+        proc.stdout.on('data', (chunk) => {
+          bytesRead += chunk.length;
+          ws.write(chunk);
+          if (totalBytes > 0) {
+            const pct = Math.min(99, Math.round((bytesRead / totalBytes) * 100));
+            emit({ index: 0, total: 1, name: path.basename(remotePath), percent: pct, bytes: bytesRead, totalBytes });
+          } else {
+            emit({ index: 0, total: 1, name: path.basename(remotePath), percent: -1, bytes: bytesRead, totalBytes: 0 });
+          }
         });
+        proc.on('close', (code) => {
+          ws.end(() => {
+            if (xferCancelled(scope)) return reject(new Error('Transfer cancelled'));
+            if (code === 0) resolve();
+            else reject(new Error('adb exited with code ' + code));
+          });
+        });
+        proc.on('error', (err) => { ws.end(); reject(err); });
       });
-      proc.on('error', (err) => { ws.end(); reject(err); });
-    });
-    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100, bytes: bytesRead, totalBytes: bytesRead });
-    return filePath;
-  } catch (err) {
-    try { await adb(['-s', serial, 'pull', remotePath, filePath]); } catch (fallbackErr) { throw fallbackErr; }
-    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100 });
-    return filePath;
+      emit({ index: 0, total: 1, name: path.basename(remotePath), percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+      return filePath;
+    } catch (err) {
+      if (xferCancelled(scope)) return null;
+      try { await adb(['-s', serial, 'pull', remotePath, filePath]); } catch (fallbackErr) { throw fallbackErr; }
+      emit({ index: 0, total: 1, name: path.basename(remotePath), percent: 100 });
+      return filePath;
+    }
+  } finally {
+    endTransferScope(scope);
   }
 });
 
@@ -1554,144 +1608,269 @@ async function listRemoteFilesRecursive(serial, remoteDir) {
     .filter(Boolean);
 }
 
-ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
-  if (!destDir) {
-    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
-    if (result.canceled || !result.filePaths.length) return null;
-    destDir = result.filePaths[0];
-  }
-  // Expand selected folders into their contained files with structure
-  // preserved (destDir/<folder>/<relative path>), keeping per-file progress.
-  // A folder that walks empty — genuinely empty, or a device without find —
-  // stays a single whole-directory entry pulled natively below.
-  const queue = [];
-  for (const f of files) {
-    if (!f.isDir) { queue.push({ ...f, localRel: f.name }); continue; }
-    let rels = null;
-    try { rels = await listRemoteFilesRecursive(serial, f.path); } catch { rels = null; }
-    if (!rels || !rels.length) { queue.push({ ...f, isDir: true, localRel: f.name }); continue; }
-    const base = String(f.path).replace(/\/?$/, '');
-    for (const rel of rels) {
-      queue.push({ path: base + '/' + rel, name: f.name + '/' + rel, localRel: path.join(f.name, rel) });
-    }
-  }
-  const results = [];
-  for (let i = 0; i < queue.length; i++) {
-    const f = queue[i];
-    e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 0 });
-    const localPath = path.join(destDir, f.localRel);
-    if (f.isDir) {
-      // Whole-directory fallback: `adb pull` recurses natively. destDir
-      // exists, so the folder lands as destDir/<name>/… — indeterminate
-      // progress while it runs, since adb reports no per-file signal.
-      // Pre-creating the target also preserves genuinely empty folders,
-      // which `adb pull` alone would silently skip.
-      try {
-        fs.mkdirSync(path.join(destDir, f.name), { recursive: true });
-        await adb(['-s', serial, 'pull', f.path, destDir]);
-        results.push({ name: f.name, ok: true, path: path.join(destDir, f.name) });
-      } catch (err) {
-        results.push({ name: f.name, ok: false, error: err.message });
-      }
-      e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 100 });
-      continue;
-    }
-    try { fs.mkdirSync(path.dirname(localPath), { recursive: true }); } catch { /* ignore */ }
-    try {
-      let totalBytes = 0;
-      try {
-        const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', f.path]);
-        totalBytes = parseInt(sizeOut.trim(), 10) || 0;
-      } catch { /* ignore */ }
-      const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', f.path]);
-      let bytesRead = 0;
-      const ws = fs.createWriteStream(localPath);
-      await new Promise((resolve, reject) => {
-        proc.stdout.on('data', (chunk) => {
-          bytesRead += chunk.length;
-          ws.write(chunk);
-          const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
-          e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
-        });
-        proc.on('close', (code) => { ws.end(() => code === 0 ? resolve() : reject(new Error('exit ' + code))); });
-        proc.on('error', (err) => { ws.end(); reject(err); });
-      });
-      e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
-      results.push({ name: f.name, ok: true, path: localPath });
-    } catch (err) {
-      try {
-        await adb(['-s', serial, 'pull', f.path, localPath]);
-        results.push({ name: f.name, ok: true, path: localPath });
-      } catch (pullErr) {
-        results.push({ name: f.name, ok: false, error: pullErr.message });
-      }
-      e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 100 });
-    }
-  }
-  return { destDir, results };
-});
-
-ipcMain.handle('files:push', async (e, { serial, remoteDir }) => {
-  const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
-  if (canceled || !filePaths.length) return null;
-  const localPath = filePaths[0];
-  const name = path.basename(localPath);
-  const remotePath = remoteDir.replace(/\/?$/, '/') + name;
-  const totalBytes = fs.statSync(localPath).size;
-  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: -1, bytes: 0, totalBytes });
-  try {
-    const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    await adb(['-s', serial, 'push', localPath, tmpPath]);
-    await adb(['-s', serial, 'shell', 'mv', tmpPath, remotePath]);
-  } catch {
-    await adb(['-s', serial, 'push', localPath, remoteDir]);
-  }
-  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: 100, bytes: totalBytes, totalBytes });
-  return localPath;
-});
-
-ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
-  const { canceled, filePaths } = await dialog.showOpenDialog({
-    properties: ['openFile', 'multiSelections'],
-    title: 'Select files to upload',
+/**
+ * `adb pull` as a tracked child process (killable for Stop, with a readable
+ * error). The shared adb() helper buffers and cannot be aborted mid-flight.
+ */
+async function adbPullTracked({ serial, remotePath, localPath, scope }) {
+  const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'pull', remotePath, localPath]));
+  proc.stdout.resume();
+  let stderr = '';
+  proc.stderr.on('data', (b) => { stderr = (stderr + b.toString()).slice(-2000); });
+  const code = await new Promise((resolve) => {
+    proc.once('error', () => resolve(null));
+    proc.once('close', (c) => resolve(c));
   });
-  if (canceled || !filePaths.length) return null;
-  const results = [];
-  for (let i = 0; i < filePaths.length; i++) {
-    const lp = filePaths[i];
-    const name = path.basename(lp);
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
-    let totalBytes = 0;
-    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
-    try {
-      await adb(['-s', serial, 'push', lp, remoteDir]);
-      results.push({ name, ok: true });
-    } catch (err) {
-      results.push({ name, ok: false, error: err.message });
-    }
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+  if (xferCancelled(scope)) throw new Error('Transfer cancelled');
+  if (code !== 0) {
+    const detail = stderr.trim().split('\n').filter(Boolean).pop();
+    throw new Error(detail || `adb pull exited with code ${code}`);
   }
-  return results;
+}
+
+ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pullProgress', scope, payload);
+  try {
+    if (!destDir) {
+      const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
+      if (result.canceled || !result.filePaths.length) return null;
+      destDir = result.filePaths[0];
+    }
+    if (xferCancelled(scope)) return null;
+    // Expand selected folders into their contained files with structure
+    // preserved (destDir/<folder>/<relative path>), keeping per-file progress.
+    // A folder that walks empty — genuinely empty, or a device without find —
+    // stays a single whole-directory entry pulled natively below.
+    const queue = [];
+    for (const f of files) {
+      if (xferCancelled(scope)) break;
+      if (!f.isDir) { queue.push({ ...f, localRel: f.name }); continue; }
+      let rels = null;
+      try { rels = await listRemoteFilesRecursive(serial, f.path); } catch { rels = null; }
+      if (!rels || !rels.length) { queue.push({ ...f, isDir: true, localRel: f.name }); continue; }
+      const base = String(f.path).replace(/\/?$/, '');
+      for (const rel of rels) {
+        queue.push({ path: base + '/' + rel, name: f.name + '/' + rel, localRel: path.join(f.name, rel) });
+      }
+    }
+    const results = [];
+    for (let i = 0; i < queue.length; i++) {
+      if (xferCancelled(scope)) break;
+      const f = queue[i];
+      const sizeHint = Number(f.sizeHint) > 0 ? Number(f.sizeHint) : 0;
+      emit({ index: i, total: queue.length, name: f.name, percent: 0, bytes: 0, totalBytes: sizeHint });
+      const localPath = path.join(destDir, f.localRel);
+      if (f.isDir) {
+        // Whole-directory fallback: `adb pull` recurses natively. destDir
+        // exists, so the folder lands as destDir/<name>/… — indeterminate
+        // progress while it runs, since adb reports no per-file signal.
+        // Pre-creating the target also preserves genuinely empty folders,
+        // which `adb pull` alone would silently skip.
+        try {
+          fs.mkdirSync(path.join(destDir, f.name), { recursive: true });
+          await adbPullTracked({ serial, remotePath: f.path, localPath: destDir, scope });
+          results.push({ name: f.name, ok: true, path: path.join(destDir, f.name) });
+        } catch (err) {
+          results.push({ name: f.name, ok: false, error: err.message });
+          if (xferCancelled(scope)) break;
+        }
+        emit({ index: i, total: queue.length, name: f.name, percent: 100 });
+        continue;
+      }
+      try { fs.mkdirSync(path.dirname(localPath), { recursive: true }); } catch { /* ignore */ }
+      try {
+        let totalBytes = await remoteFileSize(serial, f.path);
+        if (!(totalBytes > 0)) totalBytes = sizeHint;
+        const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', f.path]));
+        let bytesRead = 0;
+        const ws = fs.createWriteStream(localPath);
+        await new Promise((resolve, reject) => {
+          proc.stdout.on('data', (chunk) => {
+            bytesRead += chunk.length;
+            ws.write(chunk);
+            const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
+            emit({ index: i, total: queue.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
+          });
+          proc.on('close', (code) => {
+            ws.end(() => {
+              if (xferCancelled(scope)) return reject(new Error('Transfer cancelled'));
+              if (code === 0) resolve();
+              else reject(new Error('exit ' + code));
+            });
+          });
+          proc.on('error', (err) => { ws.end(); reject(err); });
+        });
+        emit({ index: i, total: queue.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+        results.push({ name: f.name, ok: true, path: localPath });
+      } catch (err) {
+        if (xferCancelled(scope)) { results.push({ name: f.name, ok: false, error: 'Transfer cancelled' }); break; }
+        try {
+          await adbPullTracked({ serial, remotePath: f.path, localPath, scope });
+          results.push({ name: f.name, ok: true, path: localPath });
+        } catch (pullErr) {
+          results.push({ name: f.name, ok: false, error: pullErr.message });
+          if (xferCancelled(scope)) break;
+        }
+        emit({ index: i, total: queue.length, name: f.name, percent: 100 });
+      }
+    }
+    const cancelled = xferCancelled(scope);
+    return { destDir, results, cancelled };
+  } finally {
+    endTransferScope(scope);
+  }
 });
 
-ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths }) => {
-  if (!filePaths || !filePaths.length) return [];
-  const results = [];
-  for (let i = 0; i < filePaths.length; i++) {
-    const lp = filePaths[i];
-    const name = path.basename(lp);
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
-    let totalBytes = 0;
-    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+/**
+ * `adb push` as a tracked child process with live byte progress. adb itself
+ * reports nothing until it finishes, so the remote size is polled while it
+ * runs — the UI shows real MBs instead of a stuck indeterminate bar. Single
+ * poll failures (and devices without stat) degrade silently to the old
+ * start/finish events. Resolves on success; throws on failure or user cancel.
+ */
+async function adbPushTracked({ serial, localPath, targetPath, totalBytes, scope, onEvent }) {
+  const proc = trackProc(scope, spawn(tools.adb, ['-s', serial, 'push', localPath, targetPath]));
+  proc.stdout.resume();
+  proc.stderr.resume();
+  let finished = false;
+  let spawnErr = null;
+  proc.once('error', (err) => { spawnErr = err; });
+  const done = new Promise((resolve) => proc.once('close', (code) => { finished = true; resolve(code); }));
+  if (xferCancelled(scope)) { try { proc.kill(); } catch {} }
+  const t0 = Date.now();
+  while (!finished) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (finished || xferCancelled(scope)) break;
+    if (Date.now() - t0 < 800) continue; // let the transfer actually start
     try {
-      await adb(['-s', serial, 'push', lp, remoteDir]);
-      results.push({ name, ok: true });
-    } catch (err) {
-      results.push({ name, ok: false, error: err.message });
-    }
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+      const bytes = await remoteFileSize(serial, targetPath);
+      if (bytes !== null && bytes >= 0) onEvent(Math.min(bytes, totalBytes || bytes));
+    } catch { /* single poll failures are fine */ }
   }
-  return results;
+  const exitCode = await done;
+  if (xferCancelled(scope)) throw new Error('Transfer cancelled');
+  if (spawnErr && (exitCode === null || exitCode === undefined)) throw spawnErr;
+  if (exitCode !== 0) throw new Error('adb push exited with code ' + exitCode);
+}
+
+ipcMain.handle('files:push', async (e, { serial, remoteDir, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pushProgress', scope, payload);
+  const report = (index, total, name, percent, bytes, totalBytes) => {
+    emit({ index, total, name, percent, bytes: bytes || 0, totalBytes: totalBytes || 0 });
+  };
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
+    if (canceled || !filePaths.length) return null;
+    if (xferCancelled(scope)) return null;
+    const localPath = filePaths[0];
+    const name = path.basename(localPath);
+    const remotePath = remoteDir.replace(/\/?$/, '/') + name;
+    const totalBytes = fs.statSync(localPath).size;
+    const tick = (bytes) => report(0, 1, name,
+      totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1, bytes, totalBytes);
+    report(0, 1, name, -1, 0, totalBytes);
+    try {
+      const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      await adbPushTracked({ serial, localPath, targetPath: tmpPath, totalBytes, scope, onEvent: tick });
+      if (xferCancelled(scope)) {
+        try { await adb(['-s', serial, 'shell', 'rm', '-f', tmpPath]); } catch {}
+        return null;
+      }
+      await adb(['-s', serial, 'shell', 'mv', tmpPath, remotePath]);
+    } catch (err) {
+      if (xferCancelled(scope)) return null;
+      await adbPushTracked({
+        serial, localPath, targetPath: remoteDir, totalBytes, scope,
+        onEvent: (bytes) => report(0, 1, name,
+          totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1, bytes, totalBytes),
+      });
+    }
+    if (xferCancelled(scope)) return null;
+    report(0, 1, name, 100, totalBytes, totalBytes);
+    return localPath;
+  } finally {
+    endTransferScope(scope);
+  }
+});
+
+ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pushProgress', scope, payload);
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections'],
+      title: 'Select files to upload',
+    });
+    if (canceled || !filePaths.length) return null;
+    const results = [];
+    for (let i = 0; i < filePaths.length; i++) {
+      if (xferCancelled(scope)) break;
+      const lp = filePaths[i];
+      const name = path.basename(lp);
+      let totalBytes = 0;
+      try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+      const target = remoteDir.replace(/\/?$/, '/') + name;
+      emit({ index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes });
+      try {
+        await adbPushTracked({
+          serial, localPath: lp, targetPath: target, totalBytes, scope,
+          onEvent: (bytes) => emit({
+            index: i, total: filePaths.length, name,
+            percent: totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1,
+            bytes, totalBytes,
+          }),
+        });
+        results.push({ name, ok: true });
+      } catch (err) {
+        results.push({ name, ok: false, error: xferCancelled(scope) ? 'Transfer cancelled' : err.message });
+        if (xferCancelled(scope)) break;
+      }
+      emit({ index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+    }
+    const cancelled = xferCancelled(scope);
+    return { results, cancelled };
+  } finally {
+    endTransferScope(scope);
+  }
+});
+
+ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths, transferId }) => {
+  const scope = transferScope(transferId);
+  const emit = (payload) => emitXfer(e.sender, 'files:pushProgress', scope, payload);
+  try {
+    if (!filePaths || !filePaths.length) return { results: [], cancelled: xferCancelled(scope) };
+    const results = [];
+    for (let i = 0; i < filePaths.length; i++) {
+      if (xferCancelled(scope)) break;
+      const lp = filePaths[i];
+      const name = path.basename(lp);
+      let totalBytes = 0;
+      try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+      const target = remoteDir.replace(/\/?$/, '/') + name;
+      emit({ index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes });
+      try {
+        await adbPushTracked({
+          serial, localPath: lp, targetPath: target, totalBytes, scope,
+          onEvent: (bytes) => emit({
+            index: i, total: filePaths.length, name,
+            percent: totalBytes > 0 ? Math.min(99, Math.round((bytes / totalBytes) * 100)) : -1,
+            bytes, totalBytes,
+          }),
+        });
+        results.push({ name, ok: true });
+      } catch (err) {
+        results.push({ name, ok: false, error: xferCancelled(scope) ? 'Transfer cancelled' : err.message });
+        if (xferCancelled(scope)) break;
+      }
+      emit({ index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+    }
+    const cancelled = xferCancelled(scope);
+    return { results, cancelled };
+  } finally {
+    endTransferScope(scope);
+  }
 });
 
 ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm -rf ' + JSON.stringify(remotePath)]));
@@ -2337,6 +2516,7 @@ ipcMain.handle('scrcpy:stop', () => {
 app.on('before-quit', () => {
   closeMirrorSession({ killScrcpy: true });
   closeCameraSession({ killScrcpy: true });
+  stopWebcamBridge();
 });
 
 ipcMain.handle('scrcpy:info', async () => {
@@ -3318,6 +3498,227 @@ ipcMain.handle('camera:bridge', async () => {
     v4l2Devices: listV4l2Devices(),
     obsInstalled: hasObsVirtualCamera(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// Native virtual webcam (Windows, tshino/softcam).
+//
+// Unlike the OBS route (which captures the visible preview window), this feeds
+// the phone camera straight into a self-registered DirectShow device, so Zoom
+// / Meet / Teams list it directly with no extra app to install or configure.
+// The driver + bridge binaries are resolved like the icon dex: bundled copies
+// first (assets/softcam is asarUnpacked, so external processes can run them),
+// then userData/bin (future auto-download), then PATH.
+//
+// softcam is Windows-only; macOS keeps the OBS route and Linux the v4l2 route
+// reported by camera:bridge above.
+// ---------------------------------------------------------------------------
+
+const WEBCAM_BIN_DIR = 'softcam';
+const WEBCAM_REGISTERED_FILE = 'webcam-registered.json';
+
+/** Unpacked-aware path into bundled assets (same pattern as iconDexPath). */
+function bundledAsset(...parts) {
+  const inApp = path.join(__dirname, 'assets', ...parts);
+  const unpacked = inApp.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+  for (const candidate of [unpacked, inApp]) {
+    try { if (fs.existsSync(candidate)) return candidate; } catch { /* keep looking */ }
+  }
+  return inApp;
+}
+
+function userBinPath(name) {
+  try {
+    return path.join(app.getPath('userData'), 'bin', WEBCAM_BIN_DIR, name);
+  } catch { return null; }
+}
+
+function resolveWebcamPaths() {
+  const exe = process.platform === 'win32' ? '.exe' : '';
+  const find = (name) => {
+    const bundled = bundledAsset('softcam', name);
+    const candidates = [bundled, userBinPath(name)];
+    if (process.platform === 'win32') {
+      // No PATH lookup for our own binaries: they must be the exact build we
+      // ship, not whatever happens to share the name.
+      for (const c of candidates) {
+        try { if (c && fs.existsSync(c)) return c; } catch { /* keep looking */ }
+      }
+      return null;
+    }
+    for (const c of candidates) {
+      try { if (c && fs.existsSync(c)) return c; } catch { /* keep looking */ }
+    }
+    return null;
+  };
+  // ffmpeg is the exception: it is a third-party LGPL build the user provides
+  // (bundling a GPL build would contaminate this MIT app), so an explicit
+  // override, userData, and PATH (e.g. a winget install) are all legitimate.
+  let ffmpeg = process.env.APC_FFMPEG_PATH || null;
+  if (!ffmpeg || !fs.existsSync(ffmpeg)) {
+    ffmpeg = userBinPath(`ffmpeg${exe}`);
+    if (!ffmpeg || !fs.existsSync(ffmpeg)) ffmpeg = null;
+  }
+  return {
+    bridge: find(`softcam-bridge${exe}`),
+    installer: find(`softcam_installer${exe}`),
+    dll: find(`softcam${process.platform === 'win32' ? '.dll' : '.so'}`),
+    ffmpeg,
+  };
+}
+
+/** ffmpeg with a PATH fallback (covers winget installs). Async: PATH lookup shells out. */
+async function resolveFfmpegPath() {
+  const paths = resolveWebcamPaths();
+  if (paths.ffmpeg) return paths.ffmpeg;
+  if (process.platform === 'win32') {
+    try {
+      const onPath = await resolveOnPath('ffmpeg');
+      if (onPath) return onPath;
+    } catch { /* not on PATH */
+    }
+  }
+  return null;
+}
+
+function webcamRegisteredMarker() {
+  try {
+    return path.join(app.getPath('userData'), WEBCAM_REGISTERED_FILE);
+  } catch { return null; }
+}
+
+function isWebcamRegistered() {
+  const marker = webcamRegisteredMarker();
+  if (!marker) return false;
+  try {
+    const data = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    return !!(data && data.registered && data.dll && fs.existsSync(data.dll));
+  } catch { return false; }
+}
+
+let webcamHandle = null;
+const webcamLog = [];
+function webcamLogLine(msg) {
+  webcamLog.push(`[${new Date().toISOString()}] ${String(msg).trim()}`);
+  if (webcamLog.length > 40) webcamLog.splice(0, webcamLog.length - 40);
+}
+
+function stopWebcamBridge() {
+  if (webcamHandle) {
+    try { webcamHandle.stop(); } catch { /* already gone */ }
+    webcamHandle = null;
+  }
+}
+
+ipcMain.handle('webcam:status', async () => {
+  if (!scrcpyInfo.version) await probeScrcpyVersion().catch(() => {});
+  const paths = resolveWebcamPaths();
+  return {
+    supported: process.platform === 'win32',
+    running: !!(webcamHandle && webcamHandle.running),
+    bridgePresent: !!paths.bridge,
+    ffmpegPresent: !!(await resolveFfmpegPath()),
+    installerPresent: !!paths.installer,
+    dllPresent: !!paths.dll,
+    registered: isWebcamRegistered(),
+    scrcpyOk: !!scrcpyInfo.version,
+    log: webcamLog.slice(-20),
+  };
+});
+
+ipcMain.handle('webcam:start', async (_e, opts = {}) => {
+  if (process.platform !== 'win32') {
+    throw new Error('The native virtual webcam is Windows-only; use the OBS route on macOS or v4l2 loopback on Linux (see camera:bridge).');
+  }
+  if (webcamHandle && webcamHandle.running) stopWebcamBridge();
+  const { serial } = opts;
+  await assertDeviceReady(serial);
+  if (!scrcpyInfo.version) await probeScrcpyVersion();
+  if (!scrcpyInfo.version) throw new Error('scrcpy is not available. Re-run tool setup from "Binaries & Drivers".');
+  const paths = resolveWebcamPaths();
+  if (!paths.bridge) {
+    throw new Error('softcam-bridge.exe is not bundled yet — the native bridge ships with a future release. Use the OBS route meanwhile.');
+  }
+  const ffmpegPath = await resolveFfmpegPath();
+  if (!ffmpegPath) {
+    throw new Error('ffmpeg not found. Install an LGPL build (`winget install -e --id BtbN.FFmpeg.LGPL.Shared.8.1`) or point APC_FFMPEG_PATH at ffmpeg.exe (bundling a GPL build would contaminate this MIT app).');
+  }
+  if (!isWebcamRegistered()) {
+    throw new Error('Virtual camera is not registered yet. Press "Register virtual camera" first (one UAC prompt).');
+  }
+  const size = String(opts.size || '1280x720');
+  const m = size.match(/^(\d+)x(\d+)$/);
+  if (!m) throw new Error(`Invalid size "${size}" — expected WIDTHxHEIGHT.`);
+  const width = Number(m[1]);
+  const height = Number(m[2]);
+  const fps = Math.max(1, Math.min(60, Math.round(Number(opts.fps) || 30)));
+  const bitrate = Math.max(1, Math.min(32, Math.round(Number(opts.bitrate) || 8)));
+  // Validate the argv shape (flag spellings, required pieces) before spawning.
+  buildScrcpyCameraArgs(serial, {
+    cameraId: opts.cameraId,
+    facing: opts.facing,
+    size: `${width}x${height}`,
+    fps,
+    bitrate,
+    recordTarget: 'probe',
+  }, scrcpyInfo.help);
+  webcamLogLine(`starting bridge ${width}x${height}@${fps} for ${serial}`);
+  webcamHandle = startWebcamBridge({
+    serial,
+    scrcpyPath: tools.scrcpy,
+    ffmpegPath,
+    bridgePath: paths.bridge,
+    cameraId: opts.cameraId,
+    facing: opts.facing,
+    size: { width, height },
+    fps,
+    bitrate,
+    help: scrcpyInfo.help,
+    onLog: webcamLogLine,
+    onExit: ({ code, origin }) => webcamLogLine(`pipeline ended via ${origin} (code ${code})`),
+  });
+  // Grace window: a DOA pipeline (bad camera id, missing provider) exits
+  // immediately; surfacing that now beats a silent dead toggle.
+  await new Promise((r) => setTimeout(r, 2500));
+  if (!webcamHandle || !webcamHandle.running) {
+    const tail = webcamLog.slice(-4).join('\n');
+    stopWebcamBridge();
+    throw new Error(`Virtual webcam failed to start.${tail ? `\n${tail}` : ''}`);
+  }
+  return { running: true, width, height, fps };
+});
+
+ipcMain.handle('webcam:stop', async () => {
+  const wasRunning = !!(webcamHandle && webcamHandle.running);
+  stopWebcamBridge();
+  webcamLogLine('bridge stopped by user');
+  return wasRunning;
+});
+
+ipcMain.handle('webcam:register', async () => {
+  if (process.platform !== 'win32') throw new Error('Driver registration only applies on Windows.');
+  const paths = resolveWebcamPaths();
+  if (!paths.installer || !paths.dll) {
+    throw new Error('Installer or softcam.dll not bundled yet — registration ships with a future release.');
+  }
+  // The installer writes the DLL path to the registry and needs elevation.
+  // PowerShell Start-Process -Verb RunAs raises the UAC prompt; -Wait blocks
+  // until the user answers, so a declined prompt surfaces as a failed install
+  // rather than a silent no-op.
+  const ps = 'Start-Process -FilePath $env:APC_INSTALLER -ArgumentList $env:APC_DLL -Verb RunAs -Wait; exit $LASTEXITCODE';
+  await new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      windowsHide: true,
+      timeout: 120000,
+      env: { ...process.env, APC_INSTALLER: paths.installer, APC_DLL: paths.dll },
+    }, (err) => (err ? reject(new Error(`Registration failed: ${err.message}`)) : resolve()));
+  });
+  const marker = webcamRegisteredMarker();
+  if (marker) {
+    try { fs.writeFileSync(marker, JSON.stringify({ registered: true, dll: paths.dll, at: Date.now() })); } catch {}
+  }
+  webcamLogLine('virtual camera registered');
+  return { registered: true };
 });
 
 /** Loopback sinks scrcpy could write into (Linux only). */
