@@ -113,7 +113,10 @@ function parseSession(block) {
 
   const position = text.match(/\bposition=(-?\d+)/);
   const actions = text.match(/\bactions=(\d+)/);
-  const duration = text.match(/\b(?:duration|METADATA_KEY_DURATION)[=:]\s*(\d+)/);
+  // Duration appears under many spellings across Android versions and apps:
+  // `duration=`, `mDuration=`, `durationMillis=`,
+  // `android.media.metadata.DURATION=`, `METADATA_KEY_DURATION=`.
+  const duration = text.match(/(?:android\.media\.metadata\.DURATION|METADATA_KEY_DURATION|durationMillis|mDuration|duration)\s*[=:]\s*(\d+)/i);
   // position= is a snapshot taken when the dump was written, so a bar that moves
   // has to be advanced locally — which needs the playback speed the session
   // reports (0.0 while paused, 1.0 normally, other values when scrubbing).
@@ -135,8 +138,33 @@ function parseSession(block) {
     album = clean(parts.slice(2).join(', '));
   }
 
+  // Artwork URI — some sessions expose album art via a content:// URI
+  // (e.g. Spotify, YouTube Music). The bitmap itself lives inside the player
+  // process and never appears in the dump. Variants seen in the wild:
+  // `art=`, `albumArt=`, `albumArtUri=`, `artUri=`, `displayIconUri=`,
+  // `android.media.metadata.ART_URI=`, `ALBUM_ART_URI=`, `DISPLAY_ICON_URI=`,
+  // `ALBUM_ART=`, `ART=`, `DISPLAY_ICON=`, `icon=`. The URI can be pulled
+  // on-device (ContentResolver via dex helper, or `content read | base64`).
+  // Not all apps set this; when absent the renderer falls back to the
+  // dex-fetched launcher icon.
+  const artUri = (() => {
+    const re = /(?:android\.media\.metadata\.(?:ALBUM_ART_URI|ART_URI|DISPLAY_ICON_URI|ALBUM_ART|ART|DISPLAY_ICON)|METADATA_KEY_(?:ALBUM_ART_URI|ART_URI|DISPLAY_ICON_URI)|ALBUM_ART_URI|ART_URI|DISPLAY_ICON_URI|albumArtUri|artUri|displayIconUri|albumArt|art|displayIcon|icon)\s*[=:]\s*(content:\/\/\S+)/i;
+    const m = text.match(re);
+    if (!m) return null;
+    // Strip trailing dump punctuation: `,`, `}`, `]`, quotes.
+    return m[1].replace(/[,\}\]\)'"]+$/g, '');
+  })();
+
   const positionMs = position ? Number(position[1]) : null;
-  const durationMs = duration ? Number(duration[1]) : null;
+  let durationMs = duration ? Number(duration[1]) : null;
+  // Unit normalisation: some dumps report duration in seconds (e.g. `218`)
+  // while position is in ms (e.g. `70000`). A duration shorter than the
+  // position is impossible — if ×1000 makes it plausible, it was seconds.
+  if (Number.isFinite(durationMs) && Number.isFinite(positionMs)
+      && durationMs > 0 && positionMs >= 0 && durationMs < positionMs
+      && durationMs * 1000 >= positionMs) {
+    durationMs = durationMs * 1000;
+  }
 
   const track = {
     package: block.pkg || null,
@@ -147,6 +175,7 @@ function parseSession(block) {
     title,
     artist,
     album,
+    artUri,
     positionMs: Number.isFinite(positionMs) && positionMs >= 0 ? positionMs : null,
     durationMs: Number.isFinite(durationMs) && durationMs > 0 ? durationMs : null,
     speed: speed && Number.isFinite(Number(speed[1])) ? Number(speed[1]) : null,
@@ -204,6 +233,46 @@ function describeTrack(track) {
   return main || track.app || null;
 }
 
+/**
+ * Collects every content:// art URI in a session block (some dumps carry two:
+ * e.g. both ART_URI and ALBUM_ART_URI). The artwork fetcher tries them in order.
+ */
+function collectArtUris(text) {
+  const out = [];
+  const re = /(?:android\.media\.metadata\.(?:ALBUM_ART_URI|ART_URI|DISPLAY_ICON_URI|ALBUM_ART|ART|DISPLAY_ICON)|METADATA_KEY_(?:ALBUM_ART_URI|ART_URI|DISPLAY_ICON_URI)|ALBUM_ART_URI|ART_URI|DISPLAY_ICON_URI|albumArtUri|artUri|displayIconUri|albumArt|art|displayIcon|icon)\s*[=:]\s*(content:\/\/\S+)/gi;
+  let m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    const uri = m[1].replace(/[,\}\]\)'"]+$/g, '');
+    if (uri && !out.includes(uri)) out.push(uri);
+  }
+  return out;
+}
+
+/**
+ * Parses `dumpsys audio` for the MUSIC stream level.
+ * Formats differ by version (`STREAM_MUSIC(3): index:11`, `stream:3 ...`,
+ * `Music: ...`), so several patterns are tried; returns { index, max } with
+ * nulls where unreadable rather than throwing.
+ */
+function parseAudioVolume(out) {
+  const text = String(out || '');
+  // Modern: `STREAM_MUSIC(3): muted=false, ... index:11(max:15) ...`
+  let m = text.match(/STREAM_MUSIC\s*\(\s*3\s*\)[^\n]*?index\s*[:=]\s*(\d+)(?:\s*\(?\s*max\s*[:=]\s*(\d+))?/i);
+  if (m) {
+    return {
+      index: Number(m[1]),
+      max: m[2] !== undefined ? Number(m[2]) : 15,
+    };
+  }
+  // Compact: `stream:3 index:11` near a `music` label.
+  m = text.match(/(?:stream\s*[:=]\s*3|music)[^\n]{0,120}?index\s*[:=]\s*(\d+)/i);
+  if (m) return { index: Number(m[1]), max: 15 };
+  // `cmd audio get-volume music` prints a bare number or `index: 11`.
+  m = text.match(/index\s*[:=]\s*(\d+)/i) || text.match(/^\s*(\d+)\s*$/m);
+  if (m) return { index: Number(m[1]), max: 15 };
+  return { index: null, max: 15 };
+}
+
 module.exports = {
   PLAYBACK_STATES,
   STATE_LABELS,
@@ -216,4 +285,6 @@ module.exports = {
   parseNowPlaying,
   parseAllSessions,
   describeTrack,
+  collectArtUris,
+  parseAudioVolume,
 };

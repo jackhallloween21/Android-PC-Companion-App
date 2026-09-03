@@ -24,15 +24,28 @@ const CAMERA_FLAGS = {
   facing: ['--camera-facing'],
   size: ['--camera-size'],
   fps: ['--camera-fps'],
+  maxFps: ['--max-fps'],
+  bitrate: ['--video-bit-rate', '--bit-rate'],
+  maxSize: ['--max-size'],
   aspectRatio: ['--camera-ar'],
   highSpeed: ['--camera-high-speed'],
   audioSource: ['--audio-source'],
   v4l2Sink: ['--v4l2-sink'],
   windowTitle: ['--window-title'],
+  captureOrientation: ['--capture-orientation', '--orientation', '--display-orientation'],
+  record: ['--record'],
+  stayAwake: ['--stay-awake'],
 };
 
 /** Human labels for the facing values scrcpy reports. */
 const FACING_LABELS = { back: 'Rear', front: 'Front', external: 'External' };
+
+/**
+ * Window title for camera streams. Used for docked window matching and tracking.
+ */
+function cameraWindowTitle(serial) {
+  return `Camera — ${serial}`;
+}
 
 /**
  * Parses `scrcpy --list-cameras` and `--list-camera-sizes`.
@@ -123,8 +136,9 @@ function describeCamera(cam) {
  * @param {boolean} [o.mic]        also forward the phone microphone
  * @param {string} [o.v4l2Device]  Linux: write frames to this loopback device
  * @param {?string} help
+ * @param {object} [info]  scrcpyInfo { major, minor, help } for version-based detection
  */
-function buildCameraArgs(serial, o = {}, help = null) {
+function buildCameraArgs(serial, o = {}, help = null, info = null) {
   if (!serial) throw new Error('No device selected.');
   const source = pickFlag(help, CAMERA_FLAGS.videoSource);
   if (!source) throw new Error('This scrcpy build cannot use the camera as a video source (needs 2.2 or newer).');
@@ -140,12 +154,18 @@ function buildCameraArgs(serial, o = {}, help = null) {
 
   if (o.size) push('size', o.size);
   if (o.fps) push('fps', o.fps);
+  if (o.maxFps) push('maxFps', o.maxFps);
+  if (o.bitrate) push('bitrate', typeof o.bitrate === 'number' ? `${o.bitrate}M` : o.bitrate);
+  if (o.maxSize) push('maxSize', o.maxSize);
   if (o.highSpeed) push('highSpeed');
+  if (o.orientation !== undefined && o.orientation !== null) push('captureOrientation', o.orientation);
+  if (o.record) push('record', o.record);
+  if (o.stayAwake) push('stayAwake');
 
   // Audio: the mic is a genuine capture source; without it there is nothing
   // worth forwarding from a camera session, so the default is silence.
   const audioFlag = pickFlag(help, CAMERA_FLAGS.audioSource);
-  if (o.mic && audioFlag && supportsMic(help)) args.push(`${audioFlag}=mic`);
+  if (o.mic && audioFlag && supportsMic(help, info)) args.push(`${audioFlag}=mic`);
   else if (supportsFlag(help, '--no-audio') ?? true) args.push('--no-audio');
 
   if (o.v4l2Device) {
@@ -154,16 +174,24 @@ function buildCameraArgs(serial, o = {}, help = null) {
     args.push(`${flag}=${o.v4l2Device}`);
   }
 
-  push('windowTitle', `Camera — ${serial}`);
+  push('windowTitle', cameraWindowTitle(serial));
   return args;
 }
 
 /** Whether `--audio-source=mic` is available (scrcpy 2.2+ on Android 11+). */
-function supportsMic(help) {
+function supportsMic(help, info) {
   if (!help) return true;
-  return /--audio-source[^\n]*\bmic\b/i.test(help) || /\bmic\b/i.test(
-    (help.match(/--audio-source[\s\S]{0,400}/) || [''])[0]
-  );
+  // Fast path: version >= 2.2 always supports mic regardless of help parsing.
+  if (info && (info.major > 2 || (info.major === 2 && info.minor >= 2))) return true;
+  // scrcpy 2.x-3.x: --audio-source listed with mic option
+  if (/--audio-source[^\n]*\bmic\b/i.test(help)) return true;
+  const match = (help.match(/--audio-source[\s\S]{0,400}/) || [''])[0];
+  if (/\b(?:possible values|values are)\b/i.test(match)) {
+    return /\bmic\b/i.test(match);
+  }
+  if (/\bmic\b/i.test(match)) return true;
+  if (/--audio-source/i.test(help) && !/--audio-source=\w+/i.test(match)) return true;
+  return false;
 }
 
 /** Whether this build can write into a v4l2 loopback device at all. */
@@ -311,11 +339,19 @@ function describeCameraFailure(log, o = {}) {
 const TORCH_TILES = [
   'com.android.systemui/.qs.tiles.FlashlightTile',
   'com.android.systemui/com.android.systemui.qs.tiles.FlashlightTile',
+  'com.android.systemui/.qs.tiles.LanternTile',
+  'com.android.systemui/com.android.systemui.qs.tiles.LanternTile',
 ];
 
 function torchArgs(serial, tile = TORCH_TILES[0]) {
   if (!serial) throw new Error('No device selected.');
   return ['-s', serial, 'shell', 'cmd', 'statusbar', 'click-tile', tile];
+}
+
+/** Alternative: toggle torch via settings + am broadcast fallback. */
+function torchFallbackArgs(serial) {
+  if (!serial) throw new Error('No device selected.');
+  return ['-s', serial, 'shell', 'cmd', 'statusbar', 'expand-settings'];
 }
 
 /** `settings get secure sysui_qs_tiles` → the tile specs the shade actually has. */
@@ -436,6 +472,7 @@ module.exports = {
   FACING_LABELS,
   TORCH_TILES,
   DEFAULT_CODEC,
+  cameraWindowTitle,
   parseCameraList,
   describeCamera,
   buildCameraArgs,

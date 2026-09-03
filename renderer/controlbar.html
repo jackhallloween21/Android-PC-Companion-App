@@ -52,10 +52,14 @@
 
   .nav button { min-width: 54px; height: 34px; justify-content: center; font-size: 15px; }
   .nav .shade { min-width: 0; padding: 0 10px; font-size: 12px; }
+  .nav .cam-btn { min-width: 0; padding: 0 12px; font-size: 12.5px; font-weight: 500; }
   .aux button { height: 24px; padding: 0 8px; font-size: 11px; background: #111828; color: #a9b6cd; }
   .aux button:hover:not(:disabled) { color: #e6edf7; }
-  .aux .danger { color: #ff8b8b; border-color: #4a2331; }
-  .aux .rec-on { color: #fff; background: #7f1d2e; border-color: #a02a3f; }
+  .danger { color: #ff8b8b; border-color: #4a2331; }
+  .primary { color: #8ec2ff; border-color: #244275; background: #132442; }
+  .primary:hover:not(:disabled) { color: #fff; background: #1b3563; border-color: #355fa6; }
+  .rec-on { color: #fff; background: #7f1d2e !important; border-color: #a02a3f !important; }
+  .active-mic { color: #75e0a7; border-color: #1e5239; background: #0f2e20; }
 
   .zoom {
     display: inline-flex;
@@ -100,7 +104,8 @@
 <body>
   <div id="toast" role="status" aria-live="polite"></div>
 
-  <div class="row nav">
+  <!-- Mirror Nav Row -->
+  <div class="row nav" id="mirror-nav-row">
     <button id="k-back" title="Back">&#9664;</button>
     <button id="k-home" title="Home">&#9679;</button>
     <button id="k-recents" title="Recent apps">&#9632;</button>
@@ -108,21 +113,33 @@
     <button id="k-qs" class="shade" title="Open quick settings">Quick settings</button>
   </div>
 
+  <!-- Camera Action Row -->
+  <div class="row nav" id="camera-nav-row" style="display:none;">
+    <button id="c-flip" class="cam-btn" title="Switch between Front and Back camera">🔄 Switch Cam</button>
+    <button id="c-rotate" class="cam-btn" title="Rotate camera 90°">🔄 Rotate</button>
+    <button id="c-mic" class="cam-btn" title="Toggle microphone">🎙️ Mic</button>
+    <button id="c-shot" class="cam-btn primary" title="Capture photo from camera">📸 Capture</button>
+    <button id="c-record" class="cam-btn danger" title="Record camera video">🔴 Record</button>
+    <button id="c-stop" class="cam-btn danger" title="Stop camera stream">Stop</button>
+  </div>
+
   <div class="row aux">
     <span class="zoom">
-      <button id="z-out" title="Make the mirror smaller">&minus;</button>
+      <button id="z-out" title="Make the video smaller">&minus;</button>
       <span id="zoom-value">100%</span>
-      <button id="z-in" title="Make the mirror bigger">+</button>
+      <button id="z-in" title="Make the video bigger">+</button>
       <button id="z-fit" title="Fill as much of the screen as fits">Fit</button>
     </span>
-    <button id="a-power" class="danger" title="Long-press the power button">Power</button>
-    <button id="a-vol-down" title="Volume down">Vol &minus;</button>
-    <button id="a-vol-up" title="Volume up">Vol +</button>
-    <button id="a-rotate" title="Rotate the device display">Rotate</button>
-    <button id="a-shot" title="Save a screenshot to this PC">Screenshot</button>
-    <button id="a-record" title="Record the device screen">Record</button>
+    <span id="mirror-aux" style="display:inline-flex;gap:6px;align-items:center;">
+      <button id="a-power" class="danger" title="Long-press the power button">Power</button>
+      <button id="a-vol-down" title="Volume down">Vol &minus;</button>
+      <button id="a-vol-up" title="Volume up">Vol +</button>
+      <button id="a-rotate" title="Rotate the device display">Rotate</button>
+      <button id="a-shot" title="Save a screenshot to this PC">Screenshot</button>
+      <button id="a-record" title="Record the device screen">Record</button>
+    </span>
     <button id="a-redock" title="Snap this bar back under the video, wherever you have moved it">Re-dock</button>
-    <button id="a-stop" class="danger" title="Stop mirroring and close this bar">Stop</button>
+    <button id="a-stop" class="danger" title="Stop session and close this bar">Stop</button>
   </div>
 
   <script src="controlbar.js"></script>

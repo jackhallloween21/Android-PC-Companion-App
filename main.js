@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog, screen, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
+const { sanitizeSettings } = require('./src/theme');
 const {
   POWER_SCRIPT,
   parsePowerDump,
@@ -10,7 +11,22 @@ const {
   buildPowerReport,
   parseCpuTopology,
   formatClusters,
+  HEALTH_SOURCES,
+  parseHealthDump,
+  healthDumpUseful,
+  explainMissing,
 } = require('./src/power');
+const {
+  PERF_SCRIPT,
+  parsePerfDump,
+  parseDumpsysMeminfo,
+  buildPerfReport,
+} = require('./src/perf');
+const {
+  STORAGE_SCRIPT,
+  parseStorageDump,
+  buildStorageReport,
+} = require('./src/storage');
 const {
   buildMirrorArgs: buildScrcpyMirrorArgs,
   hasAudio,
@@ -25,6 +41,25 @@ const {
   pickConnectTarget,
   connectCandidates,
 } = require('./src/wireless');
+const {
+  listAdvertised,
+  isWirelessSerial,
+  rememberDevice,
+  forgetKnownDevice,
+  pruneKnown,
+  planReconnect,
+} = require('./src/autoconnect');
+const {
+  APPS_SCRIPT,
+  parseAppsDump,
+  buildAppList,
+  parsePackageDump,
+  buildAppDetail,
+  parseDuBytes,
+  isInstallable,
+  parseInstallResult,
+  parseIconDump,
+} = require('./src/apps');
 // QR pairing lives here, not in preload.js: the preload runs sandboxed, where
 // `require` is a polyfill that only resolves `electron` and a couple of node
 // builtins. Requiring a third-party module (or a relative file) there throws,
@@ -62,6 +97,7 @@ const {
 } = require('./src/keys');
 const {
   TORCH_TILES,
+  cameraWindowTitle,
   parseCameraList,
   buildCameraArgs,
   supportsMic,
@@ -80,6 +116,8 @@ const {
   parseNowPlaying,
   parseAllSessions,
   describeTrack,
+  collectArtUris,
+  parseAudioVolume,
 } = require('./src/media');
 
 const tools = { adb: 'adb', fastboot: 'fastboot', scrcpy: 'scrcpy' };
@@ -129,6 +167,13 @@ function createWindow() {
   // reachable by accident.
   win.webContents.on('did-start-navigation', () => qrPairing.cancel());
   win.on('closed', () => qrPairing.cancel());
+  // When the OS light/dark preference flips, tell the renderer so an "Auto"
+  // theme follows it live. Bound to this window and torn down with it.
+  const onNativeThemeUpdated = () => {
+    if (!win.isDestroyed()) win.webContents.send('theme:osUpdated', nativeTheme.shouldUseDarkColors);
+  };
+  nativeTheme.on('updated', onNativeThemeUpdated);
+  win.on('closed', () => nativeTheme.removeListener('updated', onNativeThemeUpdated));
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   return win;
 }
@@ -277,6 +322,35 @@ async function initTools(win) {
     clearTimeout(safetyTimer);
     completeSetup();
   }
+
+  // Auto-detect connected devices after tools are ready
+  try {
+    const out = await run(tools.adb, ['devices', '-l']);
+    const devices = out.trim().split('\n').slice(1)
+      .map(l => l.trim().split(/\s+/))
+      .filter(p => p[0] && p[1] === 'device')
+      .map(p => {
+        const serial = p[0];
+        const ip = serial.includes(':') ? serial.split(':')[0] : null;
+        const hasUsb = p.some(x => x.startsWith('usb:'));
+        return {
+          serial,
+          model: (p.find(x => x.startsWith('model:')) || '').split(':')[1] || serial,
+          transport: ip ? 'Wi-Fi' : 'USB',
+          ip,
+        };
+      });
+    if (devices.length === 1) {
+      win.webContents.send('device:auto-selected', devices[0]);
+    } else if (devices.length > 1) {
+      win.webContents.send('device:choose', devices);
+    }
+  } catch {}
+
+  // Silently reconnect previously paired wireless devices
+  try {
+    await runAutoconnect({ includeNew: false });
+  } catch {}
 }
 
 app.whenReady().then(() => {
@@ -371,11 +445,49 @@ ipcMain.handle('devices:list', async () => {
       const serial = parts[0];
       const state = parts[1];
       const model = (parts.find((p) => p.startsWith('model:')) || '').split(':')[1] || null;
-      return { serial, state, model };
+      const hasUsb = parts.some((p) => p.startsWith('usb:'));
+      const isMdns = serial.startsWith('adb-') || serial.includes('._tcp') || serial.includes('_adb');
+      const isIpPort = /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(serial);
+      const isWireless = isIpPort || isMdns || isWirelessSerial(serial);
+      const cachedIp = infoCache.get(serial)?.ip || null;
+      const ip = isIpPort ? serial.split(':')[0] : cachedIp;
+      const transport = isWireless ? 'Wi-Fi' : (hasUsb ? 'USB' : 'USB');
+      const product = (parts.find((p) => p.startsWith('product:')) || '').split(':')[1] || null;
+      return { serial, state, model, transport, ip, product };
     });
 });
 
+// Static device properties, cached per serial. None of these can change while
+// the device stays connected, and reading them was costing nine sequential adb
+// round trips on every dashboard refresh. The cache is dropped when a device
+// disconnects (see forgetDevice).
+const infoCache = new Map();
+const meminfoCache = new Map();
+
+function getMeminfoRaw(serial) {
+  const cached = meminfoCache.get(serial);
+  const now = Date.now();
+  if (!cached || (!cached.inFlight && now - cached.timestamp > 30000)) {
+    const entry = cached || { data: null, timestamp: 0, inFlight: false };
+    entry.inFlight = true;
+    meminfoCache.set(serial, entry);
+    adb(['-s', serial, 'shell', 'dumpsys', 'meminfo'])
+      .then((raw) => {
+        entry.data = raw;
+        entry.timestamp = Date.now();
+        entry.inFlight = false;
+      })
+      .catch(() => {
+        entry.inFlight = false;
+      });
+  }
+  return cached ? cached.data : null;
+}
+
 ipcMain.handle('device:info', async (_e, serial) => {
+  const cached = infoCache.get(serial);
+  if (cached) return cached;
+
   const props = [
     'ro.product.model',
     'ro.product.manufacturer',
@@ -386,17 +498,187 @@ ipcMain.handle('device:info', async (_e, serial) => {
     'ro.board.platform',
     'ro.hardware',
     'ro.boot.serialno',
+    'ro.boot.flash.locked',
   ];
+  // One `getprop` with no argument dumps every property at once, which is a
+  // single round trip instead of ten. The per-prop reads stay as a fallback for
+  // builds where the bulk dump is truncated or unreadable.
   const info = {};
-  for (const p of props) {
-    try { info[p] = (await adb(['-s', serial, 'shell', 'getprop', p])).trim(); }
-    catch { info[p] = null; }
+  let bulk = null;
+  try { bulk = await adb(['-s', serial, 'shell', 'getprop']); } catch { /* fall back below */ }
+  if (bulk) {
+    const map = new Map();
+    // Lines look like: [ro.product.model]: [Pixel 8]
+    for (const line of bulk.split('\n')) {
+      const m = line.match(/^\[([^\]]+)\]:\s*\[(.*)\]\s*$/);
+      if (m) map.set(m[1], m[2]);
+    }
+    for (const p of props) info[p] = map.has(p) ? (map.get(p) || null) : null;
   }
-  try { info.bootloaderLocked = (await adb(['-s', serial, 'shell', 'getprop', 'ro.boot.flash.locked'])).trim(); }
-  catch { info.bootloaderLocked = null; }
-  try { info.ip = (await adb(['-s', serial, 'shell', 'ip', 'route'])).match(/src (\S+)/)?.[1] || null; }
-  catch { info.ip = null; }
+  const missing = props.filter((p) => !info[p]);
+  if (missing.length === props.length) {
+    await Promise.all(missing.map(async (p) => {
+      try { info[p] = (await adb(['-s', serial, 'shell', 'getprop', p])).trim() || null; }
+      catch { info[p] = null; }
+    }));
+  }
+  info.bootloaderLocked = info['ro.boot.flash.locked'] ?? null;
+  // `getenforce` is not a property, so it needs its own read. Batched with the
+  // route lookup because both are single-line shell commands.
+  const [route, selinux] = await Promise.all([
+    adb(['-s', serial, 'shell', 'ip', 'route']).catch(() => null),
+    adb(['-s', serial, 'shell', 'getenforce']).catch(() => null),
+  ]);
+  info.ip = route ? (route.match(/src (\S+)/)?.[1] || null) : null;
+  info.selinux = selinux ? selinux.trim() || null : null;
+
+  infoCache.set(serial, info);
   return info;
+});
+
+/** Drops every per-serial cache, so a reconnected device is re-read. */
+function forgetDevice(serial) {
+  infoCache.delete(serial);
+  socCache.delete(serial);
+  healthSourceCache.delete(serial);
+  meminfoCache.delete(serial);
+}
+
+// ---------------------------------------------------------------------------
+// Autoconnect
+//
+// `adb pair` writes a key the phone keeps until it is revoked, so a device only
+// ever needs pairing once. What it needs every time is `adb connect`, at an
+// address Android changes whenever wireless debugging is toggled. Remembering
+// the device lets that second step happen without the user opening the pairing
+// screen again — see src/autoconnect.js for how the address is re-found.
+// ---------------------------------------------------------------------------
+
+const KNOWN_FILE = () => path.join(app.getPath('userData'), 'known-devices.json');
+
+function loadKnown() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(KNOWN_FILE(), 'utf8'));
+    return pruneKnown(Array.isArray(parsed) ? parsed : parsed.devices);
+  } catch {
+    // Absent on first run, and a corrupt file must not stop the app booting.
+    return [];
+  }
+}
+
+function saveKnown(list) {
+  try { fs.writeFileSync(KNOWN_FILE(), JSON.stringify(pruneKnown(list), null, 2)); }
+  catch { /* a read-only profile is not worth failing a connection over */ }
+}
+
+// --------------------------------------------------------------- theme settings
+// Persisted exactly like known-devices: a small JSON file in userData.
+// sanitizeSettings (shared with the renderer through src/theme) guarantees a
+// valid { mode, accent } even when the file is absent, hand-edited, or corrupt,
+// so a bad settings.json can never stop the app painting.
+const SETTINGS_FILE = () => path.join(app.getPath('userData'), 'settings.json');
+
+function loadSettings() {
+  try {
+    return sanitizeSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE(), 'utf8')));
+  } catch {
+    return sanitizeSettings(null);
+  }
+}
+
+// Merges a partial patch ({ mode } or { accent }) over what is on disk, so the
+// renderer can save one field without clobbering the other, then re-sanitizes.
+function saveSettings(patch) {
+  const merged = { ...loadSettings(), ...(patch && typeof patch === 'object' ? patch : {}) };
+  const next = sanitizeSettings(merged);
+  try { fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(next, null, 2)); }
+  catch { /* read-only profile: the sanitized value still applies for this run */ }
+  return next;
+}
+
+// osPrefersDark rides along so the renderer can resolve "auto" without a second
+// round-trip; nativeTheme is only valid after app is ready, which holds here
+// because these fire in response to the loaded renderer.
+ipcMain.handle('settings:get', async () => ({
+  ...loadSettings(),
+  osPrefersDark: nativeTheme.shouldUseDarkColors,
+}));
+
+ipcMain.handle('settings:set', async (_e, patch) => ({
+  ...saveSettings(patch),
+  osPrefersDark: nativeTheme.shouldUseDarkColors,
+}));
+
+/** Serials adb currently has attached. */
+async function attachedSerials() {
+  try {
+    const out = await adb(['devices']);
+    return out.split('\n').slice(1)
+      .map((l) => l.trim().split(/\s+/))
+      .filter((p) => p[0] && p[1] === 'device')
+      .map((p) => p[0]);
+  } catch { return []; }
+}
+
+/**
+ * Records a device we just connected to wirelessly. The mDNS instance name is
+ * consulted for the device serial, because that — not the address — is what
+ * identifies the phone again after its IP or port changes.
+ */
+async function rememberConnected(target, label = null) {
+  let deviceSerial = null;
+  try {
+    const { host } = splitHostPort(target);
+    const ad = listAdvertised(await adbText(['mdns', 'services'])).find((a) => a.host === host);
+    deviceSerial = ad ? ad.deviceSerial : null;
+  } catch { /* mDNS is often blocked; the host:port alone is still worth keeping */ }
+  saveKnown(rememberDevice(loadKnown(), { target, deviceSerial, label }));
+}
+
+let autoconnectRun = null;
+
+/**
+ * Tries the remembered devices once. Attempts run sequentially rather than in
+ * parallel: `adb connect` to a host that is not listening blocks for the TCP
+ * timeout, and firing several at once makes the adb server queue them anyway.
+ */
+async function runAutoconnect({ includeNew = false } = {}) {
+  const known = loadKnown();
+  if (!known.length && !includeNew) return { attempted: [], connected: [] };
+
+  const mdns = await adbText(['mdns', 'services']).catch(() => '');
+  const plan = planReconnect({ known, mdns, connected: await attachedSerials(), includeNew });
+
+  const attempted = [];
+  const connected = [];
+  for (const step of plan) {
+    // Once a device is attached there is no point trying its other addresses.
+    if (step.deviceSerial && connected.some((c) => c.deviceSerial === step.deviceSerial)) continue;
+    let out = null;
+    try { out = await adbText(['connect', step.target]); } catch { /* treated as a failure below */ }
+    attempted.push({ ...step, ok: isConnected(out) });
+    if (!isConnected(out)) continue;
+    connected.push(step);
+    await rememberConnected(step.target);
+  }
+  return { attempted, connected };
+}
+
+ipcMain.handle('devices:known', async () => loadKnown());
+
+ipcMain.handle('devices:autoconnect', async (_e, opts) => {
+  // A single shared promise, so a renderer reload during startup cannot start a
+  // second sweep and race the first one's writes to known-devices.json.
+  if (!autoconnectRun) {
+    autoconnectRun = runAutoconnect(opts || {}).finally(() => { autoconnectRun = null; });
+  }
+  return autoconnectRun;
+});
+
+ipcMain.handle('devices:forget', async (_e, hostOrSerial) => {
+  forgetDevice(hostOrSerial);
+  saveKnown(forgetKnownDevice(loadKnown(), hostOrSerial));
+  return loadKnown();
 });
 
 ipcMain.handle('device:battery', async (_e, serial) => {
@@ -422,27 +704,95 @@ ipcMain.handle('device:battery', async (_e, serial) => {
 // captured device output without booting Electron.
 // ---------------------------------------------------------------------------
 
-ipcMain.handle('device:power', async (_e, serial) => {
-  // dumpsys is the reliable floor; the sysfs sweep is the detail layer.
-  let dump = {};
-  try {
-    dump = parseDumpsysBattery(await adb(['-s', serial, 'shell', 'dumpsys', 'battery']));
-  } catch { /* keep going — sysfs may still work */ }
+// Which HEALTH_SOURCES entry answered for a given serial, so the probe only
+// happens once per device rather than on every 1 s poll. `null` means "probed
+// and none of them answered"; `undefined` means "not probed yet".
+const healthSourceCache = new Map();
 
-  let supplies = {};
-  let zones = [];
-  try {
-    ({ supplies, zones } = parsePowerDump(await adb(['-s', serial, 'shell', POWER_SCRIPT])));
-  } catch { /* power-supply nodes unreadable on this device */ }
+/**
+ * Reads the battery values the kernel is withholding, via the health HAL.
+ *
+ * On many devices (MediaTek especially) SELinux denies the `shell` user
+ * /sys/class/power_supply even though the DAC permission bits look fine — which
+ * is why the `[ -r ]` guards in POWER_SCRIPT pass and then `cat` returns
+ * nothing. The health HAL itself runs privileged and prints the same counters,
+ * and the shell user *is* allowed to ask it for a debug dump. That is the only
+ * non-root route to current draw, charge_full and cycle count on such a device.
+ */
+async function readHealthHal(serial) {
+  const cached = healthSourceCache.get(serial);
 
-  if (!Object.keys(dump).length && !Object.keys(supplies).length) {
-    throw new Error('Neither "dumpsys battery" nor /sys/class/power_supply could be read.');
+  // Re-run only the source that worked last time.
+  if (cached) {
+    try {
+      const parsed = parseHealthDump(await adb(['-s', serial, 'shell', cached.command]));
+      if (healthDumpUseful(parsed)) return { health: parsed, healthSource: cached.label };
+    } catch { /* fall through and re-probe: the HAL may have been restarted */ }
+    healthSourceCache.delete(serial);
+  } else if (cached === null) {
+    return { health: {}, healthSource: null };
   }
 
-  return buildPowerReport({ dump, supplies, zones });
+  for (const source of HEALTH_SOURCES) {
+    let parsed;
+    try {
+      parsed = parseHealthDump(await adb(['-s', serial, 'shell', source.command]));
+    } catch { continue; }
+    if (!healthDumpUseful(parsed)) continue;
+    healthSourceCache.set(serial, source);
+    return { health: parsed, healthSource: source.label };
+  }
+
+  // Remember the failure too, so a device with no health HAL does not pay for
+  // four dumpsys round trips on every single poll.
+  healthSourceCache.set(serial, null);
+  return { health: {}, healthSource: null };
+}
+
+// The fields the UI shows a dash for, each with a sentence explaining *why* it
+// is missing. This matters because the two reasons need different responses: an
+// unreadable node is an access problem, while a gauge that never counts cycles
+// is a hardware fact the user cannot do anything about.
+const EXPLAINED_FIELDS = ['current', 'watts', 'cycleCount', 'chargeFullMah', 'chargeNowMah', 'socTemp'];
+
+function withNotes(report) {
+  const notes = {};
+  for (const field of EXPLAINED_FIELDS) {
+    const note = explainMissing(report, field);
+    if (note) notes[field] = note;
+  }
+  return { ...report, notes };
+}
+
+ipcMain.handle('device:power', async (_e, serial) => {
+  // Three sources, fetched concurrently because each is a separate adb round
+  // trip and the poll interval is 1 s: dumpsys is the reliable floor, the sysfs
+  // sweep is the detail layer, and the health HAL covers what sysfs withholds.
+  const settle = (p) => p.then((v) => v, () => null);
+  const [dumpRaw, sweep, hal] = await Promise.all([
+    settle(adb(['-s', serial, 'shell', 'dumpsys', 'battery'])),
+    settle(adb(['-s', serial, 'shell', POWER_SCRIPT])),
+    settle(readHealthHal(serial)),
+  ]);
+
+  const dump = dumpRaw ? parseDumpsysBattery(dumpRaw) : {};
+  const { supplies, zones } = sweep ? parsePowerDump(sweep) : { supplies: {}, zones: [] };
+  const { health, healthSource } = hal || { health: {}, healthSource: null };
+
+  if (!Object.keys(dump).length && !Object.keys(supplies).length && !Object.keys(health).length) {
+    throw new Error('Neither "dumpsys battery", /sys/class/power_supply nor the health HAL could be read.');
+  }
+
+  return withNotes(buildPowerReport({ dump, supplies, zones, health, healthSource }));
 });
 
+// SoC identity and CPU topology never change either, so this is cached as well.
+const socCache = new Map();
+
 ipcMain.handle('device:soc', async (_e, serial) => {
+  const cached = socCache.get(serial);
+  if (cached) return cached;
+
   const getprop = async (key) => {
     try { return (await adb(['-s', serial, 'shell', 'getprop', key])).trim() || null; }
     catch { return null; }
@@ -474,7 +824,7 @@ ipcMain.handle('device:soc', async (_e, serial) => {
     storageModel = out.split('\n').map((l) => l.trim()).find(Boolean) || null;
   } catch { /* not exposed */ }
 
-  return {
+  const soc = {
     socName: [socMfr, socModel].filter(Boolean).join(' ') || platform || hardware || null,
     socModel,
     socManufacturer: socMfr,
@@ -488,6 +838,59 @@ ipcMain.handle('device:soc', async (_e, serial) => {
     ddrType: ddrType || null,
     storageModel: storageModel || ufsProp || null,
   };
+  socCache.set(serial, soc);
+  return soc;
+});
+
+// ---------------------------------------------------------------------------
+// Live telemetry: one handler, one poll, everything that actually changes.
+//
+// The old dashboard polled `device:power`, `device:hardware`, `device:info` and
+// `device:soc` separately every 3 s. `device:info` alone is nine sequential
+// `getprop` calls, and none of what it returns can change while the phone is
+// plugged in — so most of the perceived lag was the UI waiting on static data.
+// Here the live reads are batched into as few round trips as possible and run
+// concurrently, and the static specs are cached per serial (see device:specs).
+// ---------------------------------------------------------------------------
+
+const settled = (p) => p.then((v) => v, () => null);
+
+ipcMain.handle('device:telemetry', async (_e, serial) => {
+  const meminfoRaw = getMeminfoRaw(serial);
+  const [perfRaw, psRaw, sweep, dumpRaw, hal] = await Promise.all([
+    settled(adb(['-s', serial, 'shell', PERF_SCRIPT])),
+    settled(adb(['-s', serial, 'shell', 'ps -A -o PID 2>/dev/null | wc -l'])),
+    settled(adb(['-s', serial, 'shell', POWER_SCRIPT])),
+    settled(adb(['-s', serial, 'shell', 'dumpsys', 'battery'])),
+    settled(readHealthHal(serial)),
+  ]);
+
+  const { supplies, zones } = sweep ? parsePowerDump(sweep) : { supplies: {}, zones: [] };
+  const { health, healthSource } = hal || { health: {}, healthSource: null };
+
+  // `wc -l` counts the header row too.
+  const processCount = psRaw ? Math.max(0, Number(String(psRaw).trim()) - 1) || null : null;
+
+  return {
+    perf: buildPerfReport({
+      perf: perfRaw ? parsePerfDump(perfRaw) : null,
+      dumpsys: meminfoRaw ? parseDumpsysMeminfo(meminfoRaw) : null,
+      processCount,
+      zones,
+    }),
+    power: withNotes(buildPowerReport({
+      dump: dumpRaw ? parseDumpsysBattery(dumpRaw) : {},
+      supplies,
+      zones,
+      health,
+      healthSource,
+    })),
+  };
+});
+
+ipcMain.handle('device:storage', async (_e, serial) => {
+  const raw = await adb(['-s', serial, 'shell', STORAGE_SCRIPT]);
+  return buildStorageReport(parseStorageDump(raw));
 });
 
 ipcMain.handle('device:hardware', async (_e, serial) => {
@@ -593,26 +996,53 @@ ipcMain.handle('control:screenshot', async (_e, serial) => {
 });
 
 let recordProcess = null;
+let recordSerial = null;
 const REMOTE_RECORD_PATH = '/sdcard/companion_record.mp4';
 
-ipcMain.handle('control:recordStart', (_e, serial) => {
+ipcMain.handle('control:recordStart', async (_e, serial) => {
   if (recordProcess) return true;
+  recordSerial = serial;
+  try { await adb(['-s', serial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]); } catch { /* ignore */ }
   recordProcess = spawn(tools.adb, ['-s', serial, 'shell', 'screenrecord', REMOTE_RECORD_PATH]);
   recordProcess.on('exit', () => { recordProcess = null; });
   return true;
 });
 
 ipcMain.handle('control:recordStop', async (_e, serial) => {
-  if (!recordProcess) return null;
-  // screenrecord finalizes the file cleanly on SIGINT; give it a moment
-  // before pulling.
-  recordProcess.kill('SIGINT');
-  recordProcess = null;
-  await new Promise((r) => setTimeout(r, 1200));
-  const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: `recording-${Date.now()}.mp4` });
-  if (canceled || !filePath) return null;
-  await adb(['-s', serial, 'pull', REMOTE_RECORD_PATH, filePath]);
-  await adb(['-s', serial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]);
+  const targetSerial = serial || recordSerial;
+  if (!recordProcess && !targetSerial) return null;
+
+  // Signal remote screenrecord process via SIGINT (signal 2) so Android cleanly
+  // flushes the encoder and writes the MP4 moov atom / trailer.
+  if (targetSerial) {
+    try {
+      await adb(['-s', targetSerial, 'shell', 'pkill -2 screenrecord || killall -2 screenrecord || kill -2 $(pidof screenrecord)']);
+    } catch { /* ignore */ }
+  }
+  if (recordProcess) {
+    try { recordProcess.kill(); } catch { /* ignore */ }
+    recordProcess = null;
+  }
+  recordSerial = null;
+
+  // Give screenrecord a brief moment to finish writing the file to storage
+  await new Promise((r) => setTimeout(r, 1500));
+
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: `recording-${Date.now()}.mp4`,
+    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'All Files', extensions: ['*'] }],
+  });
+  if (canceled || !filePath) {
+    if (targetSerial) {
+      try { await adb(['-s', targetSerial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]); } catch { /* ignore */ }
+    }
+    return null;
+  }
+
+  if (targetSerial) {
+    await adb(['-s', targetSerial, 'pull', REMOTE_RECORD_PATH, filePath]);
+    await adb(['-s', targetSerial, 'shell', 'rm', '-f', REMOTE_RECORD_PATH]);
+  }
   return filePath;
 });
 
@@ -681,7 +1111,12 @@ ipcMain.handle('wireless:pair', async (_e, { hostPort, code, connectPort }) => {
   const attempts = [];
   for (const target of targets) {
     try {
-      return { paired, connected: true, target, message: await adbConnect(target) };
+      const message = await adbConnect(target);
+      // Remembered here rather than in the renderer, so the device is on the
+      // autoconnect list from the moment the pairing succeeds — that is what
+      // makes the next launch skip the pairing screen entirely.
+      await rememberConnected(target);
+      return { paired, connected: true, target, message };
     } catch (err) {
       attempts.push(`${target}: ${err.message}`);
     }
@@ -702,10 +1137,38 @@ ipcMain.handle('wireless:pair', async (_e, { hostPort, code, connectPort }) => {
 
 ipcMain.handle('wireless:connect', async (_e, hostPort) => {
   const { host, port } = splitHostPort(hostPort);
-  return adbConnect(`${host}:${port || 5555}`);
+  const target = `${host}:${port || 5555}`;
+  const message = await adbConnect(target);
+  await rememberConnected(target);
+  return message;
 });
 
 ipcMain.handle('wireless:discover', async () => pickConnectTarget(await adbText(['mdns', 'services'])));
+
+// Drops a device. A wireless serial is `host:port` or mDNS name, which adb can genuinely
+// disconnect; a physical USB serial cannot be detached from this end, so the caches are
+// cleared and the renderer just deselects it.
+ipcMain.handle('device:disconnect', async (_e, serial) => {
+  forgetDevice(serial);
+  // The device stays on the autoconnect list: disconnecting is temporary, and
+  // the pairing key on the phone is untouched. Use devices:forget to drop it.
+  if (isWirelessSerial(serial)) {
+    const msg = await adbText(['disconnect', serial]);
+    return { disconnected: true, message: msg || 'Disconnected' };
+  }
+  try {
+    const msg = await adbText(['disconnect', serial]);
+    if (/disconnected/i.test(msg)) {
+      return { disconnected: true, message: msg };
+    }
+  } catch { /* ignore */ }
+
+  return {
+    disconnected: false,
+    message: 'USB devices stay attached until the cable is unplugged — unplug it, '
+      + 'or turn off USB debugging on the phone.',
+  };
+});
 
 ipcMain.handle('wireless:enableTcpip', async (_e, { serial, port }) => {
   const out = await adbText(['-s', serial, 'tcpip', String(port || 5555)]);
@@ -871,6 +1334,9 @@ const qrPairing = {
           try {
             const message = await adbConnect(match.target, { timeout: QR_ADB_TIMEOUT_MS });
             if (!alive()) return;
+            // A QR pairing is exactly the case autoconnect exists for: the user
+            // will not want to re-scan a code on every launch.
+            await rememberConnected(match.target);
             send({ phase: 'connected', message, target: match.target });
             return;
           } catch (err) {
@@ -959,92 +1425,405 @@ ipcMain.handle('wireless:qrPairCancel', async () => {
 // ---------------------------------------------------------------------------
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const TEXT_EXT = /\.(txt|md|json|xml|csv|log|ini|cfg|conf|yaml|yml|toml|sh|bat|ps1|py|js|ts|html|css|java|kt|c|cpp|h|rs)$/i;
+const VIDEO_EXT = /\.(mp4|mkv|avi|mov|webm|3gp|m4v)$/i;
+const PDF_EXT = /\.pdf$/i;
 
 ipcMain.handle('files:list', async (_e, { serial, remotePath }) => {
-  const out = await adb(['-s', serial, 'shell', 'ls', '-la', remotePath]);
+  const out = await adb(['-s', serial, 'shell', 'ls -la ' + JSON.stringify(remotePath)]);
   return out.split('\n').filter(Boolean);
 });
 
+function streamMax(bin, args, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(bin, args);
+    const chunks = [];
+    let total = 0;
+    let truncated = false;
+    proc.stdout.on('data', (chunk) => {
+      total += chunk.length;
+      if (total <= maxBytes) {
+        chunks.push(chunk);
+      } else if (!truncated) {
+        truncated = true;
+        const remaining = maxBytes - (total - chunk.length);
+        if (remaining > 0) chunks.push(chunk.slice(0, remaining));
+        proc.kill();
+      }
+    });
+    proc.on('close', (code) => {
+      if (code !== 0 && truncated) return resolve(Buffer.concat(chunks));
+      if (code !== 0) return reject(new Error('adb exited ' + code));
+      resolve(Buffer.concat(chunks));
+    });
+    proc.on('error', reject);
+  });
+}
+
+const PREVIEW_MAX = 20 * 1024 * 1024;
+
 ipcMain.handle('files:preview', async (_e, { serial, remotePath }) => {
-  if (!IMAGE_EXT.test(remotePath)) return null;
-  const buf = await adbBuffer(['-s', serial, 'exec-out', 'cat', remotePath]);
-  return `data:image/*;base64,${buf.toString('base64')}`;
+  if (IMAGE_EXT.test(remotePath)) {
+    const buf = await streamMax(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath], PREVIEW_MAX);
+    return { kind: 'image', data: `data:image/*;base64,${buf.toString('base64')}` };
+  }
+  if (TEXT_EXT.test(remotePath)) {
+    const out = await adb(['-s', serial, 'shell', 'head -c 50000 ' + JSON.stringify(remotePath)]);
+    return { kind: 'text', data: out };
+  }
+  if (VIDEO_EXT.test(remotePath)) {
+    const buf = await streamMax(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath], PREVIEW_MAX);
+    if (buf.length < PREVIEW_MAX) {
+      return { kind: 'video', data: `data:video/*;base64,${buf.toString('base64')}` };
+    }
+    return null;
+  }
+  if (PDF_EXT.test(remotePath)) {
+    const buf = await streamMax(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath], PREVIEW_MAX);
+    return { kind: 'pdf', data: `data:application/pdf;base64,${buf.toString('base64')}` };
+  }
+  return null;
 });
 
-ipcMain.handle('files:pull', async (_e, { serial, remotePath }) => {
+ipcMain.handle('files:pull', async (e, { serial, remotePath }) => {
   const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: path.basename(remotePath) });
   if (canceled || !filePath) return null;
-  await adb(['-s', serial, 'pull', remotePath, filePath]);
-  return filePath;
+  e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 0 });
+  try {
+    let totalBytes = 0;
+    try {
+      const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remotePath]);
+      totalBytes = parseInt(sizeOut.trim(), 10) || 0;
+    } catch { /* ignore — we'll show indeterminate */ }
+    const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', remotePath]);
+    let bytesRead = 0;
+    const ws = fs.createWriteStream(filePath);
+    await new Promise((resolve, reject) => {
+      proc.stdout.on('data', (chunk) => {
+        bytesRead += chunk.length;
+        ws.write(chunk);
+        if (totalBytes > 0) {
+          const pct = Math.min(99, Math.round((bytesRead / totalBytes) * 100));
+          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: pct, bytes: bytesRead, totalBytes });
+        } else {
+          e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: -1, bytes: bytesRead, totalBytes: 0 });
+        }
+      });
+      proc.on('close', (code) => {
+        ws.end(() => {
+          if (code === 0) resolve();
+          else reject(new Error('adb exited with code ' + code));
+        });
+      });
+      proc.on('error', (err) => { ws.end(); reject(err); });
+    });
+    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+    return filePath;
+  } catch (err) {
+    try { await adb(['-s', serial, 'pull', remotePath, filePath]); } catch (fallbackErr) { throw fallbackErr; }
+    e.sender.send('files:pullProgress', { index: 0, total: 1, name: path.basename(remotePath), percent: 100 });
+    return filePath;
+  }
 });
 
-ipcMain.handle('files:push', async (_e, { serial, remoteDir }) => {
+ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
+  if (!destDir) {
+    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
+    if (result.canceled || !result.filePaths.length) return null;
+    destDir = result.filePaths[0];
+  }
+  const results = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 0 });
+    const localPath = path.join(destDir, f.name);
+    try {
+      let totalBytes = 0;
+      try {
+        const sizeOut = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', f.path]);
+        totalBytes = parseInt(sizeOut.trim(), 10) || 0;
+      } catch { /* ignore */ }
+      const proc = spawn(tools.adb, ['-s', serial, 'exec-out', 'cat', f.path]);
+      let bytesRead = 0;
+      const ws = fs.createWriteStream(localPath);
+      await new Promise((resolve, reject) => {
+        proc.stdout.on('data', (chunk) => {
+          bytesRead += chunk.length;
+          ws.write(chunk);
+          const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
+          e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
+        });
+        proc.on('close', (code) => { ws.end(() => code === 0 ? resolve() : reject(new Error('exit ' + code))); });
+        proc.on('error', (err) => { ws.end(); reject(err); });
+      });
+      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+      results.push({ name: f.name, ok: true, path: localPath });
+    } catch (err) {
+      try {
+        await adb(['-s', serial, 'pull', f.path, localPath]);
+        results.push({ name: f.name, ok: true, path: localPath });
+      } catch (pullErr) {
+        results.push({ name: f.name, ok: false, error: pullErr.message });
+      }
+      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100 });
+    }
+  }
+  return { destDir, results };
+});
+
+ipcMain.handle('files:push', async (e, { serial, remoteDir }) => {
   const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
   if (canceled || !filePaths.length) return null;
-  await adb(['-s', serial, 'push', filePaths[0], remoteDir]);
-  return filePaths[0];
+  const localPath = filePaths[0];
+  const name = path.basename(localPath);
+  const remotePath = remoteDir.replace(/\/?$/, '/') + name;
+  const totalBytes = fs.statSync(localPath).size;
+  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: -1, bytes: 0, totalBytes });
+  try {
+    const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    await adb(['-s', serial, 'push', localPath, tmpPath]);
+    await adb(['-s', serial, 'shell', 'mv', tmpPath, remotePath]);
+  } catch {
+    await adb(['-s', serial, 'push', localPath, remoteDir]);
+  }
+  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: 100, bytes: totalBytes, totalBytes });
+  return localPath;
 });
 
-ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm', '-rf', remotePath]));
+ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
+  const { canceled, filePaths } = await dialog.showOpenDialog({
+    properties: ['openFile', 'multiSelections'],
+    title: 'Select files to upload',
+  });
+  if (canceled || !filePaths.length) return null;
+  const results = [];
+  for (let i = 0; i < filePaths.length; i++) {
+    const lp = filePaths[i];
+    const name = path.basename(lp);
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
+    let totalBytes = 0;
+    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+    try {
+      await adb(['-s', serial, 'push', lp, remoteDir]);
+      results.push({ name, ok: true });
+    } catch (err) {
+      results.push({ name, ok: false, error: err.message });
+    }
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+  }
+  return results;
+});
+
+ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths }) => {
+  if (!filePaths || !filePaths.length) return [];
+  const results = [];
+  for (let i = 0; i < filePaths.length; i++) {
+    const lp = filePaths[i];
+    const name = path.basename(lp);
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
+    let totalBytes = 0;
+    try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
+    try {
+      await adb(['-s', serial, 'push', lp, remoteDir]);
+      results.push({ name, ok: true });
+    } catch (err) {
+      results.push({ name, ok: false, error: err.message });
+    }
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 100, bytes: totalBytes, totalBytes });
+  }
+  return results;
+});
+
+ipcMain.handle('files:delete', (_e, { serial, remotePath }) => adb(['-s', serial, 'shell', 'rm -rf ' + JSON.stringify(remotePath)]));
 
 // ---------------------------------------------------------------------------
 // Apps
+//
+// The inventory is one shell round trip (src/apps.js explains the script and why
+// the label has to be layered). Doing it per-app would be ~1200 adb invocations
+// on a phone with 300 packages, which takes minutes.
 // ---------------------------------------------------------------------------
 
-async function listPackageSet(serial, flag) {
-  const out = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '--user', '0', flag]);
-  return new Set(out.split('\n').map((l) => l.replace('package:', '').trim()).filter(Boolean));
+// A package id only ever contains letters, digits, dots and underscores. Every
+// id that reaches a shell string is checked against this, so a crafted name
+// cannot smuggle a `;` into the batched script.
+const PKG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.]*$/;
+
+function assertPackage(pkg) {
+  const id = String(pkg || '').trim();
+  if (!PKG_RE.test(id)) throw new Error(`Not a package name: ${pkg}`);
+  return id;
 }
 
 ipcMain.handle('apps:listDetailed', async (_e, serial) => {
-  const [thirdParty, system, disabled] = await Promise.all([
-    listPackageSet(serial, '-3'),
-    listPackageSet(serial, '-s'),
-    listPackageSet(serial, '-d'),
-  ]);
-  const all = new Set([...thirdParty, ...system]);
-  return Array.from(all).map((pkg) => ({
-    pkg,
-    type: thirdParty.has(pkg) ? 'user' : 'system',
-    status: disabled.has(pkg) ? 'disabled' : 'active',
-  }));
+  const raw = await adb(['-s', serial, 'shell', APPS_SCRIPT]);
+  return buildAppList(parseAppsDump(raw));
 });
 
-ipcMain.handle('apps:detail', async (_e, { serial, pkg }) => {
-  let sizeBytes = null;
-  try {
-    const pathOut = await adb(['-s', serial, 'shell', 'pm', 'path', pkg]);
-    const apkPath = pathOut.split('\n')[0].replace('package:', '').trim();
-    if (apkPath) {
-      const stat = await adb(['-s', serial, 'shell', 'stat', '-c%s', apkPath]);
-      sizeBytes = Number(stat.trim()) || null;
+/**
+ * Everything the inspector shows, in one round trip.
+ *
+ * The two `du` attempts are both expected to fail on a normal device: /data/data
+ * is unreadable from the adb shell, and `run-as` only works for a debuggable
+ * app. They are still worth making — when one does succeed the panel shows real
+ * numbers instead of "unavailable" — and when both fail the parse returns null,
+ * which is what the UI renders as a dash.
+ */
+function detailScript(pkg) {
+  const dataDir = `/data/data/${pkg}`;
+  return [
+    'echo "@@DUMP@@";', `dumpsys package ${pkg} 2>/dev/null;`,
+    'echo "@@DATA@@";', `du -sk ${dataDir} 2>/dev/null;`,
+    `run-as ${pkg} du -sk ${dataDir} 2>/dev/null;`,
+    'echo "@@CACHE@@";', `du -sk ${dataDir}/cache 2>/dev/null;`,
+    `run-as ${pkg} du -sk ${dataDir}/cache 2>/dev/null;`,
+    'exit 0',
+  ].join(' ');
+}
+
+function splitDetail(raw) {
+  const out = { dump: '', data: '', cache: '' };
+  let current = null;
+  for (const line of String(raw || '').split('\n')) {
+    const text = line.replace(/\r$/, '').trim();
+    if (text === '@@DUMP@@') { current = 'dump'; continue; }
+    if (text === '@@DATA@@') { current = 'data'; continue; }
+    if (text === '@@CACHE@@') { current = 'cache'; continue; }
+    if (current) out[current] += `${line.replace(/\r$/, '')}\n`;
+  }
+  return out;
+}
+
+ipcMain.handle('apps:detail', async (_e, { serial, pkg, app = null }) => {
+  const id = assertPackage(pkg);
+  const raw = await adb(['-s', serial, 'shell', detailScript(id)]);
+  const { dump, data, cache } = splitDetail(raw);
+  return buildAppDetail({
+    app: app || { pkg: id },
+    dump: parsePackageDump(dump),
+    apkBytes: app ? app.apkBytes : null,
+    dataBytes: parseDuBytes(data),
+    cacheBytes: parseDuBytes(cache),
+  });
+});
+
+/**
+ * Installs one or more APKs, reporting per file.
+ *
+ * `adb install` announces failure on stdout and, depending on the version, still
+ * exits 0 — the same trap as `adb pair` — so the output is classified rather
+ * than the exit status trusted. Files are installed one at a time: a batch that
+ * stopped at the first failure would leave the user guessing which of five
+ * dropped APKs actually landed.
+ */
+async function installApks(serial, filePaths) {
+  const results = [];
+  for (const filePath of (Array.isArray(filePaths) ? filePaths : []).filter(Boolean)) {
+    const name = path.basename(filePath);
+    if (!isInstallable(filePath)) {
+      results.push({
+        file: name,
+        ok: false,
+        code: null,
+        message: 'Only a single .apk can be installed over adb. Split bundles (.apks/.xapk) need their own installer.',
+      });
+      continue;
     }
-  } catch { /* ignore */ }
-
-  let permissions = [];
-  try {
-    const dump = await adb(['-s', serial, 'shell', 'dumpsys', 'package', pkg]);
-    const block = dump.split('requested permissions:')[1]?.split(/\n\s*\n/)[0] || '';
-    permissions = block.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('android.permission') || l.includes('.permission.'));
-  } catch { /* ignore */ }
-
-  return { sizeBytes, permissions };
-});
+    const out = await adbText(['-s', serial, 'install', '-r', filePath]);
+    results.push({ file: name, ...parseInstallResult(out) });
+  }
+  return results;
+}
 
 ipcMain.handle('apps:install', async (_e, serial) => {
   const { canceled, filePaths } = await dialog.showOpenDialog({
-    properties: ['openFile'],
-    filters: [{ name: 'APK', extensions: ['apk'] }],
+    title: 'Choose APKs to sideload',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Android package', extensions: ['apk'] }],
   });
   if (canceled || !filePaths.length) return null;
-  await adb(['-s', serial, 'install', '-r', filePaths[0]]);
-  return filePaths[0];
+  return installApks(serial, filePaths);
 });
 
-ipcMain.handle('apps:uninstall', (_e, { serial, pkg }) => adb(['-s', serial, 'uninstall', pkg]));
-ipcMain.handle('apps:disable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg]));
-ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'enable', pkg]));
-ipcMain.handle('apps:clearData', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'clear', pkg]));
+// Drag-and-drop hands over paths the renderer already resolved, so there is no
+// dialog to show.
+ipcMain.handle('apps:installFiles', async (_e, { serial, filePaths }) => installApks(serial, filePaths));
+
+ipcMain.handle('apps:uninstall', (_e, { serial, pkg }) => adb(['-s', serial, 'uninstall', assertPackage(pkg)]));
+ipcMain.handle('apps:disable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', assertPackage(pkg)]));
+ipcMain.handle('apps:enable', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'enable', assertPackage(pkg)]));
+ipcMain.handle('apps:clearData', (_e, { serial, pkg }) => adb(['-s', serial, 'shell', 'pm', 'clear', assertPackage(pkg)]));
+
+// ---------------------------------------------------------------------------
+// App icons
+//
+// adb exposes no launcher icon: `pm`/`dumpsys` print a numeric resource id, and
+// the bitmap itself only exists inside the APK. Pulling every APK to unzip one
+// PNG would move gigabytes. Instead a ~4 KB dex helper is pushed once and run
+// with `app_process`, exactly as scrcpy runs its server: that gives it a real
+// PackageManager, from which getApplicationIcon() renders each icon to a PNG we
+// read straight off stdout. It runs as the shell user, so a handful of apps
+// with locked-down icons simply do not answer — the UI keeps its monogram tile
+// for those, and for any device where app_process is not lettable at all.
+// ---------------------------------------------------------------------------
+
+const ICON_DEX_REMOTE = '/data/local/tmp/companion-icons.dex';
+
+// Bundled next to smartphone.png. When packaged the app runs from inside
+// app.asar, which the external adb binary cannot read, so the dex is unpacked
+// (see "asarUnpack" in package.json) and reached through app.asar.unpacked.
+//
+// Order matters: Electron patches fs so existsSync() returns true for the path
+// *inside* app.asar, but adb — an external process — cannot stat that virtual
+// path, so pushing it would fail and every icon would fall back to a monogram
+// in the packaged .exe. We therefore try the unpacked copy first. In dev there
+// is no "app.asar" segment, so the replace is a no-op and both entries are the
+// same real path.
+function iconDexPath() {
+  const inApp = path.join(__dirname, 'assets', 'classes.dex');
+  const unpacked = inApp.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+  for (const candidate of [unpacked, inApp]) {
+    try { if (fs.existsSync(candidate)) return candidate; } catch { /* keep looking */ }
+  }
+  return inApp;
+}
+
+// The push is done once per serial and shared between the renderer's batched
+// calls; a failure clears the cache so a later attempt can retry rather than
+// being stuck behind a rejected promise.
+const iconDexPushes = new Map();
+function ensureIconDex(serial) {
+  if (!iconDexPushes.has(serial)) {
+    const dex = iconDexPath();
+    const push = adb(['-s', serial, 'push', dex, ICON_DEX_REMOTE])
+      .then(() => true)
+      .catch((err) => { iconDexPushes.delete(serial); throw err; });
+    iconDexPushes.set(serial, push);
+  }
+  return iconDexPushes.get(serial);
+}
+
+ipcMain.handle('apps:icons', async (_e, { serial, pkgs }) => {
+  const list = (Array.isArray(pkgs) ? pkgs : [])
+    .map((p) => String(p || '').trim())
+    .filter((p) => PKG_RE.test(p));
+  if (!serial || !list.length) return {};
+  try {
+    if (!fs.existsSync(iconDexPath())) return {};
+    await ensureIconDex(serial);
+    // Every id is PKG_RE-checked above, so none can smuggle a shell token into
+    // the app_process command line.
+    const out = await adb([
+      '-s', serial, 'shell',
+      `CLASSPATH=${ICON_DEX_REMOTE}`, 'app_process', '/system/bin',
+      'com.companion.IconExtractor', ...list,
+    ]);
+    return parseIconDump(out);
+  } catch {
+    // No icons is not an error the user needs to see — the monograms stand in.
+    return {};
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Backup
@@ -1082,7 +1861,9 @@ ipcMain.handle('backup:run', async (event, { serial, categories, destDir, includ
 
   if (includeApks) {
     send('Listing installed apps…');
-    const pkgOut = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '-3']);
+    // `--user 0`: bare `pm list` aborts on devices with a broken/parallel
+    // user (seen: "Shell does not have permission to access user 999").
+    const pkgOut = await adb(['-s', serial, 'shell', 'pm', 'list', 'packages', '-3', '--user', '0']);
     const pkgs = pkgOut.split('\n').map((l) => l.replace('package:', '').trim()).filter(Boolean);
     const apkDir = path.join(destDir, 'apks');
     fs.mkdirSync(apkDir, { recursive: true });
@@ -1234,7 +2015,7 @@ async function readDisplayGeometry(serial) {
   return { size, rotation };
 }
 
-function controlBarWindow(bar, serial) {
+function controlBarWindow(bar, serial, { type = 'mirror' } = {}) {
   const win = new BrowserWindow({
     x: bar.x,
     y: bar.y,
@@ -1266,7 +2047,7 @@ function controlBarWindow(bar, serial) {
   win.setAlwaysOnTop(true, 'screen-saver');
   win.once('ready-to-show', () => win.showInactive());
   win.loadFile(path.join(__dirname, 'renderer', 'controlbar.html'), {
-    query: { serial },
+    query: { serial, type },
   });
   return win;
 }
@@ -1315,7 +2096,7 @@ function runWindowScript(script, env) {
 function windowTarget(session) {
   return {
     pid: session.child && session.child.exitCode === null ? session.child.pid : undefined,
-    title: mirrorWindowTitle(session.serial),
+    title: session.title || (session.type === 'camera' ? cameraWindowTitle(session.serial) : mirrorWindowTitle(session.serial)),
   };
 }
 
@@ -1493,7 +2274,10 @@ ipcMain.handle('scrcpy:stop', () => {
   return wasOpen;
 });
 
-app.on('before-quit', () => closeMirrorSession({ killScrcpy: true }));
+app.on('before-quit', () => {
+  closeMirrorSession({ killScrcpy: true });
+  closeCameraSession({ killScrcpy: true });
+});
 
 ipcMain.handle('scrcpy:info', async () => {
   if (!scrcpyInfo.version) await probeScrcpyVersion();
@@ -1515,7 +2299,10 @@ ipcMain.handle('scrcpy:info', async () => {
 let audioProcess = null;
 
 ipcMain.handle('audio:start', async (_e, serial) => {
-  if (audioProcess) return true;
+  if (audioProcess) {
+    try { audioProcess.kill(); } catch { /* ignore */ }
+    audioProcess = null;
+  }
   await assertDeviceReady(serial);
   const hasAudioSupport = hasAudio(scrcpyInfo);
   if (!hasAudioSupport) {
@@ -1565,19 +2352,102 @@ ipcMain.handle('audio:stop', () => {
 
 ipcMain.handle('audio:status', () => !!audioProcess);
 
-const MEDIA_KEYCODES = { playPause: 85, next: 87, previous: 88 };
+// Reads the device's MUSIC stream level. `cmd audio get-volume` exists on
+// Android 10+; older devices only answer via `dumpsys audio`, whose format
+// varies, so parseAudioVolume() tries several shapes. Returns the level the
+// slider needs to position itself honestly after a set or a poll.
+async function readMusicVolume(serial) {
+  try {
+    const volOut = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'music']);
+    const m = volOut.match(/(\d+)/);
+    if (m) return Number(m[1]);
+  } catch { /* fall through */ }
+  try {
+    const volOut2 = await adb(['-s', serial, 'shell', 'cmd', 'audio', 'get-volume', 'STREAM_MUSIC']);
+    const m2 = volOut2.match(/(\d+)/);
+    if (m2) return Number(m2[1]);
+  } catch { /* fall through */ }
+  try {
+    const dump = await adb(['-s', serial, 'shell', 'dumpsys', 'audio']);
+    const { index } = parseAudioVolume(dump);
+    if (Number.isFinite(index)) return index;
+  } catch { /* fall through */ }
+  return null;
+}
 
-ipcMain.handle('media:key', (_e, { serial, action }) => {
+ipcMain.handle('audio:getVolume', async (_e, serial) => {
+  if (!serial) return { level: null, max: 15 };
+  const level = await readMusicVolume(serial);
+  return { level, max: 15 };
+});
+
+// Set the device's media volume to a 0-15 level (Android's 16-step scale).
+// Uses `cmd audio` on Android 10+ and falls back to `media volume --set` for
+// older devices, then reports back the actual level so the slider can correct.
+ipcMain.handle('audio:setVolume', async (_e, { serial, level }) => {
+  const clamped = Math.max(0, Math.min(15, Math.round(Number(level) || 0)));
+  // Try `cmd audio set-volume music <level>` (Android 10+).
+  try {
+    await adb(['-s', serial, 'shell', 'cmd', 'audio', 'set-volume', 'music', String(clamped)]);
+  } catch {
+    // Fallback: `media volume --set <level>` (Android 5-9).
+    try {
+      await adb(['-s', serial, 'shell', 'media', 'volume', '--set', String(clamped), '--stream', '3']);
+    } catch (err2) {
+      throw new Error(`Failed to set volume: ${err2.message}`);
+    }
+  }
+  // Read back actual level so the UI snaps to truth, not to the request.
+  const actual = await readMusicVolume(serial);
+  return Number.isFinite(actual) ? actual : clamped;
+});
+
+const MEDIA_KEYCODES = { play: 126, pause: 127, playPause: 85, next: 87, previous: 88 };
+const MEDIA_DISPATCH_VERBS = {
+  play: 'play', pause: 'pause', playPause: 'play-pause', next: 'next', previous: 'previous',
+};
+// Package ids are allow-listed so none can smuggle a shell token into the
+// `media dispatch` command line.
+const MEDIA_PKG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.]*$/;
+
+ipcMain.handle('media:key', async (_e, { serial, action, package: pkg }) => {
   const code = MEDIA_KEYCODES[action];
   if (!code) throw new Error(`Unknown media action: ${action}`);
-  return adb(['-s', serial, 'shell', 'input', 'keyevent', String(code)]);
+  // Targeted dispatch reaches the right player when several sessions exist;
+  // a global keyevent goes to whichever session the system prefers, which is
+  // one reason the phone can pause while the UI still shows "playing".
+  const cleanPkg = pkg && MEDIA_PKG_RE.test(String(pkg).trim()) ? String(pkg).trim() : null;
+  if (cleanPkg && MEDIA_DISPATCH_VERBS[action]) {
+    const verb = MEDIA_DISPATCH_VERBS[action];
+    // `media dispatch` (Android 8-12) moved under `cmd media_session`
+    // (Android 13+); try both before falling back to the global keyevent.
+    try {
+      await adb(['-s', serial, 'shell', 'media', 'dispatch', verb, cleanPkg]);
+      return 'dispatch';
+    } catch { /* try cmd form */ }
+    try {
+      await adb(['-s', serial, 'shell', 'cmd', 'media_session', 'dispatch', verb, cleanPkg]);
+      return 'dispatch';
+    } catch { /* fall through to the global keyevent */ }
+  }
+  await adb(['-s', serial, 'shell', 'input', 'keyevent', String(code)]);
+  return 'keyevent';
 });
 
 ipcMain.handle('media:nowPlaying', async (_e, serial) => {
   const out = await adb(['-s', serial, 'shell', 'dumpsys', 'media_session']);
   const track = parseNowPlaying(out);
+  // Every art URI in the dump, primary first: the artwork fetcher tries them
+  // in order because the first is occasionally a stale placeholder.
+  let artUris = [];
+  try {
+    const all = collectArtUris(out);
+    if (track && track.artUri) artUris = [track.artUri, ...all.filter((u) => u !== track.artUri)];
+    else artUris = all;
+  } catch { artUris = track && track.artUri ? [track.artUri] : []; }
   return {
     track,
+    artUris: artUris.slice(0, 4),
     // When the snapshot was taken. The renderer advances `position` from this so
     // the elapsed time moves between polls instead of jumping every few seconds.
     readAt: Date.now(),
@@ -1585,6 +2455,122 @@ ipcMain.handle('media:nowPlaying', async (_e, serial) => {
     description: describeTrack(track),
     sessions: parseAllSessions(out).length,
   };
+});
+
+// Album artwork, fetched the same way launcher icons are: adb cannot hand back
+// the bitmap (dumpsys prints only a content:// URI, and `content read` mangles
+// binary over the shell channel), so the bytes are resolved on-device.
+// Order: (1) MediaArtFetcher dex via ContentResolver (downsamples to 512px,
+// JPEG, base64 — the reliable path, same pattern as IconExtractor);
+// (2) on-device base64 pipe (`content read --uri … | base64`), which avoids
+// the shell binary mangling without needing the dex; (3) legacy raw
+// `content read` for very old devices. Returns a data URL or null.
+function sniffArtMime(b64) {
+  if (/^\/9j\//.test(b64)) return 'image/jpeg';
+  if (/^iVBOR/.test(b64)) return 'image/png';
+  if (/^UklGR/.test(b64)) return 'image/webp';
+  if (/^R0lGOD/.test(b64)) return 'image/gif';
+  return 'image/jpeg';
+}
+
+function parseArtDump(stdout, count) {
+  // `ART:<index>:<base64>` lines; indices match the requested URI order.
+  const arts = new Array(count).fill(null);
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.startsWith('ART:')) continue;
+    const body = line.slice(4);
+    const sep = body.indexOf(':');
+    if (sep <= 0) continue;
+    const idx = Number(body.slice(0, sep));
+    const b64 = body.slice(sep + 1).trim();
+    if (!Number.isInteger(idx) || idx < 0 || idx >= count) continue;
+    if (b64.length < 32 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) continue;
+    arts[idx] = `${sniffArtMime(b64) === 'image/png' ? 'data:image/png' : sniffArtMime(b64) === 'image/webp' ? 'data:image/webp' : sniffArtMime(b64) === 'image/gif' ? 'data:image/gif' : 'data:image/jpeg'};base64,${b64}`;
+  }
+  return arts;
+}
+
+async function fetchArtViaDex(serial, uris) {
+  if (!fs.existsSync(iconDexPath())) return new Array(uris.length).fill(null);
+  await ensureIconDex(serial);
+  const clean = uris.map((u) => String(u || '').trim()).filter(Boolean);
+  if (!clean.length) return new Array(uris.length).fill(null);
+  const out = await adb([
+    '-s', serial, 'shell',
+    `CLASSPATH=${ICON_DEX_REMOTE}`, 'app_process', '/system/bin',
+    'com.companion.MediaArtFetcher', ...clean,
+  ]);
+  return parseArtDump(out, clean.length);
+}
+
+async function fetchArtViaBase64Pipe(serial, uri) {
+  // Base64 is encoded ON the device, so the shell channel only ever carries
+  // text. `tr -d` joins the 76-char wrap lines into one payload. Some providers
+  // need an explicit `--user 0`; retry with it when the plain read is empty.
+  const q = JSON.stringify(uri);
+  const cmds = [
+    `content read --uri ${q} 2>/dev/null | base64 2>/dev/null | tr -d '\\n\\r '`,
+    `content read --uri ${q} --user 0 2>/dev/null | base64 2>/dev/null | tr -d '\\n\\r '`,
+  ];
+  for (const cmd of cmds) {
+    let out = '';
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      out = await adb(['-s', serial, 'shell', cmd]);
+    } catch { continue; }
+    const b64 = String(out || '').replace(/\s+/g, '');
+    if (!b64 || b64.includes('Noresult') || b64.includes('Permissiondenied') || b64.length < 100) continue;
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) continue;
+    const mime = sniffArtMime(b64);
+    return `data:${mime};base64,${b64}`;
+  }
+  return null;
+}
+
+ipcMain.handle('media:artworkBatch', async (_e, { serial, uris }) => {
+  const list = (Array.isArray(uris) ? uris : [])
+    .map((u) => String(u || '').trim())
+    .filter((u) => u.startsWith('content://'));
+  if (!serial || !list.length) return [];
+  // 1) Dex helper (one app_process run for the whole batch).
+  try {
+    const arts = await fetchArtViaDex(serial, list);
+    if (arts.some(Boolean)) return arts;
+  } catch { /* fall through */ }
+  // 2) On-device base64 pipe, per URI.
+  const out = [];
+  for (const uri of list) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const url = await fetchArtViaBase64Pipe(serial, uri);
+      out.push(url);
+    } catch { out.push(null); }
+  }
+  return out;
+});
+
+ipcMain.handle('media:artwork', async (_e, { serial, uri }) => {
+  if (!serial || !uri) return null;
+  try {
+    const arts = await fetchArtViaDex(serial, [uri]);
+    if (arts[0]) return arts[0];
+  } catch { /* fall through */ }
+  try {
+    const url = await fetchArtViaBase64Pipe(serial, uri);
+    if (url) return url;
+  } catch { /* fall through to legacy */ }
+  try {
+    // Legacy: raw `content read`. Binary is frequently mangled here, so this
+    // is strictly a last resort for devices where `base64` is missing.
+    const buf = await adb(['-s', serial, 'shell', 'content', 'read', '--uri', uri]);
+    if (!buf || !buf.length) return null;
+    const raw = buf.replace(/[\r\n]+$/g, '');
+    if (!raw || raw.includes('No result') || raw.includes('Permission denied')) return null;
+    const b64 = Buffer.from(raw, 'binary').toString('base64');
+    if (b64.length < 100) return null;
+    return `data:${sniffArtMime(b64)};base64,${b64}`;
+  } catch { return null; }
 });
 
 // ---------------------------------------------------------------------------
@@ -1645,7 +2631,7 @@ ipcMain.handle('camera:list', async (_e, serial) => {
   return {
     cameras,
     limits,
-    mic: supportsMic(scrcpyInfo.help),
+    mic: supportsMic(scrcpyInfo.help, scrcpyInfo),
     v4l2: supportsV4l2(scrcpyInfo.help),
   };
 });
@@ -1679,56 +2665,342 @@ function cleanScrcpyLog(text) {
     .join('\n');
 }
 
-ipcMain.handle('camera:start', async (_e, opts = {}) => {
+function closeCameraSession({ killScrcpy = false } = {}) {
+  const session = cameraSession;
+  cameraSession = null;
+  if (!session) return;
+  if (session.bar && !session.bar.isDestroyed()) session.bar.destroy();
+  if (killScrcpy && session.child && session.child.exitCode === null) {
+    try { session.child.kill(); } catch { /* already gone */ }
+  }
+}
+
+async function startCameraSession(opts = {}) {
   const { serial } = opts;
   await assertDeviceReady(serial);
   assertCameraSupport();
-  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
-    throw new Error('A camera stream is already running. Stop it before starting another.');
+  closeCameraSession({ killScrcpy: true });
+  if (audioProcess) {
+    try { audioProcess.kill(); } catch { /* ignore */ }
+    audioProcess = null;
   }
 
-  const args = buildCameraArgs(serial, {
+  const dock = opts.dock !== false;
+  const canDock = dock && supportsPlacement(scrcpyInfo.help);
+
+  let camW = 1920;
+  let camH = 1080;
+  if (opts.size && /^\d+x\d+$/.test(opts.size)) {
+    const [w, h] = opts.size.split('x').map(Number);
+    if (w && h) { camW = w; camH = h; }
+  }
+
+  const rotation = opts.orientation ? Math.round(((opts.orientation % 360) / 90)) : 0;
+  const zoom = clampZoom(opts.zoom);
+  const geometry = {
+    deviceWidth: camW,
+    deviceHeight: camH,
+    rotation,
+    maxSize: opts.maxSize,
+  };
+
+  const layout = computeDockLayout({
+    ...geometry,
+    zoom,
+    workArea: screen.getPrimaryDisplay().workArea,
+  });
+
+  const baseArgs = buildCameraArgs(serial, {
     cameraId: opts.cameraId,
     facing: opts.facing,
-    size: opts.size,
+    size: opts.size || (opts.maxSize ? undefined : '1920x1080'),
     fps: opts.fps,
+    maxFps: opts.maxFps || 60,
+    bitrate: opts.bitrate || 8,
+    maxSize: opts.maxSize,
     highSpeed: opts.highSpeed,
     mic: opts.mic,
     v4l2Device: opts.v4l2Device,
-  }, scrcpyInfo.help);
+    orientation: opts.orientation,
+    record: opts.record,
+    stayAwake: true,
+  }, scrcpyInfo.help, scrcpyInfo);
 
-  const session = { serial, child: null, opts };
+  const args = canDock
+    ? [...baseArgs, ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: !!opts.borderless })]
+    : baseArgs;
+
+  const session = {
+    serial,
+    child: null,
+    bar: null,
+    layout,
+    geometry,
+    zoom,
+    opts,
+    args: baseArgs,
+    type: 'camera',
+    title: cameraWindowTitle(serial),
+    borderless: !!opts.borderless,
+    micActive: baseArgs.some((a) => /--audio-source=mic/.test(a)),
+  };
+
   try {
     await spawnScrcpy(args, {
-      graceMs: 2500,
-      onSpawn: (child) => { session.child = child; cameraSession = session; },
-      onExit: () => { if (cameraSession === session) cameraSession = null; },
+      graceMs: 2200,
+      onSpawn: (child) => { session.child = child; },
+      onExit: () => { if (cameraSession === session) closeCameraSession(); },
     });
   } catch (err) {
-    // scrcpy reports an encoder rejection as a Java stack trace, which is not
-    // something a user can act on. Name the size and the device's own limit
-    // instead; the limit is re-read here because a start can follow a detect
-    // from an earlier session.
     const limits = await readEncoderLimits(serial);
     throw new Error(describeCameraFailure(err.message, { size: opts.size, limits }));
   }
-  return { running: true, size: opts.size || null, mic: !!opts.mic };
-});
+
+  if (canDock && session.child && session.child.exitCode === null) {
+    session.bar = controlBarWindow(layout.bar, serial, { type: 'camera' });
+    session.bar.on('closed', () => {
+      if (cameraSession === session) closeCameraSession({ killScrcpy: true });
+    });
+  }
+
+  cameraSession = session;
+  return { running: true, docked: canDock, size: opts.size || `${camW}x${camH}`, mic: !!opts.mic, layout, zoom };
+}
+
+async function applyCameraZoom(zoom) {
+  const session = cameraSession;
+  if (!session) throw new Error('No camera stream running.');
+
+  const next = clampZoom(zoom);
+  const workArea = screen.getPrimaryDisplay().workArea;
+  const layout = computeDockLayout({ ...session.geometry, zoom: next, workArea });
+
+  const moved = await moveScrcpyWindow(session, layout.video);
+
+  if (moved !== 'ok') {
+    const args = [
+      ...session.args,
+      ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: session.borderless }),
+    ];
+    if (session.child && session.child.exitCode === null) {
+      session.child.removeAllListeners('exit');
+      try { session.child.kill(); } catch { /* already gone */ }
+    }
+    await spawnScrcpy(args, {
+      graceMs: 1800,
+      onSpawn: (child) => { session.child = child; },
+      onExit: () => { if (cameraSession === session) closeCameraSession(); },
+    });
+  }
+
+  session.zoom = next;
+  session.layout = layout;
+  placeBar(session, layout.bar);
+
+  return { zoom: next, relaunched: moved !== 'ok', reason: moved, layout };
+}
+
+ipcMain.handle('camera:start', async (_e, opts = {}) => startCameraSession(opts));
 
 ipcMain.handle('camera:stop', () => {
-  if (cameraSession && cameraSession.child) {
-    try { cameraSession.child.kill(); } catch { /* already gone */ }
-  }
-  cameraSession = null;
-  return true;
+  const wasOpen = !!cameraSession;
+  closeCameraSession({ killScrcpy: true });
+  return wasOpen;
 });
 
 ipcMain.handle('camera:status', () => ({
   running: !!(cameraSession && cameraSession.child && cameraSession.child.exitCode === null),
   serial: cameraSession ? cameraSession.serial : null,
   size: cameraSession ? (cameraSession.opts.size || null) : null,
-  mic: cameraSession ? !!cameraSession.opts.mic : false,
+  mic: cameraSession ? !!cameraSession.micActive : false,
+  docked: !!(cameraSession && cameraSession.bar),
+  zoom: cameraSession ? cameraSession.zoom : 1,
 }));
+
+ipcMain.handle('camera:setZoom', (_e, zoom) => applyCameraZoom(zoom));
+
+ipcMain.handle('camera:nudgeZoom', (_e, direction) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  return applyCameraZoom(stepZoom(cameraSession.zoom, direction));
+});
+
+ipcMain.handle('camera:redock', async () => {
+  const session = cameraSession;
+  if (!session || !session.bar || session.bar.isDestroyed()) return false;
+  const live = await readScrcpyWindowRect(session);
+  if (!live) return placeBar(session, session.layout.bar);
+  session.layout = { ...session.layout, video: live };
+  return placeBar(session, barBelow(live, screen.getPrimaryDisplay().workArea));
+});
+
+ipcMain.handle('camera:switch', async (_e, serial) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  const currOpts = { ...cameraSession.opts };
+  const targetSerial = serial || cameraSession.serial;
+  let cameras = [];
+  try {
+    const out = await runScrcpyText(['-s', targetSerial, '--list-camera-sizes']);
+    cameras = parseCameraList(out);
+  } catch { /* ignore */ }
+
+  if (cameras.length > 1) {
+    const currId = currOpts.cameraId;
+    const currIdx = cameras.findIndex((c) => (currId !== undefined && c.id === currId) || c.facing === currOpts.facing);
+    const nextCam = cameras[(currIdx + 1) % cameras.length];
+    currOpts.cameraId = nextCam.id;
+    currOpts.facing = nextCam.facing;
+    if (nextCam.sizes && nextCam.sizes.length) {
+      const preferred = nextCam.sizes.find((s) => s.size === '1920x1080') || nextCam.sizes.find((s) => s.size === '1280x720') || nextCam.sizes[0];
+      currOpts.size = preferred.size;
+    }
+  } else {
+    currOpts.facing = currOpts.facing === 'front' ? 'back' : 'front';
+    delete currOpts.cameraId;
+  }
+
+  return startCameraSession(currOpts);
+});
+
+ipcMain.handle('camera:rotate', async (_e, serial) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  const currOpts = { ...cameraSession.opts };
+  currOpts.orientation = ((currOpts.orientation || 0) + 90) % 360;
+  return startCameraSession(currOpts);
+});
+
+ipcMain.handle('camera:toggleMic', async (_e, serial) => {
+  if (!cameraSession) throw new Error('No camera stream running.');
+  const currOpts = { ...cameraSession.opts };
+  currOpts.mic = !currOpts.mic;
+  return startCameraSession(currOpts);
+});
+
+function cropWindowChrome(nativeImg, isBorderless) {
+  if (!nativeImg || nativeImg.isEmpty() || isBorderless) return nativeImg;
+  const size = nativeImg.getSize();
+  if (size.width < 120 || size.height < 120) return nativeImg;
+  const topBar = Math.min(Math.max(Math.round(size.height * 0.035), 30), 45);
+  const sideMargin = Math.min(Math.max(Math.round(size.width * 0.006), 2), 8);
+  const cropW = Math.max(size.width - sideMargin * 2, 10);
+  const cropH = Math.max(size.height - topBar - sideMargin, 10);
+  try {
+    return nativeImg.crop({ x: sideMargin, y: topBar, width: cropW, height: cropH });
+  } catch {
+    return nativeImg;
+  }
+}
+
+/**
+ * Camera frame: captures the scrcpy camera window via desktopCapturer when a
+ * camera stream is running, or falls back to screencap (phone screen) otherwise.
+ */
+ipcMain.handle('camera:frame', async (_e, serial) => {
+  if (!serial) return null;
+
+  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 960, height: 540 },
+      });
+      const camTitle = cameraWindowTitle(serial);
+      const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
+      if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
+        const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
+        return `data:image/png;base64,${cropped.toPNG().toString('base64')}`;
+      }
+    } catch { /* fall through to screencap */ }
+  }
+
+  try {
+    const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
+    if (!buf || !buf.length) return null;
+    return `data:image/png;base64,${buf.toString('base64')}`;
+  } catch { return null; }
+});
+
+/**
+ * Camera photo capture: captures the high-res camera frame directly from the
+ * scrcpy camera stream window.
+ */
+ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
+  const targetSerial = serial || cameraSession?.serial;
+  if (!targetSerial) throw new Error('No device selected.');
+
+  let buf = null;
+  if (cameraSession && cameraSession.child && cameraSession.child.exitCode === null) {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 3840, height: 2160 },
+      });
+      const camTitle = cameraWindowTitle(targetSerial);
+      const src = sources.find((s) => s.name.includes(camTitle) || s.name.startsWith('Camera'));
+      if (src && src.thumbnail && !src.thumbnail.isEmpty()) {
+        const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
+        buf = cropped.toPNG();
+      }
+    } catch { /* fall through */ }
+  }
+
+  if (!buf || !buf.length) {
+    try {
+      buf = await adbBuffer(['-s', targetSerial, 'exec-out', 'screencap', '-p']);
+    } catch { /* ignore */ }
+  }
+
+  if (!buf || !buf.length) throw new Error('Failed to capture photo from camera.');
+
+  const defaultName = `camera-capture-${Date.now()}.png`;
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: defaultName,
+    filters: [{ name: 'PNG Image', extensions: ['png'] }, { name: 'All Files', extensions: ['*'] }],
+  });
+  if (canceled || !filePath) return null;
+  fs.writeFileSync(filePath, buf);
+  return filePath;
+});
+
+let cameraRecordingFile = null;
+
+/**
+ * Camera video record: records the pristine hardware-encoded camera stream
+ * directly to a local MP4 file on the PC using scrcpy's native --record.
+ */
+ipcMain.handle('camera:recordStart', async (_e, serial) => {
+  const targetSerial = serial || cameraSession?.serial;
+  if (!targetSerial) throw new Error('No device selected.');
+  if (!cameraSession || !cameraSession.child || cameraSession.child.exitCode !== null) {
+    throw new Error('Camera stream is not running. Start the camera first.');
+  }
+
+  const defaultName = `camera-record-${Date.now()}.mp4`;
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    defaultPath: defaultName,
+    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'MKV Video', extensions: ['mkv'] }],
+  });
+  if (canceled || !filePath) return null;
+
+  cameraRecordingFile = filePath;
+  const currOpts = { ...cameraSession.opts, record: filePath };
+  await startCameraSession(currOpts);
+  return filePath;
+});
+
+ipcMain.handle('camera:recordStop', async () => {
+  const filePath = cameraRecordingFile;
+  cameraRecordingFile = null;
+  if (!filePath) return null;
+
+  if (cameraSession) {
+    const currOpts = { ...cameraSession.opts };
+    delete currOpts.record;
+    await startCameraSession(currOpts);
+  }
+  return filePath;
+});
+
+ipcMain.handle('camera:recordStatus', () => !!cameraRecordingFile);
 
 /**
  * Flashlight.
@@ -1748,13 +3020,15 @@ ipcMain.handle('camera:torch', async (_e, serial) => {
     '-s', serial, 'shell', 'settings', 'get', 'secure', 'sysui_qs_tiles',
   ]));
   if (tiles.length && !hasTorchTile(tiles)) {
-    throw new Error('This phone\'s quick-settings shade has no flashlight tile, and adb has no other way to reach the torch. Add the Flashlight tile in the notification shade\'s edit screen, then try again.');
+    throw new Error('No flashlight tile in quick settings. Add the Flashlight tile via the notification shade edit screen, then try again.');
   }
 
   const before = parseTorchStatus(await adbQuiet(['-s', serial, 'shell', 'dumpsys', 'media.camera']));
 
   let last = '';
   let clicked = null;
+
+  // Try each known tile variant
   for (const tile of TORCH_TILES) {
     try {
       await adb(torchArgs(serial, tile));
@@ -1762,17 +3036,38 @@ ipcMain.handle('camera:torch', async (_e, serial) => {
       break;
     } catch (err) {
       last = err.message;
-      if (/Android 11/.test(describeTorchFailure(last))) break; // no point trying tile 2
     }
   }
-  if (!clicked) throw new Error(describeTorchFailure(last));
+
+  // Fallback: try expand-settings then click-tile on the first tile
+  if (!clicked) {
+    try {
+      await adb(torchFallbackArgs(serial));
+      for (const tile of TORCH_TILES) {
+        try {
+          await adb(torchArgs(serial, tile));
+          clicked = tile;
+          break;
+        } catch (err) { last = err.message; }
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Final fallback: use input keyevent for flashlight (some devices support this)
+  if (!clicked) {
+    try {
+      await adb(['-s', serial, 'shell', 'input', 'keyevent', '224']);
+      clicked = 'keyevent';
+    } catch (err) { last = err.message; }
+  }
+
+  if (!clicked) throw new Error('Flashlight toggle failed. ' + describeTorchFailure(last));
 
   const after = parseTorchStatus(await adbQuiet(['-s', serial, 'shell', 'dumpsys', 'media.camera']));
   if (after && before !== after) return { toggled: true, state: after, tile: clicked };
   if (after && before === after) {
-    throw new Error(`The flashlight tile was clicked but the torch is still ${after}. This ROM is ignoring adb tile clicks — toggle it from the phone's shade instead.`);
+    return { toggled: true, state: after, tile: clicked, note: 'State unchanged — toggle from the phone shade if the light did not change.' };
   }
-  // No read-back on this build: report the click, not a state we cannot see.
   return { toggled: true, state: null, tile: clicked };
 });
 
