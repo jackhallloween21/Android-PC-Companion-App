@@ -1,11 +1,20 @@
 name: Build Windows EXE
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g. 1.2.3). Falls back to release tag or package.json version.'
+        required: false
+        default: ''
+  release:
+    types: [published] # Triggers automatically when a release is created/published
+
+# Upstream virtual-camera source (tshino/softcam). Pin SOFTCAM_REF to a specific
+# commit SHA once a green build is confirmed so releases stay reproducible.
+env:
+  SOFTCAM_REPO: tshino/softcam
+  SOFTCAM_REF: main
 
 jobs:
   build:
@@ -19,12 +28,167 @@ jobs:
         with:
           node-version: 20
 
+      # Resolve the version: release tag > manual input > package.json
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = '${{ github.event.release.tag_name }}'
+          if (-not $version) { $version = '${{ inputs.version }}' }
+          $version = $version.Trim().TrimStart('v')
+          if (-not $version) {
+            $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          }
+          Write-Host "Building version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # Update package.json + package-lock.json so the exe/installer
+      # carries the release version instead of the stale repo version.
+      - name: Bump version
+        shell: pwsh
+        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
+
+      # =====================================================================
+      # Native virtual-camera binaries (x64). Built on the runner so no local
+      # VS2022 machine is required. Outputs are staged into assets/softcam/
+      # before electron-builder packages the app; asarUnpack (assets/**) keeps
+      # them as real on-disk files that external processes can execute.
+      # =====================================================================
+      - name: Checkout softcam (virtual camera source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOFTCAM_REPO }}
+          ref: ${{ env.SOFTCAM_REF }}
+          path: softcam
+          submodules: recursive
+
+      - name: Locate MSVC (vcvars64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found at $vswhere" }
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) { throw "No VS install with the C++ x64 toolset found." }
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          Write-Host "vcvars64: $vcvars"
+          "VCVARS=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # softcam.dll (the DirectShow filter + Sender API) and softcam_installer.exe
+      # (registers the filter under elevation). If a specific softcam commit fails
+      # to compile on missing standard headers, add the include(s) in a patch step
+      # here before this one -- that is the "two include fixes" hook.
+      - name: Build softcam.dll + softcam_installer.exe (Release x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $vcvars = $env:VCVARS
+          Write-Host "Solutions under softcam/:"
+          Get-ChildItem softcam -Recurse -Filter *.sln | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          function Build-Sln([string]$proj) {
+            Write-Host "== msbuild $proj =="
+            cmd /c "`"$vcvars`" && msbuild `"$proj`" /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo"
+            if ($LASTEXITCODE -ne 0) { throw "msbuild failed for $proj (exit $LASTEXITCODE)" }
+          }
+
+          # Main solution -> softcam.dll (+ dist/inc/softcam.h, dist/lib/x64/softcam.lib)
+          $mainSln = Join-Path $PWD 'softcam\softcam.sln'
+          if (-not (Test-Path $mainSln)) {
+            $mainSln = (Get-ChildItem softcam -Recurse -Filter *.sln |
+                        Where-Object { $_.Name -notmatch 'vs2019|sender|installer' } |
+                        Select-Object -First 1).FullName
+          }
+          if (-not $mainSln) { throw "Could not find the softcam solution." }
+          Build-Sln $mainSln
+
+          # softcam_installer.exe: produced by the main sln, or a separate example sln.
+          $installer = Get-ChildItem softcam -Recurse -Filter softcam_installer.exe -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+          if (-not $installer) {
+            $instSln = Get-ChildItem softcam -Recurse -Filter *.sln |
+                       Where-Object { $_.FullName -match 'installer' } | Select-Object -First 1
+            if (-not $instSln) { throw "No softcam_installer solution found." }
+            Build-Sln $instSln.FullName
+          }
+
+      - name: Build softcam-bridge.exe (Release x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $vcvars = $env:VCVARS
+
+          $hdr = Get-ChildItem softcam -Recurse -Filter softcam.h |
+                 Sort-Object { $_.FullName -notmatch 'dist|inc|include' } | Select-Object -First 1
+          if (-not $hdr) { throw "softcam.h not found - did the DLL build succeed?" }
+          $inc = $hdr.Directory.FullName
+
+          $lib = Get-ChildItem softcam -Recurse -Filter softcam.lib |
+                 Where-Object { $_.FullName -match '(x64|X64)' } |
+                 Sort-Object { $_.FullName -notmatch 'dist' }, { $_.FullName -notmatch 'Release' } |
+                 Select-Object -First 1
+          if (-not $lib) { throw "softcam.lib (x64) not found - did the DLL build succeed?" }
+
+          Write-Host "softcam.h dir : $inc"
+          Write-Host "softcam.lib   : $($lib.FullName)"
+
+          $bat = Join-Path $PWD 'native\softcam-bridge\build.bat'
+          cmd /c "`"$vcvars`" && `"$bat`" `"$inc`" `"$($lib.FullName)`""
+          if ($LASTEXITCODE -ne 0) { throw "bridge build failed (exit $LASTEXITCODE)" }
+
+      - name: Stage native binaries into assets/softcam/
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $PWD 'assets\softcam'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          $dll = Get-ChildItem softcam -Recurse -Filter softcam.dll |
+                 Where-Object { $_.FullName -match '(x64|X64)' } |
+                 Sort-Object { $_.FullName -notmatch 'dist' }, { $_.FullName -notmatch 'Release' } |
+                 Select-Object -First 1
+          $inst = Get-ChildItem softcam -Recurse -Filter softcam_installer.exe |
+                  Sort-Object { $_.FullName -notmatch 'Release' } | Select-Object -First 1
+          $bridge = Join-Path $PWD 'native\softcam-bridge\softcam-bridge.exe'
+
+          if (-not $dll)  { throw "softcam.dll not found after build." }
+          if (-not $inst) { throw "softcam_installer.exe not found after build." }
+          if (-not (Test-Path $bridge)) { throw "softcam-bridge.exe not found after build." }
+
+          Copy-Item $dll.FullName  (Join-Path $dest 'softcam.dll') -Force
+          Copy-Item $inst.FullName (Join-Path $dest 'softcam_installer.exe') -Force
+          Copy-Item $bridge        (Join-Path $dest 'softcam-bridge.exe') -Force
+
+          Write-Host "Staged into assets/softcam/:"
+          Get-ChildItem $dest -File | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length) bytes" }
+
+      - name: Upload native binaries (softcam)
+        uses: actions/upload-artifact@v4
+        with:
+          name: softcam-native-x64
+          path: assets/softcam/*
+
+      # =====================================================================
+      # Electron package (bundles assets/softcam/ produced above)
+      # =====================================================================
       - run: npm ci
       - run: npm run dist
         env:
           CI: false
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Unzipped EXE (Artifact Test)
+        uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: dist/*.exe
+          path: dist/*.exe # Uploads raw .exe file directly
+
+      - name: Attach EXE to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe # Attaches raw unzipped .exe to release assets
