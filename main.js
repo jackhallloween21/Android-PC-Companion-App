@@ -3704,8 +3704,8 @@ ipcMain.handle('webcam:register', async () => {
   // The installer writes the DLL path to the registry and needs elevation.
   // PowerShell Start-Process -Verb RunAs raises the UAC prompt; -Wait blocks
   // until the user answers, so a declined prompt surfaces as a failed install
-  // rather than a silent no-op.
-  const ps = 'Start-Process -FilePath $env:APC_INSTALLER -ArgumentList $env:APC_DLL -Verb RunAs -Wait; exit $LASTEXITCODE';
+  // rather than a silent no-op. The installer usage is `register <dll>`.
+  const ps = 'Start-Process -FilePath $env:APC_INSTALLER -ArgumentList @("register",$env:APC_DLL) -Verb RunAs -Wait; exit $LASTEXITCODE';
   await new Promise((resolve, reject) => {
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
       windowsHide: true,
