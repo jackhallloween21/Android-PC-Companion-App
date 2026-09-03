@@ -53,6 +53,7 @@ Full-featured file manager for your device storage:
 - **Torch control** with multi-tile flash support
 - **Audio forwarding** + media transport controls (play/pause/next/prev)
 - Now-playing display with track info
+- **Use the phone as a PC webcam** — via OBS Virtual Camera (Windows/macOS) or v4l2 loopback (Linux); see [🎥 Use Your Phone as a Webcam](#-use-your-phone-as-a-webcam) below
 
 ### 🔋 Hardware & Power
 Fuller battery + device-spec readout — health, temperature, cycle count (where the kernel exposes it), voltage, and SoC details.
@@ -158,6 +159,33 @@ Each release ships a Windows installer (`Companion Setup x.x.x.exe`). Just run i
 ![Windows Start Menu](Screenshots/23-windows-start-menu.png)
 
 *Companion appears under "Recently added" right after installing `Companion Setup x.x.x.exe`.*
+
+---
+
+## 🎥 Use Your Phone as a Webcam
+
+The Multimedia tab streams any phone camera to your PC. To make other apps (Zoom, Meet, Teams, Discord) see it as a webcam, bridge it through a virtual-camera driver. The Camera tab's bridge status tells you which route applies on your machine.
+
+### Windows / macOS — via OBS Studio
+
+Windows has no built-in virtual camera, so the route is [OBS Studio](https://obsproject.com/) (free, signed driver — the app detects it and reports *"OBS Virtual Camera available"*).
+
+1. Connect your phone, open the **Multimedia** tab, pick a lens/resolution and press **Start** — a window titled `Camera — <serial>` appears. Keep it open.
+2. Open OBS → **Sources** → **+** → **Window Capture** → select the `Camera — <serial>` window (crop/fit with right-click → *Transform* if needed).
+3. In OBS → **Controls** (bottom-right) → **Start Virtual Camera**. First run may ask for admin to register the driver — one time only.
+4. In Zoom/Meet/Teams/Discord, pick **OBS Virtual Camera** as the camera. If it doesn't appear, restart that app after step 3.
+
+Keep OBS running while you use the camera elsewhere, and stop the stream in Companion when you're done.
+
+### Linux — direct via v4l2 loopback (no OBS needed)
+
+```bash
+sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Camera"
+```
+
+Reopen the Camera tab — it will report *v4l2 loopback ready* with the device (e.g. `/dev/video2`). Start the stream and pick **Phone Camera** as the camera in any app. (Needs a scrcpy build with `--v4l2-sink` — distro packages have it; the tab warns you otherwise.)
+
+> **Mic:** the camera tab's mic toggle forwards the phone mic into the stream audio (heard on PC speakers). The OBS route above carries video — for calls, pair it with your usual microphone, or use OBS's audio monitoring to route it.
 
 ---
 
@@ -269,7 +297,7 @@ Honest engineering notes — real functionality, best-effort data sources:
 - **Battery cycle count** reads `/sys/class/power_supply/battery/cycle_count`, missing on some kernels → shows "N/A", not a fake number
 - **Console command parsing** splits on whitespace — quoted args with spaces won't parse; it's for one-liners, not a full shell
 - **Fastboot flashing** will brick a device given the wrong image — that's why the confirmation dialog exists
-- **Camera feed** displays in-app; registering it as a system webcam (Zoom/Discord/OBS) would require a signed virtual-camera driver per OS — not implemented
+- **Camera feed** displays in-app, with a bridge-status row that routes it to other apps: OBS Virtual Camera on Windows/macOS, direct v4l2 loopback on Linux — see [🎥 Use Your Phone as a Webcam](#-use-your-phone-as-a-webcam)
 
 ---
 
