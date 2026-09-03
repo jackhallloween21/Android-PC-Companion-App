@@ -281,10 +281,6 @@
               <span id="file-sel-count" class="muted tiny"></span>
               <button id="file-download-btn" class="primary-btn tiny" disabled>Download selected</button>
               <button id="file-upload-btn" class="ghost-btn tiny" disabled>Upload to here</button>
-              <div id="file-transfer-progress" class="transfer-progress hidden">
-                <div class="transfer-bar"><div id="file-transfer-fill" class="transfer-fill"></div></div>
-                <span id="file-transfer-label" class="muted tiny"></span>
-              </div>
             </div>
             <div id="file-list" class="mono file-list"></div>
             <div id="file-drop-overlay" class="file-drop-overlay hidden">
@@ -1066,6 +1062,54 @@
       <button id="tools-refresh-btn" class="primary-btn">Re-verify tools</button>
     </div>
   </div>
+
+  <!-- Transfer center: floating sheet for file uploads/downloads -->
+  <div id="transfer-pill" class="transfer-pill hidden" title="Show transfers">
+    <span id="transfer-pill-icon">&#11015;</span><span id="transfer-pill-text" class="mono">0%</span>
+  </div>
+  <section id="transfer-center" class="transfer-center hidden" aria-live="polite">
+    <div class="tc-grip"></div>
+    <div class="tc-head">
+      <span id="tc-icon" class="tc-icon">&#11015;</span>
+      <span id="tc-title" class="tc-title">Transferring Files</span>
+      <span id="tc-count" class="tc-count-pill">0 items</span>
+      <span class="tc-head-spacer"></span>
+      <button id="tc-stop" class="ghost-btn tiny hidden" title="Stop this transfer">Stop</button>
+      <button id="tc-collapse" class="icon-btn" title="Collapse">&#9662;</button>
+      <button id="tc-close" class="icon-btn" title="Close">&times;</button>
+    </div>
+    <div id="tc-body">
+      <div class="tc-overall-row">
+        <span id="tc-pct" class="tc-pct">0%</span><span id="tc-complete-word" class="tc-complete muted">complete</span>
+        <span class="tc-head-spacer"></span>
+        <span id="tc-eta" class="tc-eta">Calculating&hellip;</span>
+      </div>
+      <div class="transfer-bar tc-overall-bar"><div id="tc-overall-fill" class="transfer-fill"></div></div>
+      <div class="tc-meta-row">
+        <span id="tc-speed" class="tc-speed mono">&mdash;</span>
+        <span class="tc-head-spacer"></span>
+        <span id="tc-totals" class="tc-totals mono">&mdash;</span>
+      </div>
+      <div id="tc-route" class="tc-route muted"></div>
+      <div id="tc-active" class="tc-active hidden">
+        <div class="tc-active-top">
+          <span id="tc-active-idx" class="tc-active-idx">ACTIVE ITEM</span>
+          <span class="tc-head-spacer"></span>
+          <span id="tc-active-pct" class="tc-active-pct mono">0%</span>
+        </div>
+        <div class="tc-active-main">
+          <span id="tc-active-icon" class="tc-item-icon">&#128196;</span>
+          <span class="tc-active-text">
+            <span id="tc-active-name" class="tc-active-name"></span>
+            <span id="tc-active-sub" class="tc-active-sub muted"></span>
+          </span>
+        </div>
+        <div class="transfer-bar tc-item-bar"><div id="tc-active-fill" class="transfer-fill"></div></div>
+      </div>
+      <div class="tc-queue-head"><span id="tc-queue-title">Transfer Queue</span></div>
+      <div id="tc-queue" class="tc-queue"></div>
+    </div>
+  </section>
 
   <script src="renderer.js"></script>
 </body>

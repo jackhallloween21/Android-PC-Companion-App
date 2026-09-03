@@ -13,6 +13,8 @@ const {
   parseNowPlaying,
   parseAllSessions,
   describeTrack,
+  collectArtUris,
+  parseAudioVolume,
   ACTION_BITS,
 } = require('../src/media');
 
@@ -179,4 +181,43 @@ test('no duration means no progress fraction — the bar has nothing to draw', (
   assert.strictEqual(track.duration, null);
   assert.strictEqual(track.progress, null);
   assert.strictEqual(track.position, '0:28');
+});
+
+test('duration is read from namespaced metadata keys, not just bare duration=', () => {
+  const track = parseSession({
+    pkg: 'com.example.player',
+    text: 'package=com.example.player\nstate=PlaybackState {state=3, position=70000, speed=1.0, actions=0}\nmetadata: size=9, description=Song, Artist, Album\nandroid.media.metadata.DURATION=218000',
+  });
+  assert.strictEqual(track.durationMs, 218000);
+  assert.strictEqual(track.duration, '3:38');
+});
+
+test('a seconds-scale duration is normalised when the position proves it', () => {
+  const track = parseSession({
+    pkg: 'com.example.player',
+    text: 'package=com.example.player\nstate=PlaybackState {state=3, position=70000, speed=1.0, actions=0}\nmetadata: size=9, description=Song, Artist, Album\nduration=218',
+  });
+  assert.strictEqual(track.durationMs, 218000);
+});
+
+test('album-art URIs are found under vendor key spellings', () => {
+  const text = 'package=com.spotify.music\nstate=PlaybackState {state=3, position=1000, speed=1.0, actions=0}\nmetadata: size=9, description=Song, Artist, Album\nandroid.media.metadata.ALBUM_ART_URI=content://media/external/audio/albumart/42}';
+  const track = parseSession({ pkg: 'com.spotify.music', text });
+  assert.strictEqual(track.artUri, 'content://media/external/audio/albumart/42');
+  assert.deepStrictEqual(collectArtUris(text), ['content://media/external/audio/albumart/42']);
+});
+
+test('every art URI in a block is collected for ordered fallback', () => {
+  const text = 'art=content://a/1,\nALBUM_ART_URI=content://b/2}';
+  assert.deepStrictEqual(collectArtUris(text), ['content://a/1', 'content://b/2']);
+});
+
+test('dumpsys audio yields the music stream index across formats', () => {
+  assert.deepStrictEqual(
+    parseAudioVolume('STREAM_MUSIC(3): muted=false index:11(max:15)'),
+    { index: 11, max: 15 });
+  assert.deepStrictEqual(
+    parseAudioVolume('stream:3 index:9'),
+    { index: 9, max: 15 });
+  assert.deepStrictEqual(parseAudioVolume(''), { index: null, max: 15 });
 });

@@ -923,9 +923,6 @@ function updateFileToolbar() {
   const upBtn = el('file-upload-btn');
   if (dlBtn) dlBtn.disabled = count === 0;
   if (upBtn) upBtn.disabled = count === 0;
-  // count actual files (not dirs) for download
-  const fileCount = count - [...state.selectedFiles].filter((p) => p._isDir).length;
-  if (dlBtn) dlBtn.disabled = fileCount === 0;
 }
 
 qAll('#file-category-tabs .chip-tab').forEach((tab) => {
@@ -938,31 +935,354 @@ qAll('#file-category-tabs .chip-tab').forEach((tab) => {
 });
 
 el('list-files-btn').onclick = loadFiles;
+
+// ---------------------------------------------------------------------------
+// Transfer center: one floating sheet for uploads and downloads, modelled on
+// a phone-style transfer manager (overall %, ETA, speed, totals, active item,
+// per-file queue) but drawn entirely with theme variables so dark and light
+// mode both work. A single persistent listener per direction feeds it — the
+// old code registered a new ipcRenderer listener on every transfer and never
+// removed it.
+// ---------------------------------------------------------------------------
+const TransferCenter = {
+  active: false,
+  done: false,
+  cancelled: false,
+  failed: false,
+  cancelling: false,
+  transferId: null,
+  direction: 'download', // 'download' | 'upload'
+  items: [], // { name, isDir, status: queued|active|done|failed, bytes, totalBytes, percent, error }
+  from: '',
+  to: '',
+  startedAt: 0,
+  samples: [], // { t, bytes } trailing window for speed/ETA
+  collapsed: false,
+  _raf: false,
+
+  start({ direction, items, from, to }) {
+    this.active = true;
+    this.done = false;
+    this.cancelled = false;
+    this.failed = false;
+    this.cancelling = false;
+    this.transferId = `tc-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}`;
+    this.direction = direction === 'upload' ? 'upload' : 'download';
+    this.items = (Array.isArray(items) ? items : []).map((it) => ({
+      name: it && it.name ? String(it.name) : 'Preparing…',
+      isDir: !!(it && it.isDir),
+      status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '',
+    }));
+    this.from = from || '';
+    this.to = to || '';
+    this.startedAt = Date.now();
+    this.samples = [];
+    el('transfer-center').classList.remove('hidden');
+    el('transfer-pill').classList.add('hidden');
+    el('tc-icon').textContent = this.direction === 'upload' ? '⬆' : '⬇';
+    el('transfer-pill-icon').textContent = this.direction === 'upload' ? '⬆' : '⬇';
+    const stopBtn = el('tc-stop');
+    if (stopBtn) { stopBtn.classList.remove('hidden'); stopBtn.disabled = false; stopBtn.textContent = 'Stop'; }
+    this.render(true);
+  },
+
+  async stop() {
+    if (!this.active || this.done || this.cancelling) return;
+    this.cancelling = true;
+    const stopBtn = el('tc-stop');
+    if (stopBtn) { stopBtn.disabled = true; stopBtn.textContent = 'Stopping…'; }
+    try { await window.api.cancelTransfer(this.transferId); } catch { /* the in-flight call still resolves */ }
+    // The UI settles when the transfer call returns (cancelled flag); the
+    // button stays disabled until then so Stop can't double-fire.
+  },
+
+  rowFor(data) {
+    const name = data && data.name ? String(data.name) : '';
+    // Name first: main expands folders server-side, so event indexes address
+    // the expanded queue — using them blindly would rename the parent folder
+    // row to its first child. Index is only a fallback for unnamed rows.
+    if (name) {
+      const hit = this.items.find((it) => it.name === name);
+      if (hit) return hit;
+    }
+    if (Number.isInteger(data.index) && this.items[data.index]
+        && (!name || this.items[data.index].name === name || this.items[data.index].name === 'Preparing…')) {
+      return this.items[data.index];
+    }
+    const row = { name: name || 'Item', isDir: false, status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '' };
+    this.items.push(row);
+    return row;
+  },
+
+  onEvent(data) {
+    if (!this.active || this.done || !data) return;
+    const row = this.rowFor(data);
+    if (data.name && (!row.name || row.name === 'Preparing…')) row.name = String(data.name);
+    row.status = 'active';
+    if (Number.isFinite(data.bytes)) row.bytes = data.bytes;
+    if (Number.isFinite(data.totalBytes) && data.totalBytes > 0) row.totalBytes = data.totalBytes;
+    if (data.percent === 100) {
+      row.percent = 100;
+      row.status = 'done';
+      if (row.totalBytes) row.bytes = row.totalBytes;
+    } else if (typeof data.percent === 'number' && data.percent >= 0) {
+      row.percent = data.percent;
+    } else {
+      row.percent = -1; // indeterminate: working, no measurable fraction
+    }
+    const snap = this.totals();
+    const now = Date.now();
+    const last = this.samples[this.samples.length - 1];
+    if (!last || now - last.t > 250 || snap.done !== last.bytes) this.samples.push({ t: now, bytes: snap.done });
+    this.scheduleRender();
+  },
+
+  totals() {
+    let done = 0;
+    let known = 0;
+    let doneCount = 0;
+    for (const it of this.items) {
+      if (it.totalBytes > 0) { known += it.totalBytes; done += Math.min(it.bytes, it.totalBytes); }
+      if (it.status === 'done') doneCount += 1;
+    }
+    return { done, known, doneCount, total: this.items.length };
+  },
+
+  speed() {
+    const now = Date.now();
+    this.samples = this.samples.filter((s) => now - s.t < 4000);
+    if (this.samples.length < 2) return 0;
+    const first = this.samples[0];
+    const last = this.samples[this.samples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    return dt > 0.3 ? Math.max(0, (last.bytes - first.bytes) / dt) : 0;
+  },
+
+  scheduleRender() {
+    if (this._raf) return;
+    this._raf = true;
+    const paint = () => { this._raf = false; this.render(); };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(paint);
+    else setTimeout(paint, 100);
+  },
+
+  fmtEta(sec) {
+    if (!Number.isFinite(sec) || sec < 0) return 'Calculating…';
+    if (sec < 2) return 'Almost done…';
+    if (sec < 60) return `About ${Math.round(sec)}s left`;
+    const m = Math.round(sec / 60);
+    return m < 60 ? `About ${m}m left` : `About ${Math.floor(m / 60)}h ${m % 60}m left`;
+  },
+
+  activeRow() {
+    return this.items.find((it) => it.status === 'active')
+      || this.items.filter((it) => it.status === 'done').slice(-1)[0]
+      || null;
+  },
+
+  render() {
+    const doPaint = () => {
+      const snap = this.totals();
+      const sheet = el('transfer-center');
+      const hidden = sheet.classList.contains('hidden');
+      const pctText = snap.known > 0
+        ? `${Math.min(100, Math.round((snap.done / snap.known) * 100))}%`
+        : (snap.total ? `${Math.round((snap.doneCount / snap.total) * 100)}%` : '0%');
+      el('transfer-pill-text').textContent = this.done ? 'Done' : pctText;
+      if (hidden) return;
+      const isUp = this.direction === 'upload';
+      el('tc-title').textContent = this.failed ? 'Transfer failed'
+        : this.cancelled ? 'Transfer cancelled'
+        : this.done ? (isUp ? 'Upload complete' : 'Download complete')
+        : (isUp ? 'Uploading Files' : 'Downloading Files');
+      el('tc-count').textContent = `${snap.total} item${snap.total === 1 ? '' : 's'}`;
+      // Headline: percent when totals are known, else the bytes actually moved
+      // (a stuck "0%" while gigabytes flow is the worst possible feedback).
+      const movedOnly = !this.done && snap.known === 0 && snap.done > 0;
+      el('tc-pct').textContent = movedOnly ? formatSize(snap.done)
+        : (this.done && snap.doneCount === snap.total && snap.total ? '100%' : pctText);
+      el('tc-complete-word').textContent = this.cancelling ? 'cancelling…'
+        : movedOnly ? 'transferred' : 'complete';
+      const spd = this.done ? 0 : this.speed();
+      const remaining = snap.known - snap.done;
+      el('tc-eta').textContent = this.done ? (snap.doneCount === snap.total && snap.total ? 'Finished' : '')
+        : (snap.known > 0 && spd > 0 ? this.fmtEta(remaining / spd) : 'Calculating…');
+      const fill = el('tc-overall-fill');
+      if (snap.known > 0) {
+        fill.classList.remove('indet');
+        fill.style.width = `${snap.known ? Math.min(100, (snap.done / snap.known) * 100) : 0}%`;
+      } else if (snap.doneCount > 0 && snap.total) {
+        fill.classList.remove('indet');
+        fill.style.width = `${(snap.doneCount / snap.total) * 100}%`;
+      } else {
+        fill.classList.add('indet');
+        fill.style.width = '';
+      }
+      el('tc-speed').textContent = spd > 0 ? `${formatSize(spd)}/s` : '—';
+      el('tc-totals').textContent = snap.known > 0
+        ? `${formatSize(snap.done)} / ${formatSize(snap.known)}`
+        : `${snap.doneCount} / ${snap.total} items`;
+      el('tc-route').textContent = this.from && this.to ? `${this.from} → ${this.to}` : '';
+      // Active item card.
+      const active = this.done ? null : this.activeRow();
+      const activeBox = el('tc-active');
+      if (!active) {
+        activeBox.classList.add('hidden');
+      } else {
+        activeBox.classList.remove('hidden');
+        const idx = this.items.indexOf(active);
+        el('tc-active-idx').textContent = `ACTIVE ITEM (${idx + 1} OF ${snap.total})`;
+        el('tc-active-pct').textContent = active.percent >= 0 ? `${Math.round(active.percent)}%` : '…';
+        el('tc-active-icon').textContent = fileIcon(active.name, active.isDir, false);
+        el('tc-active-name').textContent = active.name;
+        el('tc-active-name').title = active.name;
+        const parts = [];
+        if (active.totalBytes > 0) parts.push(`${formatSize(active.bytes)} of ${formatSize(active.totalBytes)}`);
+        else if (active.bytes > 0) parts.push(formatSize(active.bytes));
+        if (spd > 0 && active.status === 'active') parts.push(`${formatSize(spd)}/s`);
+        if (!parts.length) parts.push(active.status === 'done' ? 'Done' : active.isDir ? 'Folder • working…' : 'Working…');
+        el('tc-active-sub').textContent = parts.join(' • ');
+        const afill = el('tc-active-fill');
+        if (active.percent >= 0) { afill.classList.remove('indet'); afill.style.width = `${active.percent}%`; }
+        else { afill.classList.add('indet'); afill.style.width = ''; }
+      }
+      // Queue.
+      el('tc-queue-title').innerHTML = `Transfer Queue <span class="muted">(${snap.total} item${snap.total === 1 ? '' : 's'})</span>`;
+      const list = el('tc-queue');
+      const scroll = list.scrollTop;
+      list.innerHTML = this.items.map((it) => {
+        let sub;
+        let state;
+        let mark;
+        if (it.status === 'done') {
+          sub = `Completed${it.totalBytes > 0 ? ' • ' + formatSize(it.totalBytes) : ''}`;
+          state = 'ok'; mark = '✓';
+        } else if (it.status === 'failed') {
+          sub = it.error ? `Failed • ${it.error}` : 'Failed';
+          state = 'err'; mark = '✕';
+        } else if (it.status === 'active') {
+          sub = it.totalBytes > 0 ? `${formatSize(it.bytes)} of ${formatSize(it.totalBytes)}` : (it.bytes > 0 ? formatSize(it.bytes) : 'Working…');
+          state = 'idle'; mark = `${it.percent >= 0 ? Math.round(it.percent) + '%' : '…'}`;
+        } else {
+          sub = it.isDir ? 'Folder • Queued' : (it.totalBytes > 0 ? `Queued • ${formatSize(it.totalBytes)}` : 'Queued');
+          state = 'idle'; mark = '◷';
+        }
+        return `<div class="tc-row"><span class="tc-item-icon">${fileIcon(it.name, it.isDir, false)}</span>`
+          + `<span class="tc-row-text"><span class="tc-row-name" title="${esc(it.name)}">${esc(it.name)}</span>`
+          + `<span class="tc-row-sub ${state === 'ok' ? 'ok' : state === 'err' ? 'err' : ''}"${state === 'err' && it.error ? ` title="${esc(it.error)}"` : ''}>${esc(sub)}</span></span>`
+          + `<span class="tc-row-state ${state}">${mark}</span></div>`;
+      }).join('');
+      list.scrollTop = scroll;
+    };
+    doPaint();
+  },
+
+  finish({ results, single, cancelled, destDir, error } = {}) {
+    if (Array.isArray(results)) {
+      for (const r of results) {
+        if (!r) continue;
+        let row = (r.name && this.items.find((it) => it.name === r.name)) || null;
+        if (!row && this.items.length === 1) row = this.items[0];
+        if (!row) {
+          row = { name: r.name || 'Item', isDir: false, status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '' };
+          this.items.push(row);
+        }
+        if (r.ok) {
+          row.status = 'done';
+          row.percent = 100;
+          if (row.totalBytes) row.bytes = row.totalBytes;
+        } else {
+          row.status = 'failed';
+          row.error = r.error ? cleanIpcError(String(r.error)) : 'Failed';
+        }
+      }
+      // Folders expand server-side into sub-entries: retire a leftover queued
+      // parent once any of its children completed.
+      for (const it of this.items) {
+        if (it.status !== 'queued') continue;
+        const covered = this.items.some((o) => o !== it && o.status === 'done' && o.name.startsWith(it.name + '/'));
+        if (covered) { it.status = 'done'; it.percent = 100; }
+      }
+    } else if (single) {
+      let row = this.items.find((it) => it.status !== 'queued') || this.items[0];
+      if (!row) {
+        row = { name: String(single).split(/[\\/]/).pop(), isDir: false, status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '' };
+        this.items.push(row);
+      }
+      row.status = 'done';
+      row.percent = 100;
+    }
+    if (typeof destDir === 'string' && destDir) this.to = destDir;
+    this.done = true;
+    this.cancelled = !!cancelled;
+    this.cancelling = false;
+    this.failed = !!error || (Array.isArray(results) && results.some((r) => r && !r.ok));
+    if (this.cancelled) {
+      for (const it of this.items) {
+        if (it.status !== 'done') { it.status = 'queued'; it.percent = 0; }
+      }
+    }
+    const stopBtn = el('tc-stop');
+    if (stopBtn) stopBtn.classList.add('hidden');
+    el('transfer-pill').classList.add('hidden');
+    this.render(true);
+  },
+
+  fail(err) {
+    this.finish({ error: err ? cleanIpcError(String((err && err.message) || err)) : 'Failed' });
+  },
+
+  cancel() {
+    this.finish({ cancelled: true });
+  },
+
+  hide() {
+    el('transfer-center').classList.add('hidden');
+    if (this.active && !this.done) {
+      el('transfer-pill').classList.remove('hidden');
+    } else {
+      el('transfer-pill').classList.add('hidden');
+    }
+  },
+
+  show() {
+    el('transfer-center').classList.remove('hidden');
+    el('transfer-pill').classList.add('hidden');
+    this.render();
+  },
+};
+
+el('tc-close').onclick = () => TransferCenter.hide();
+el('tc-stop').onclick = () => TransferCenter.stop();
+el('tc-collapse').onclick = () => {
+  TransferCenter.collapsed = !TransferCenter.collapsed;
+  el('tc-body').classList.toggle('hidden', TransferCenter.collapsed);
+  el('tc-collapse').innerHTML = TransferCenter.collapsed ? '&#9656;' : '&#9662;';
+};
+el('transfer-pill').onclick = () => TransferCenter.show();
+// One persistent listener per direction (also fixes the old per-transfer leak).
+// The transferId match keeps a previous transfer's late events from painting
+// over a newer one running the same direction.
+window.api.onPushProgress((data) => {
+  if (!TransferCenter.active || TransferCenter.done || TransferCenter.direction !== 'upload') return;
+  if (data && data.transferId && data.transferId !== TransferCenter.transferId) return;
+  TransferCenter.onEvent(data);
+});
+window.api.onPullProgress((data) => {
+  if (!TransferCenter.active || TransferCenter.done || TransferCenter.direction !== 'download') return;
+  if (data && data.transferId && data.transferId !== TransferCenter.transferId) return;
+  TransferCenter.onEvent(data);
+});
+
 el('push-file-btn').onclick = async () => {
   if (!state.selected) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPushProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      label.textContent = 'Uploading ' + data.name + '...';
-    } else {
-      fill.style.background = '';
-      fill.style.width = data.percent + '%';
-      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%');
-    }
-  });
+  TransferCenter.start({ direction: 'upload', items: [], from: 'This PC', to: 'Phone ' + el('remote-path').value });
   try {
-    const result = await window.api.pushFile(state.selected, el('remote-path').value);
-    if (result) { toast('Uploaded ' + result.split('/').pop()); label.textContent = 'Done \u2014 ' + result; }
-    else { label.textContent = 'Cancelled.'; }
-  } catch (err) { label.textContent = 'Error: ' + err.message; }
+    const result = await window.api.pushFile(state.selected, el('remote-path').value, { transferId: TransferCenter.transferId });
+    if (result) { TransferCenter.finish({ single: result }); toast('Uploaded ' + result.split('/').pop()); }
+    else { TransferCenter.cancel(); }
+  } catch (err) { TransferCenter.fail(err); }
   loadFiles();
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 3000);
 };
 
 // Select-all checkbox
@@ -980,7 +1300,8 @@ function syncFileSelection() {
     if (cb && cb.checked) {
       const fp = row.dataset.fullpath;
       const isDir = row.dataset.isdir === '1';
-      const item = { path: fp, name: row.dataset.name, _isDir: isDir };
+      const size = row.dataset.size === '' ? null : Number(row.dataset.size);
+      const item = { path: fp, name: row.dataset.name, _isDir: isDir, _size: Number.isFinite(size) ? size : null };
       state.selectedFiles.add(item);
     }
   });
@@ -1000,6 +1321,8 @@ async function loadFiles() {
     const parsed = lines.map((line) => {
       const trimmed = line.trim();
       if (!trimmed) return null;
+      // `ls -la` prints a `total N` summary as its first line — not an entry.
+      if (/^total\s+\d+\s*$/.test(trimmed)) return null;
       const parts = trimmed.split(/\s+/);
       if (parts.length < 8) return { isDir: false, isLink: false, size: null, name: trimmed };
       const perms = parts[0];
@@ -1023,6 +1346,7 @@ async function loadFiles() {
       row.dataset.fullpath = fullPath;
       row.dataset.name = item.name;
       row.dataset.isdir = item.isDir ? '1' : '0';
+      row.dataset.size = Number.isFinite(item.size) ? String(item.size) : '';
       row.innerHTML = '<input type="checkbox" class="file-cb" /><span class="name"><span class="file-icon">' + icon + '</span><span class="fname">' + esc(item.name) + '</span></span><span class="meta">' + sizeStr + '</span>';
       const cb = row.querySelector('.file-cb');
       cb.onclick = (e) => { e.stopPropagation(); syncFileSelection(); };
@@ -1056,7 +1380,7 @@ async function loadFiles() {
 }
 
 async function selectFile(name, fullPath, itemInfo) {
-  state.selectedFile = { name, fullPath };
+  state.selectedFile = { name, fullPath, size: itemInfo && Number.isFinite(itemInfo.size) ? itemInfo.size : null };
   qAll('#file-list .list-row').forEach((r) => r.classList.remove('selected'));
   el('file-inspector-empty').classList.add('hidden');
   el('file-inspector-body').classList.remove('hidden');
@@ -1102,137 +1426,95 @@ async function selectFile(name, fullPath, itemInfo) {
 // Single-file download
 el('fi-pull-btn').onclick = async () => {
   if (!state.selectedFile) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPullProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      const dl = data.bytes ? formatSize(data.bytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '');
-    } else {
-      fill.style.background = '';
-      fill.style.width = data.percent + '%';
-      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%');
-    }
+  TransferCenter.start({
+    direction: 'download',
+    items: [{ name: state.selectedFile.name }],
+    from: 'Phone ' + state.selectedFile.fullPath,
+    to: 'This PC',
   });
   try {
-    const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath);
-    if (saved) { toast('Saved to ' + saved); label.textContent = 'Done \u2014 ' + saved; }
-    else { label.textContent = 'Cancelled.'; }
-  } catch (err) { label.textContent = 'Error: ' + err.message; }
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+    const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath, {
+      sizeHint: state.selectedFile.size, transferId: TransferCenter.transferId,
+    });
+    if (saved) { TransferCenter.finish({ single: saved, destDir: saved }); toast('Saved to ' + saved); }
+    else { TransferCenter.cancel(); }
+  } catch (err) { TransferCenter.fail(err); }
 };
 
-// Batch download
+// Batch download — files and folders alike. Folders download recursively with
+// their structure preserved (see files:pullBatch); each entry reports progress.
 el('file-download-btn').onclick = async () => {
-  const files = [...state.selectedFiles].filter((f) => !f._isDir);
+  const files = [...state.selectedFiles];
   if (!files.length) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPullProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      const dl = data.bytes ? formatSize(data.bytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    } else {
-      fill.style.background = '';
-      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
-      fill.style.width = overall + '%';
-      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    }
+  TransferCenter.start({
+    direction: 'download',
+    items: files.map((f) => ({ name: f.name || f.path.split('/').pop(), isDir: !!f._isDir })),
+    from: 'Phone ' + el('remote-path').value,
+    to: 'This PC',
   });
   try {
-    const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop() })));
-    if (res) {
+    const res = await window.api.pullBatch(state.selected, files.map((f) => ({
+      path: f.path, name: f.name || f.path.split('/').pop(), isDir: !!f._isDir, sizeHint: f._size || 0,
+    })), undefined, { transferId: TransferCenter.transferId });
+    if (res && res.cancelled) {
+      TransferCenter.cancel();
+    } else if (res) {
       const ok = res.results.filter((r) => r.ok).length;
-      const fail = res.results.filter((r) => !r.ok).length;
-      label.textContent = 'Done: ' + ok + ' saved' + (fail ? ', ' + fail + ' failed' : '') + ' to ' + res.destDir;
-      toast('Downloaded ' + ok + ' file(s) to ' + res.destDir);
+      TransferCenter.finish({ results: res.results, destDir: res.destDir });
+      toast('Downloaded ' + ok + ' item(s) to ' + res.destDir);
     } else {
-      label.textContent = 'Download cancelled.';
+      TransferCenter.cancel();
     }
   } catch (err) {
-    label.textContent = 'Error: ' + err.message;
+    TransferCenter.fail(err);
   }
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 };
 
 // Batch upload
 async function uploadFiles(filePaths) {
   if (!filePaths || !filePaths.length || !state.selected) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPushProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      const ul = data.bytes ? formatSize(data.bytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    } else {
-      fill.style.background = '';
-      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
-      fill.style.width = overall + '%';
-      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    }
+  TransferCenter.start({
+    direction: 'upload',
+    items: filePaths.map((p) => ({ name: String(p).split(/[\\/]/).pop() })),
+    from: 'This PC',
+    to: 'Phone ' + el('remote-path').value,
   });
   try {
-    const results = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths);
-    if (results && results.length) {
-      const ok = results.filter((r) => r.ok).length;
-      const fail = results.filter((r) => !r.ok).length;
-      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
+    const res = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths, { transferId: TransferCenter.transferId });
+    const list = res && res.results ? res.results : [];
+    if (res && res.cancelled) {
+      TransferCenter.cancel();
+    } else if (list.length) {
+      const ok = list.filter((r) => r.ok).length;
+      TransferCenter.finish({ results: list });
       toast('Uploaded ' + ok + ' file(s)');
       loadFiles();
     } else {
-      label.textContent = 'Upload cancelled.';
+      TransferCenter.cancel();
     }
   } catch (err) {
-    label.textContent = 'Error: ' + err.message;
+    TransferCenter.fail(err);
   }
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 }
-
 el('file-upload-btn').onclick = async () => {
   if (!state.selected) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPushProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      label.textContent = 'Uploading ' + data.name + ' (' + (data.index + 1) + '/' + data.total + ')';
-    } else {
-      fill.style.background = '';
-      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
-      fill.style.width = overall + '%';
-      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    }
+  TransferCenter.start({
+    direction: 'upload',
+    items: [],
+    from: 'This PC',
+    to: 'Phone ' + el('remote-path').value,
   });
   try {
-    const results = await window.api.pushBatch(state.selected, el('remote-path').value);
-    if (results && results.length) {
-      const ok = results.filter((r) => r.ok).length;
-      const fail = results.filter((r) => !r.ok).length;
-      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
-      toast('Uploaded ' + ok + ' file(s)');
-    } else { label.textContent = 'Upload cancelled.'; }
-  } catch (err) { label.textContent = 'Error: ' + err.message; }
+    const res = await window.api.pushBatch(state.selected, el('remote-path').value, { transferId: TransferCenter.transferId });
+    const list = res && res.results ? res.results : [];
+    if (res && res.cancelled) {
+      TransferCenter.cancel();
+    } else if (list.length) {
+      TransferCenter.finish({ results: list });
+      toast('Uploaded ' + list.filter((r) => r.ok).length + ' file(s)');
+    } else { TransferCenter.cancel(); }
+  } catch (err) { TransferCenter.fail(err); }
   loadFiles();
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 };
 
 // Drag-and-drop upload
@@ -2188,12 +2470,20 @@ function startCameraFeed() {
   if (badge) badge.classList.remove('hidden');
   if (placeholder) placeholder.style.display = 'none';
   let fetching = false;
+  let nullStreak = 0;
   cameraFeedInterval = setInterval(async () => {
     if (fetching || !state.selected) return;
     fetching = true;
     try {
       const dataUrl = await window.api.cameraFrame(state.selected);
-      if (dataUrl && frame) frame.src = dataUrl;
+      if (dataUrl && frame) { frame.src = dataUrl; nullStreak = 0; }
+      // No frame for seconds means the window is gone (closed/minimized) —
+      // stop polling instead of spamming capturer errors forever. Genuine
+      // restart gaps (record stop/start ≈ 4s) stay under the threshold.
+      else if (++nullStreak >= 8) {
+        stopCameraFeed();
+        setCameraStatus('Camera preview unavailable — restart the stream.', 'err');
+      }
     } catch { /* ignore frame errors */ }
     finally { fetching = false; }
   }, 1000);
@@ -2253,13 +2543,26 @@ el('camera-start-btn').onclick = async () => {
 };
 
 el('camera-stop-btn').onclick = async () => {
-  await window.api.stopCamera();
+  // Stopping mid-record finalizes the file first (main side); surface it so
+  // the recording is not silently lost, and always reset the record button.
+  let res = null;
+  try { res = await window.api.stopCamera(); } catch { /* UI still resets below */ }
+  isRecording = false;
+  const recBtn = el('camera-record-btn');
+  if (recBtn) recBtn.classList.remove('recording');
   el('camera-state').textContent = 'Standby';
   const dot = el('camera-state-dot');
   if (dot) { dot.className = 'cam-dot standby'; }
   el('camera-start-btn').classList.remove('streaming');
   stopCameraFeed();
-  setCameraStatus('Camera stream stopped.');
+  if (res && res.recording) {
+    toast('Recording saved: ' + String(res.recording).split(/[\\/]/).pop());
+    setCameraStatus('Stream stopped — recording saved.', 'ok');
+  } else if (res && res.recordError) {
+    setCameraStatus('Stream stopped — recording failed: ' + cleanIpcError(res.recordError), 'err');
+  } else {
+    setCameraStatus('Camera stream stopped.');
+  }
 };
 
 // Screenshot (capture photo from camera)
@@ -2291,10 +2594,13 @@ el('camera-record-btn').onclick = async () => {
         setCameraStatus('Recording to ' + filePath.split(/[\\/]/).pop() + '\u2026', 'busy');
       }
     } else {
+      // Finalizing takes a few seconds (graceful recorder shutdown + verify).
+      setCameraStatus('Finalising recording…', 'busy');
       const filePath = await window.api.cameraRecordStop(state.selected);
       isRecording = false;
       btn.classList.remove('recording');
       if (filePath) { toast('Recording saved: ' + filePath.split(/[\\/]/).pop()); setCameraStatus('Recording saved.', 'ok'); }
+      else { setCameraStatus('Recording ended.'); }
     }
   } catch (err) {
     setCameraStatus('Record error: ' + cleanIpcError(err.message), 'err');
@@ -2338,6 +2644,18 @@ async function refreshBridge() {
     el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
     const dot = el('camera-state-dot');
     if (dot) { dot.className = st.running ? 'cam-dot streaming' : 'cam-dot standby'; }
+    // A stopped stream (e.g. stopped from the dock bar) must not keep a stale
+    // feed polling behind it — that is what sprayed capturer errors and then
+    // painted the phone screen into the camera preview.
+    if (!st.running) stopCameraFeed();
+    // Keep the record button honest: a recording may have ended elsewhere
+    // (control bar, mic toggle) while this tab was open.
+    if (typeof st.recording === 'boolean' && st.recording !== isRecording) {
+      isRecording = st.recording;
+      const recBtn = el('camera-record-btn');
+      if (recBtn) recBtn.classList.toggle('recording', st.recording);
+      if (!st.recording) setCameraStatus('Recording ended.');
+    }
   }
 }
 
@@ -2368,6 +2686,7 @@ async function refreshAudioStatus() {
   clearInterval(nowPlayingTimer);
   if (state.activeView === 'multimedia') {
     pollNowPlaying();
+    syncVolumeFromDevice();
     nowPlayingTimer = setInterval(pollNowPlaying, 4000);
   } else {
     clearInterval(np.timer);
@@ -2385,11 +2704,27 @@ function clock(ms) {
     : `${Math.floor(total / 60)}:${pad(total % 60)}`;
 }
 
-// Art cache keyed by package — either a real album-art data URL pulled from
-// the device's content:// URI, or the dex-fetched launcher icon.
+// Art cache keyed by content:// URI — a track change within the same app must
+// re-fetch (the old package-keyed cache pinned the first song's art for the
+// whole session). Values are real album-art data URLs; the launcher icon
+// fallback is cached separately per package.
 const artCache = new Map();
+const artInflight = new Map();
 
-async function updateArtwork(track) {
+function paintArtwork(url) {
+  const img = el('np-artwork-img');
+  const wrap = el('np-artwork');
+  if (!img || !wrap) return;
+  if (url) {
+    img.src = url;
+    img.classList.remove('hidden'); wrap.classList.add('has-img');
+  } else {
+    img.classList.add('hidden'); img.removeAttribute('src');
+    wrap.classList.remove('has-img');
+  }
+}
+
+async function updateArtwork(track, artUris) {
   const img = el('np-artwork-img');
   const wrap = el('np-artwork');
   const fallback = el('np-artwork-fallback');
@@ -2399,48 +2734,61 @@ async function updateArtwork(track) {
     wrap.classList.remove('has-img'); if (fallback) fallback.style.display = '';
     return;
   }
+  if (fallback) fallback.style.display = '';
   const pkg = String(track.package).trim();
+  const serial = state.selected;
+  const uris = (Array.isArray(artUris) && artUris.length ? artUris : (track.artUri ? [track.artUri] : []))
+    .map((u) => String(u || '').trim())
+    .filter((u) => u.startsWith('content://'));
+  const cacheKey = uris.length ? `art:${uris[0]}` : `pkg:${pkg}`;
 
-  // Fast path: already fetched for this package in this session.
-  if (artCache.has(pkg)) {
-    const cached = artCache.get(pkg);
-    if (cached) { img.src = cached; img.classList.remove('hidden'); wrap.classList.add('has-img'); }
-    else { img.classList.add('hidden'); wrap.classList.remove('has-img'); }
+  // Fast path: this exact URI already resolved this session.
+  if (artCache.has(cacheKey)) {
+    paintArtwork(artCache.get(cacheKey));
+    return;
+  }
+  // Coalesce concurrent polls for the same URI (4 s poll vs. slow fetch).
+  if (artInflight.has(cacheKey)) {
+    try { paintArtwork(await artInflight.get(cacheKey)); } catch { /* keep fallback */ }
     return;
   }
 
-  // 1) Try pulling the real album art from the session's content:// URI.
-  if (track.artUri) {
-    try {
-      const dataUrl = await window.api.artwork(state.selected, track.artUri);
-      if (dataUrl) {
-        artCache.set(pkg, dataUrl);
-        img.src = dataUrl;
-        img.classList.remove('hidden'); wrap.classList.add('has-img');
-        return;
-      }
-    } catch { /* fall through to icon */ }
-  }
-
-  // 2) Fallback: dex-fetched app launcher icon.
-  try {
-    const icons = await window.api.getAppIcons(state.selected, [pkg]);
-    const url = icons && icons[pkg];
-    if (url) {
-      artCache.set(pkg, url);
-      img.src = url;
-      img.classList.remove('hidden'); wrap.classList.add('has-img');
-    } else {
-      artCache.set(pkg, null);
-      img.classList.add('hidden'); wrap.classList.remove('has-img');
+  const job = (async () => {
+    // 1) Real album art, batch-tried in dump order via dex/base64 pipeline.
+    if (uris.length) {
+      try {
+        const arts = await window.api.artworkBatch(serial, uris);
+        const hit = Array.isArray(arts) ? arts.find(Boolean) : null;
+        if (hit) { artCache.set(cacheKey, hit); return hit; }
+      } catch { /* fall through */ }
+      try {
+        const single = await window.api.artwork(serial, uris[0]);
+        if (single) { artCache.set(cacheKey, single); return single; }
+      } catch { /* fall through to icon */ }
+      artCache.set(cacheKey, null);
     }
-  } catch {
-    artCache.set(pkg, null);
-    img.classList.add('hidden'); wrap.classList.remove('has-img');
-  }
+    // 2) Fallback: dex-fetched app launcher icon (per package).
+    const iconKey = `pkg:${pkg}`;
+    if (artCache.has(iconKey)) return artCache.get(iconKey);
+    try {
+      const icons = await window.api.getAppIcons(serial, [pkg]);
+      const url = icons && icons[pkg];
+      artCache.set(iconKey, url || null);
+      if (!uris.length) artCache.set(cacheKey, url || null);
+      return url || null;
+    } catch {
+      artCache.set(iconKey, null);
+      if (!uris.length) artCache.set(cacheKey, null);
+      return null;
+    }
+  })();
+  artInflight.set(cacheKey, job);
+  try { paintArtwork(await job); }
+  catch { /* keep vinyl fallback */ }
+  finally { artInflight.delete(cacheKey); }
 }
 
-function renderNowPlaying(track, sessions, readAt) {
+function renderNowPlaying(track, sessions, readAt, artUris) {
   const dash = '—';
   np.track = track || null;
   np.readAt = readAt || Date.now();
@@ -2479,8 +2827,8 @@ function renderNowPlaying(track, sessions, readAt) {
     else trEl.classList.add('hidden');
   }
 
-  // Artwork: dex-fetched app icon (cached). Falls back to the vinyl glyph.
-  updateArtwork(track);
+  // Artwork: on-device album art first, dex launcher icon as fallback.
+  updateArtwork(track, artUris);
 
   // Progress / seek
   tickNowPlaying();
@@ -2554,12 +2902,15 @@ async function pollNowPlaying() {
   if (!state.selected) return;
   try {
     const res = await window.api.nowPlaying(state.selected);
-    renderNowPlaying(res.track, res.sessions, res.readAt);
+    renderNowPlaying(res.track, res.sessions, res.readAt, res.artUris);
+    return res;
   } catch {
     renderNowPlaying(null, 0, Date.now());
+    return null;
+  } finally {
+    clearInterval(np.timer);
+    np.timer = setInterval(tickNowPlaying, 1000);
   }
-  clearInterval(np.timer);
-  np.timer = setInterval(tickNowPlaying, 1000);
 }
 
 el('np-refresh-btn').onclick = pollNowPlaying;
@@ -2578,25 +2929,59 @@ el('audio-start-btn').onclick = async () => {
 
 el('audio-stop-btn').onclick = async () => { await window.api.stopAudio(); refreshAudioStatus(); };
 
+function paintPlayPause(isPlaying) {
+  const ppBtn = el('media-playpause-btn');
+  if (!ppBtn) return;
+  ppBtn.classList.toggle('playing', !!isPlaying);
+  ppBtn.title = isPlaying ? 'Pause' : 'Play';
+  ppBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+  ppBtn.innerHTML = isPlaying
+    ? '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>'
+    : '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5.14v14l11-7z"/></svg>';
+}
+
 async function sendMediaKey(action) {
   if (!state.selected) return;
-  try { await window.api.mediaKey(state.selected, action); } catch { /* ignore */ }
-  // Optimistic: flip the play/pause icon instantly so the user sees feedback,
-  // then re-poll after a short delay to sync with the actual session state.
+  const pkg = np.track && np.track.package ? np.track.package : null;
+  // Send an explicit play/pause when the current state is known: a blind
+  // toggle races the session (the phone pauses while dumpsys still says
+  // "playing", the single 600 ms re-poll reads stale data, and the icon flips
+  // back). Targeted `media dispatch <verb> <package>` also reaches the right
+  // player when several sessions exist, unlike a global keyevent.
+  let verb = action;
+  let expectPlaying = null;
   if (action === 'playPause' && np.track) {
-    np.track.playing = !np.track.playing;
-    const ppBtn = el('media-playpause-btn');
-    if (ppBtn) {
-      const isPlaying = np.track.playing;
-      ppBtn.classList.toggle('playing', isPlaying);
-      ppBtn.title = isPlaying ? 'Pause' : 'Play';
-      ppBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
-      ppBtn.innerHTML = isPlaying
-        ? '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>'
-        : '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M8 5.14v14l11-7z"/></svg>';
-    }
+    expectPlaying = !np.track.playing;
+    verb = expectPlaying ? 'play' : 'pause';
   }
-  setTimeout(pollNowPlaying, 600);
+  const ppBtn = el('media-playpause-btn');
+  if (ppBtn && action === 'playPause') ppBtn.disabled = true;
+  try { await window.api.mediaKey(state.selected, verb, pkg); }
+  catch {
+    try { await window.api.mediaKey(state.selected, action, pkg); } catch { /* ignore */ }
+  }
+  // Confirmed-state polling: dumpsys lags the audio by ~1-2 s, so poll three
+  // times and paint whatever the device actually reports each round. The icon
+  // only settles when the session does — no optimistic flip that can lie.
+  const delays = [450, 1300, 2600];
+  for (const ms of delays) {
+    await new Promise((r) => setTimeout(r, ms));
+    if (!state.selected) break;
+    let res = null;
+    try { res = await window.api.nowPlaying(state.selected); } catch { break; }
+    if (!res) break;
+    renderNowPlaying(res.track, res.sessions, res.readAt, res.artUris);
+    if (expectPlaying === null) break;
+    const nowPlaying = !!(res.track && res.track.playing);
+    paintPlayPause(nowPlaying);
+    if (nowPlaying === expectPlaying) break;
+  }
+  // Restore the actions-based disabled state (the pending flag must not leave
+  // a genuinely unsupported button enabled).
+  try {
+    const res = await window.api.nowPlaying(state.selected);
+    if (res) renderNowPlaying(res.track, res.sessions, res.readAt, res.artUris);
+  } catch { if (ppBtn && action === 'playPause') ppBtn.disabled = false; }
 }
 el('media-prev-btn').onclick = () => sendMediaKey('previous');
 el('media-playpause-btn').onclick = () => sendMediaKey('playPause');
@@ -2654,12 +3039,30 @@ function renderAudioTargets(list) {
   } catch {}
 }
 
+// Positions the slider from the device's actual MUSIC stream level so the UI
+// never disagrees with the phone. 0-15 Android steps ↔ 0-100% slider.
+async function syncVolumeFromDevice() {
+  const vol = el('pc-volume');
+  const pct = el('pc-volume-pct');
+  if (!vol || !pct || !state.selected) return;
+  try {
+    const res = await window.api.getVolume(state.selected);
+    const level = res && Number.isFinite(Number(res.level)) ? Number(res.level) : null;
+    if (level === null) return;
+    const max = res && Number.isFinite(Number(res.max)) ? Number(res.max) : 15;
+    const percent = Math.max(0, Math.min(100, Math.round((level / max) * 100)));
+    vol.value = String(percent);
+    pct.textContent = `${percent}%`;
+    try { localStorage.setItem('pc-master-volume', String(percent)); } catch {}
+  } catch { /* keep the local value when the device is unreachable */ }
+}
+
 function initAudioPanel() {
   renderAudioTargets(AUDIO_TARGETS_FALLBACK);
   const vol = el('pc-volume');
   const pct = el('pc-volume-pct');
   if (!vol || !pct) return;
-  // Restore persisted volume
+  // Restore persisted volume until the first device read corrects it.
   try {
     const saved = localStorage.getItem('pc-master-volume');
     if (saved !== null && saved !== '') { vol.value = String(Math.max(0, Math.min(100, Number(saved)))); }
@@ -2669,12 +3072,21 @@ function initAudioPanel() {
   vol.addEventListener('input', updatePct);
   vol.addEventListener('change', async () => {
     try { localStorage.setItem('pc-master-volume', String(vol.value)); } catch {}
-    // Map 0-100% → Android's 0-15 media volume steps.
+    // Map 0-100% → Android's 0-15 media volume steps, then snap to truth.
     const androidLevel = Math.round((Number(vol.value) / 100) * 15);
     if (state.selected) {
-      try { await window.api.setVolume(state.selected, androidLevel); } catch { /* ignore */ }
+      try {
+        const actual = await window.api.setVolume(state.selected, androidLevel);
+        if (Number.isFinite(Number(actual))) {
+          const percent = Math.max(0, Math.min(100, Math.round((Number(actual) / 15) * 100)));
+          vol.value = String(percent);
+          pct.textContent = `${percent}%`;
+          try { localStorage.setItem('pc-master-volume', String(percent)); } catch {}
+        }
+      } catch { /* ignore */ }
     }
   });
+  syncVolumeFromDevice();
 }
 initAudioPanel();
 
