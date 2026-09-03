@@ -78,43 +78,32 @@ jobs:
           "VCVARS=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # softcam.dll (the DirectShow filter + Sender API) and softcam_installer.exe
-      # (registers the filter under elevation). If a specific softcam commit fails
-      # to compile on missing standard headers, add the include(s) in a patch step
-      # here before this one -- that is the "two include fixes" hook.
+      # (registers the filter under elevation). We build ONLY the projects we
+      # ship -- the .sln also contains core_tests / dll_tests which need a
+      # googletest NuGet package and fail without `nuget restore`. Building the
+      # .vcxproj files directly pulls in their dependency BaseClasses.lib
+      # automatically, so nothing is skipped.
       - name: Build softcam.dll + softcam_installer.exe (Release x64)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
           $vcvars = $env:VCVARS
-          Write-Host "Solutions under softcam/:"
-          Get-ChildItem softcam -Recurse -Filter *.sln | ForEach-Object { Write-Host "  $($_.FullName)" }
 
-          function Build-Sln([string]$proj) {
+          function Build-Proj([string]$proj) {
             Write-Host "== msbuild $proj =="
             cmd /c "`"$vcvars`" && msbuild `"$proj`" /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo"
             if ($LASTEXITCODE -ne 0) { throw "msbuild failed for $proj (exit $LASTEXITCODE)" }
           }
 
-          # Main solution -> softcam.dll (+ dist/inc/softcam.h, dist/lib/x64/softcam.lib)
-          $mainSln = Join-Path $PWD 'softcam\softcam.sln'
-          if (-not (Test-Path $mainSln)) {
-            $mainSln = (Get-ChildItem softcam -Recurse -Filter *.sln |
-                        Where-Object { $_.Name -notmatch 'vs2019|sender|installer' } |
-                        Select-Object -First 1).FullName
-          }
-          if (-not $mainSln) { throw "Could not find the softcam solution." }
-          Build-Sln $mainSln
+          $dllProj = Get-ChildItem softcam -Recurse -Filter softcam.vcxproj |
+            Where-Object { $_.FullName -notmatch 'installer|sender' } | Select-Object -First 1
+          if (-not $dllProj) { throw "softcam.vcxproj not found under softcam/." }
+          Build-Proj $dllProj.FullName
 
-          # softcam_installer.exe: produced by the main sln, or a separate example sln.
-          $installer = Get-ChildItem softcam -Recurse -Filter softcam_installer.exe -ErrorAction SilentlyContinue |
-                       Select-Object -First 1
-          if (-not $installer) {
-            $instSln = Get-ChildItem softcam -Recurse -Filter *.sln |
-                       Where-Object { $_.FullName -match 'installer' } | Select-Object -First 1
-            if (-not $instSln) { throw "No softcam_installer solution found." }
-            Build-Sln $instSln.FullName
-          }
+          $installerProj = Get-ChildItem softcam -Recurse -Filter softcam_installer.vcxproj | Select-Object -First 1
+          if (-not $installerProj) { throw "softcam_installer.vcxproj not found under softcam/." }
+          Build-Proj $installerProj.FullName
 
       - name: Build softcam-bridge.exe (Release x64)
         shell: pwsh
