@@ -1,0 +1,4 @@
+# Keeps assets/softcam/ in the repo. The native virtual-camera binaries
+# (softcam.dll, softcam_installer.exe, softcam-bridge.exe) are built in CI
+# (.github/workflows/build.yml) and dropped here before packaging; they are
+# gitignored so build artifacts never get committed.
