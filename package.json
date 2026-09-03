@@ -1,6 +1,6 @@
 {
   "name": "android-pc-companion",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "description": "PC companion app for Android devices: mirroring, battery, files, sideloading, app management, bootloader unlock.",
   "main": "main.js",
   "scripts": {
@@ -23,6 +23,16 @@
     "appId": "com.example.androidcompanion",
     "productName": "Companion",
     "publish": false,
+    "asarUnpack": [
+      "assets/**"
+    ],
+    "files": [
+      "**/*",
+      "!tools/**",
+      "!r8.jar",
+      "!temp_src/**",
+      "!temp_classes/**"
+    ],
     "win": {
       "target": "nsis",
       "icon": "smartphone.ico"

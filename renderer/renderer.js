@@ -2188,12 +2188,20 @@ function startCameraFeed() {
   if (badge) badge.classList.remove('hidden');
   if (placeholder) placeholder.style.display = 'none';
   let fetching = false;
+  let nullStreak = 0;
   cameraFeedInterval = setInterval(async () => {
     if (fetching || !state.selected) return;
     fetching = true;
     try {
       const dataUrl = await window.api.cameraFrame(state.selected);
-      if (dataUrl && frame) frame.src = dataUrl;
+      if (dataUrl && frame) { frame.src = dataUrl; nullStreak = 0; }
+      // No frame for seconds means the window is gone (closed/minimized) —
+      // stop polling instead of spamming capturer errors forever. Genuine
+      // restart gaps (record stop/start ≈ 4s) stay under the threshold.
+      else if (++nullStreak >= 8) {
+        stopCameraFeed();
+        setCameraStatus('Camera preview unavailable — restart the stream.', 'err');
+      }
     } catch { /* ignore frame errors */ }
     finally { fetching = false; }
   }, 1000);
@@ -2253,13 +2261,26 @@ el('camera-start-btn').onclick = async () => {
 };
 
 el('camera-stop-btn').onclick = async () => {
-  await window.api.stopCamera();
+  // Stopping mid-record finalizes the file first (main side); surface it so
+  // the recording is not silently lost, and always reset the record button.
+  let res = null;
+  try { res = await window.api.stopCamera(); } catch { /* UI still resets below */ }
+  isRecording = false;
+  const recBtn = el('camera-record-btn');
+  if (recBtn) recBtn.classList.remove('recording');
   el('camera-state').textContent = 'Standby';
   const dot = el('camera-state-dot');
   if (dot) { dot.className = 'cam-dot standby'; }
   el('camera-start-btn').classList.remove('streaming');
   stopCameraFeed();
-  setCameraStatus('Camera stream stopped.');
+  if (res && res.recording) {
+    toast('Recording saved: ' + String(res.recording).split(/[\\/]/).pop());
+    setCameraStatus('Stream stopped — recording saved.', 'ok');
+  } else if (res && res.recordError) {
+    setCameraStatus('Stream stopped — recording failed: ' + cleanIpcError(res.recordError), 'err');
+  } else {
+    setCameraStatus('Camera stream stopped.');
+  }
 };
 
 // Screenshot (capture photo from camera)
@@ -2291,10 +2312,13 @@ el('camera-record-btn').onclick = async () => {
         setCameraStatus('Recording to ' + filePath.split(/[\\/]/).pop() + '\u2026', 'busy');
       }
     } else {
+      // Finalizing takes a few seconds (graceful recorder shutdown + verify).
+      setCameraStatus('Finalising recording…', 'busy');
       const filePath = await window.api.cameraRecordStop(state.selected);
       isRecording = false;
       btn.classList.remove('recording');
       if (filePath) { toast('Recording saved: ' + filePath.split(/[\\/]/).pop()); setCameraStatus('Recording saved.', 'ok'); }
+      else { setCameraStatus('Recording ended.'); }
     }
   } catch (err) {
     setCameraStatus('Record error: ' + cleanIpcError(err.message), 'err');
@@ -2338,6 +2362,18 @@ async function refreshBridge() {
     el('camera-state').textContent = st.running ? 'Streaming' : 'Standby';
     const dot = el('camera-state-dot');
     if (dot) { dot.className = st.running ? 'cam-dot streaming' : 'cam-dot standby'; }
+    // A stopped stream (e.g. stopped from the dock bar) must not keep a stale
+    // feed polling behind it — that is what sprayed capturer errors and then
+    // painted the phone screen into the camera preview.
+    if (!st.running) stopCameraFeed();
+    // Keep the record button honest: a recording may have ended elsewhere
+    // (control bar, mic toggle) while this tab was open.
+    if (typeof st.recording === 'boolean' && st.recording !== isRecording) {
+      isRecording = st.recording;
+      const recBtn = el('camera-record-btn');
+      if (recBtn) recBtn.classList.toggle('recording', st.recording);
+      if (!st.recording) setCameraStatus('Recording ended.');
+    }
   }
 }
 

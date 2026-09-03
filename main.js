@@ -119,6 +119,16 @@ const {
   collectArtUris,
   parseAudioVolume,
 } = require('./src/media');
+const {
+  RECORD_STOP_TIMEOUT_MS,
+  RECORD_FLUSH_SETTLE_MS,
+  RECORD_MIN_BYTES,
+  RECORD_TAIL_SCAN_BYTES,
+  RECORD_HEAD_SCAN_BYTES,
+  assessRecording,
+  repairMkvTimestamps,
+  repairMp4Edits,
+} = require('./src/recording');
 
 const tools = { adb: 'adb', fastboot: 'fastboot', scrcpy: 'scrcpy' };
 
@@ -2679,6 +2689,13 @@ async function startCameraSession(opts = {}) {
   const { serial } = opts;
   await assertDeviceReady(serial);
   assertCameraSupport();
+  // If a recording is in flight and this restart would abandon it (mic toggle,
+  // camera switch, rotate, …), finalize the file first instead of corrupting it
+  // with the hard kill below. Best-effort: the restart itself must not fail
+  // because of a recording; the file stays valid on disk either way.
+  if (cameraRecordingFile && opts.record !== cameraRecordingFile) {
+    try { await finalizeCameraRecording(); } catch { cameraRecordingFile = null; }
+  }
   closeCameraSession({ killScrcpy: true });
   if (audioProcess) {
     try { audioProcess.kill(); } catch { /* ignore */ }
@@ -2802,10 +2819,20 @@ async function applyCameraZoom(zoom) {
 
 ipcMain.handle('camera:start', async (_e, opts = {}) => startCameraSession(opts));
 
-ipcMain.handle('camera:stop', () => {
-  const wasOpen = !!cameraSession;
+ipcMain.handle('camera:stop', async () => {
+  const wasOpen = !!cameraSession || !!cameraRecordingFile;
+  // Stopping mid-record must finalize the file, not corrupt it: without this
+  // the recorder is hard-killed and the MP4 never gets its moov index.
+  // Never throws for a bad recording — the stream still stops; the outcome
+  // rides along for the UI to report.
+  let recording = null;
+  let recordError = null;
+  if (cameraRecordingFile) {
+    try { recording = await finalizeCameraRecording(); }
+    catch (err) { recordError = err.message; }
+  }
   closeCameraSession({ killScrcpy: true });
-  return wasOpen;
+  return { stopped: wasOpen, recording, recordError };
 });
 
 ipcMain.handle('camera:status', () => ({
@@ -2815,6 +2842,7 @@ ipcMain.handle('camera:status', () => ({
   mic: cameraSession ? !!cameraSession.micActive : false,
   docked: !!(cameraSession && cameraSession.bar),
   zoom: cameraSession ? cameraSession.zoom : 1,
+  recording: !!cameraRecordingFile,
 }));
 
 ipcMain.handle('camera:setZoom', (_e, zoom) => applyCameraZoom(zoom));
@@ -2891,8 +2919,11 @@ function cropWindowChrome(nativeImg, isBorderless) {
 }
 
 /**
- * Camera frame: captures the scrcpy camera window via desktopCapturer when a
- * camera stream is running, or falls back to screencap (phone screen) otherwise.
+ * Camera frame: captures the scrcpy camera window via desktopCapturer while a
+ * camera stream is running, else null (the renderer shows its standby
+ * placeholder). Deliberately no screencap fallback: showing the phone screen
+ * inside the camera preview — notably right after Stop — lies about what the
+ * camera sees, which is exactly the confusion it caused.
  */
 ipcMain.handle('camera:frame', async (_e, serial) => {
   if (!serial) return null;
@@ -2909,14 +2940,9 @@ ipcMain.handle('camera:frame', async (_e, serial) => {
         const cropped = cropWindowChrome(src.thumbnail, !!cameraSession?.borderless);
         return `data:image/png;base64,${cropped.toPNG().toString('base64')}`;
       }
-    } catch { /* fall through to screencap */ }
+    } catch { /* no frame this tick */ }
   }
-
-  try {
-    const buf = await adbBuffer(['-s', serial, 'exec-out', 'screencap', '-p']);
-    if (!buf || !buf.length) return null;
-    return `data:image/png;base64,${buf.toString('base64')}`;
-  } catch { return null; }
+  return null;
 });
 
 /**
@@ -2964,8 +2990,141 @@ ipcMain.handle('camera:capturePhoto', async (_e, serial) => {
 let cameraRecordingFile = null;
 
 /**
+ * Stops an scrcpy child the way its recorder needs: a graceful close lets it
+ * flush the encoder and write the MP4 moov trailer; a hard kill leaves video
+ * bytes with no index — a file that exists but no player will open.
+ *
+ * Windows has no SIGINT for child processes (Node's kill() is TerminateProcess),
+ * but the camera scrcpy runs with a real window (windowsHide: false), so plain
+ * `taskkill /PID` delivers WM_CLOSE → SDL_QUIT → clean recorder shutdown.
+ * POSIX gets SIGINT. Anything still alive after the grace window is force-killed.
+ *
+ * Returns 'exited' | 'force-killed' | 'already-exited'.
+ */
+async function stopScrcpyGracefully(child, { timeoutMs = RECORD_STOP_TIMEOUT_MS } = {}) {
+  if (!child || child.exitCode !== null) return 'already-exited';
+  const exited = new Promise((resolve) => { child.once('exit', () => resolve(true)); });
+  // The exit may already have happened between the check above and the
+  // listener attach (for a process that died on its own): don't hang then.
+  if (child.exitCode !== null) return 'exited';
+  let signaled = false;
+  if (process.platform === 'win32' && child.pid) {
+    try { await run('taskkill', ['/PID', String(child.pid)]); signaled = true; }
+    catch { /* window already gone: fall through to kill */ }
+  } else {
+    try { child.kill('SIGINT'); signaled = true; }
+    catch { /* fall through */ }
+  }
+  if (!signaled) { try { child.kill(); } catch {} }
+  const winner = await Promise.race([
+    exited.then(() => 'exited'),
+    new Promise((r) => setTimeout(() => r('timeout'), timeoutMs)),
+  ]);
+  if (winner === 'timeout') {
+    try {
+      if (process.platform === 'win32' && child.pid) await run('taskkill', ['/F', '/PID', String(child.pid)]);
+      else child.kill('SIGKILL');
+    } catch {}
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 2000))]);
+    return 'force-killed';
+  }
+  return 'exited';
+}
+
+/**
+ * Repairs a skewed recording in place when possible: some devices emit video
+ * timestamps minutes after the audio's (frozen frame + phantom duration),
+ * with perfect deltas — shifting the late track back fixes the file. Reads
+ * the whole file (recordings are tens of MB); skips absurd sizes. Returns
+ * true only when the file was rewritten AND the rewritten bytes re-verify.
+ */
+function repairRecordingFileInPlace(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.mkv' && ext !== '.webm' && ext !== '.mp4' && ext !== '.m4v' && ext !== '.mov') return false;
+  let st;
+  try { st = fs.statSync(filePath); } catch { return false; }
+  if (!st.isFile() || st.size < RECORD_MIN_BYTES || st.size > 1024 * 1024 * 1024) return false;
+  let buf;
+  try { buf = fs.readFileSync(filePath); } catch { return false; }
+  let fixed = null;
+  try {
+    fixed = (ext === '.mp4' || ext === '.m4v' || ext === '.mov') ? repairMp4Edits(buf) : repairMkvTimestamps(buf);
+  } catch { return false; }
+  if (!fixed || fixed === buf) return false;
+  try {
+    const headSize = Math.min(fixed.length, RECORD_HEAD_SCAN_BYTES);
+    const head = fixed.subarray(0, headSize);
+    const tailSize = Math.min(fixed.length, RECORD_TAIL_SCAN_BYTES);
+    const tail = fixed.subarray(fixed.length - tailSize);
+    if (!assessRecording({ head, tail, size: fixed.length, ext }).ok) return false;
+  } catch { return false; }
+  try { fs.writeFileSync(filePath, fixed); } catch { return false; }
+  return true;
+}
+
+/** Reads a finished recording off disk and judges it playable (see src/recording). */
+function verifyRecordingFile(filePath) {
+  let st;
+  try { st = fs.statSync(filePath); }
+  catch { return { ok: false, reason: 'no file was written', bytes: 0 }; }
+  if (!st.isFile() || st.size < RECORD_MIN_BYTES) {
+    return { ok: false, reason: 'file is empty', bytes: st.isFile() ? st.size : 0 };
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      // The MKV Info block (with Duration) sits in the first bytes; give the
+      // EBML scan room, while MP4 only needs its 12-byte ftyp.
+      const headSize = Math.min(st.size, RECORD_HEAD_SCAN_BYTES);
+      const head = Buffer.alloc(headSize);
+      fs.readSync(fd, head, 0, headSize, 0);
+      const tailSize = Math.min(st.size, RECORD_TAIL_SCAN_BYTES);
+      const tail = Buffer.alloc(tailSize);
+      fs.readSync(fd, tail, 0, tailSize, st.size - tailSize);
+      const res = assessRecording({ head, tail, size: st.size, ext });
+      return { ...res, bytes: st.size };
+    } finally { fs.closeSync(fd); }
+  } catch (err) {
+    return { ok: false, reason: err.message, bytes: st.size };
+  }
+}
+
+/**
+ * Ends the in-flight camera recording and returns the verified file path.
+ * Detaches the session first (without killing) so the recorder's exit cannot
+ * tear down fresh state, stops it gracefully, lets the file flush, then
+ * verifies playability. Throws an honest error for a dead file instead of
+ * handing back a path no player will open. The live preview session is left
+ * for the caller to restart or stop.
+ */
+async function finalizeCameraRecording() {
+  const filePath = cameraRecordingFile;
+  cameraRecordingFile = null;
+  if (!filePath) return null;
+  const recChild = cameraSession && cameraSession.child ? cameraSession.child : null;
+  // Detach without killing: the exit handler below becomes a no-op for it.
+  closeCameraSession({ killScrcpy: false });
+  if (recChild) await stopScrcpyGracefully(recChild);
+  // Let the OS flush the last muxed bytes before inspecting.
+  await new Promise((r) => setTimeout(r, RECORD_FLUSH_SETTLE_MS));
+  // Repair skewed A/V timelines (device timestamp quirk) before verifying.
+  try { repairRecordingFileInPlace(filePath); } catch { /* fall through to verify */ }
+  const check = verifyRecordingFile(filePath);
+  if (!check.ok) {
+    const hint = path.extname(filePath).toLowerCase() === '.mp4'
+      ? 'Try again, ideally saving as .mkv.'
+      : 'The recorder did not shut down cleanly — try recording again and stop with the Record button.';
+    throw new Error(`Recording did not finalize (${check.reason}). ${hint}`);
+  }
+  return filePath;
+}
+
+/**
  * Camera video record: records the pristine hardware-encoded camera stream
- * directly to a local MP4 file on the PC using scrcpy's native --record.
+ * directly to a local file on the PC using scrcpy's native --record.
+ * MKV is the default because it stays playable even if the recorder dies
+ * mid-stream; MP4 remains selectable but needs the clean shutdown below.
  */
 ipcMain.handle('camera:recordStart', async (_e, serial) => {
   const targetSerial = serial || cameraSession?.serial;
@@ -2973,30 +3132,45 @@ ipcMain.handle('camera:recordStart', async (_e, serial) => {
   if (!cameraSession || !cameraSession.child || cameraSession.child.exitCode !== null) {
     throw new Error('Camera stream is not running. Start the camera first.');
   }
+  if (cameraRecordingFile) throw new Error('Already recording — stop the current recording first.');
 
-  const defaultName = `camera-record-${Date.now()}.mp4`;
+  const defaultName = `camera-record-${Date.now()}.mkv`;
   const { canceled, filePath } = await dialog.showSaveDialog({
     defaultPath: defaultName,
-    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }, { name: 'MKV Video', extensions: ['mkv'] }],
+    filters: [{ name: 'MKV Video', extensions: ['mkv'] }, { name: 'MP4 Video', extensions: ['mp4'] }],
   });
   if (canceled || !filePath) return null;
 
   cameraRecordingFile = filePath;
   const currOpts = { ...cameraSession.opts, record: filePath };
-  await startCameraSession(currOpts);
+  try {
+    await startCameraSession(currOpts);
+  } catch (err) {
+    cameraRecordingFile = null;
+    throw err;
+  }
   return filePath;
 });
 
 ipcMain.handle('camera:recordStop', async () => {
-  const filePath = cameraRecordingFile;
-  cameraRecordingFile = null;
-  if (!filePath) return null;
-
-  if (cameraSession) {
-    const currOpts = { ...cameraSession.opts };
-    delete currOpts.record;
-    await startCameraSession(currOpts);
+  if (!cameraRecordingFile) return null;
+  const recSession = cameraSession;
+  const recSerial = recSession ? recSession.serial : null;
+  const recOpts = recSession ? { ...recSession.opts } : null;
+  // Finalize first (verifies playability). The preview restart below runs
+  // either way so a bad file never also kills the live view — but a corrupt
+  // file is still reported, not hidden behind the restart.
+  let filePath = null;
+  let finalizeErr = null;
+  try { filePath = await finalizeCameraRecording(); }
+  catch (err) { finalizeErr = err; }
+  if (recOpts) {
+    delete recOpts.record;
+    if (!recOpts.serial && recSerial) recOpts.serial = recSerial;
+    try { await startCameraSession(recOpts); }
+    catch (err) { if (!finalizeErr) throw err; }
   }
+  if (finalizeErr) throw finalizeErr;
   return filePath;
 });
 
