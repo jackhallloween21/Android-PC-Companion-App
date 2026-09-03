@@ -386,6 +386,32 @@ function parseTorchStatus(out) {
   return null;
 }
 
+/**
+ * PIDs of device-side scrcpy processes holding the CAMERA, parsed from
+ * `adb shell ps -A -o PID,ARGS` output. Only `video_source=camera` cmdlines
+ * match, so mirror (display-source) servers never count.
+ *
+ * Why this exists: killing the PC-side scrcpy child does not always take its
+ * on-device server with it — notably when adb itself crashes, all sockets
+ * vaporize while servers keep running and holding camera 0. The next camera
+ * open then EVICT-fights the ghost (visible in `dumpsys media.camera` as
+ * `EVICT device 0 client ... score 1001`) or fails outright, which surfaces
+ * as a frozen first frame. Callers kill exactly these PIDs; anything else —
+ * our dex helpers, the mirror server, `grep` itself — can never match.
+ */
+function findStaleCameraServerPids(psOutput) {
+  const pids = [];
+  for (const line of String(psOutput || '').split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const cmd = m[2];
+    if (/com\.genymobile\.scrcpy\.Server/.test(cmd) && /video_source=camera/.test(cmd)) {
+      pids.push(m[1]);
+    }
+  }
+  return pids;
+}
+
 /** Plain-English reason a torch toggle failed, from the shell's own output. */
 function describeTorchFailure(output) {
   const text = String(output || '').trim();
@@ -487,5 +513,6 @@ module.exports = {
   hasTorchTile,
   parseTorchStatus,
   describeTorchFailure,
+  findStaleCameraServerPids,
   describeBridge,
 };

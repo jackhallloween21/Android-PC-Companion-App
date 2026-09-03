@@ -112,6 +112,11 @@ function setView(view) {
 function refreshView(view) {
   if (view !== 'hardware') stopHardwarePolling();
   if (view !== 'dashboard') stopDashboardPolling();
+  // The 1/s capturer poll is only useful while looking at it; elsewhere it
+  // just burns CPU and sprays wgc_capturer errors for windows Chromium cannot
+  // capture. The stream itself keeps running — refreshBridge() resumes the
+  // feed on return while it is still live.
+  if (view !== 'multimedia') stopCameraFeed();
   if (!state.selected) return;
   if (view === 'dashboard') { loadDashboard(); loadStorage(); startDashboardPolling(); }
   if (view === 'files') { loadFiles(); loadFileStorage(); }
@@ -2647,7 +2652,14 @@ async function refreshBridge() {
     // A stopped stream (e.g. stopped from the dock bar) must not keep a stale
     // feed polling behind it — that is what sprayed capturer errors and then
     // painted the phone screen into the camera preview.
-    if (!st.running) stopCameraFeed();
+    if (!st.running) {
+      stopCameraFeed();
+    } else if (!cameraFeedInterval && state.activeView === 'multimedia'
+        && !(el('mm-webcam') && el('mm-webcam').classList.contains('hidden'))) {
+      // Returning to a live stream (or landing here while one runs elsewhere)
+      // resumes the preview instead of leaving a stale placeholder.
+      startCameraFeed();
+    }
     // Keep the record button honest: a recording may have ended elsewhere
     // (control bar, mic toggle) while this tab was open.
     if (typeof st.recording === 'boolean' && st.recording !== isRecording) {
@@ -2987,6 +2999,7 @@ async function pollNowPlaying() {
   if (!state.selected) return;
   try {
     const res = await window.api.nowPlaying(state.selected);
+    if (!res) return null; // adb hiccup: keep last state, try again next poll
     renderNowPlaying(res.track, res.sessions, res.readAt, res.artUris);
     return res;
   } catch {

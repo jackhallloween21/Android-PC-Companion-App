@@ -20,6 +20,7 @@ const {
   hasTorchTile,
   parseTorchStatus,
   describeTorchFailure,
+  findStaleCameraServerPids,
   describeBridge,
   TORCH_TILES,
 } = require('../src/camera');
@@ -404,4 +405,42 @@ test('torch state is read back when the camera service reports it', () => {
   assert.strictEqual(parseTorchStatus('  torch status = OFF'), 'off');
   assert.strictEqual(parseTorchStatus('Camera 0 status: present'), null);
   assert.strictEqual(parseTorchStatus(''), null);
+});
+
+// Captured from a live device (`adb shell ps -A -o PID,ARGS`) while a camera
+// scrcpy session was up: the sh wrapper, the server itself, and noise that
+// must never match (mirror server, our own dex helpers, the grep process).
+const PS_CAMERA_UP = `PID CMD
+13116 sh -c CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 4.1 scid=167b54b5 log_level=info video_source=camera audio_source=mic
+13118 app_process / com.genymobile.scrcpy.Server 4.1 scid=167b54b5 log_level=info video_source=camera audio_source=mic
+13131 app_process / com.genymobile.scrcpy.CleanUp 0 -1 false false -1 -1
+13336 grep -i scrcpy`;
+
+test('only camera-source scrcpy servers match, by PID', () => {
+  assert.deepStrictEqual(findStaleCameraServerPids(PS_CAMERA_UP), ['13116', '13118']);
+});
+
+test('mirror servers, dex helpers and noise never match', () => {
+  const ps = `PID CMD
+4412 app_process / com.genymobile.scrcpy.Server 4.1 scid=aaaa log_level=info video_source=display
+5521 app_process /system/bin com.companion.MediaArtFetcher content://media/external/audio/albumart/42
+6630 app_process /system/bin com.companion.IconExtractor com.example.app
+7741 logd
+8808 grep video_source=camera`;
+  assert.deepStrictEqual(findStaleCameraServerPids(ps), []);
+});
+
+test('stale-server search tolerates empty and garbage input', () => {
+  assert.deepStrictEqual(findStaleCameraServerPids(''), []);
+  assert.deepStrictEqual(findStaleCameraServerPids(null), []);
+  assert.deepStrictEqual(findStaleCameraServerPids(undefined), []);
+  assert.deepStrictEqual(findStaleCameraServerPids('PID CMD\nnot a pid line\n'), []);
+});
+
+test('every orphaned camera server is listed, not just the first', () => {
+  const ps = [
+    '100 app_process / com.genymobile.scrcpy.Server 3.0 x video_source=camera',
+    '200 app_process / com.genymobile.scrcpy.Server 4.1 y video_source=camera audio_source=mic',
+  ].join('\n');
+  assert.deepStrictEqual(findStaleCameraServerPids(ps), ['100', '200']);
 });

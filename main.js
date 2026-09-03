@@ -110,6 +110,7 @@ const {
   hasTorchTile,
   parseTorchStatus,
   describeTorchFailure,
+  findStaleCameraServerPids,
   describeBridge,
 } = require('./src/camera');
 const {
@@ -2291,11 +2292,29 @@ function controlBarWindow(bar, serial, { type = 'mirror' } = {}) {
   return win;
 }
 
+function destroyDockBar(session) {
+  // The dock bar is an always-on-top window: if it survives Stop it sits on
+  // screen forever and its capturer keeps failing. Detach first so the async
+  // 'closed' event is a no-op, drop its listeners, hide synchronously (instant
+  // even if destroy самого lags), then destroy — every step guarded, because a
+  // half-dead window must never wedge the teardown.
+  const bar = session ? session.bar : null;
+  if (session) session.bar = null;
+  if (!bar) return;
+  try { bar.removeAllListeners('closed'); } catch {}
+  try {
+    if (!bar.isDestroyed()) {
+      try { bar.hide(); } catch {}
+      bar.destroy();
+    }
+  } catch { /* already gone */ }
+}
+
 function closeMirrorSession({ killScrcpy = false } = {}) {
   const session = mirrorSession;
   mirrorSession = null;
   if (!session) return;
-  if (session.bar && !session.bar.isDestroyed()) session.bar.destroy();
+  destroyDockBar(session);
   if (killScrcpy && session.child && session.child.exitCode === null) {
     try { session.child.kill(); } catch { /* already gone */ }
   }
@@ -2675,7 +2694,16 @@ ipcMain.handle('media:key', async (_e, { serial, action, package: pkg }) => {
 });
 
 ipcMain.handle('media:nowPlaying', async (_e, serial) => {
-  const out = await adb(['-s', serial, 'shell', 'dumpsys', 'media_session']);
+  // adb.exe itself can crash mid-call (exit 3221225477 / 0xC0000005, seen with
+  // concurrent shell dumpsys on some platform-tools builds). A dead music
+  // widget must never surface as an exception: report nothing and let the
+  // renderer keep its last state.
+  let out;
+  try {
+    out = await adb(['-s', serial, 'shell', 'dumpsys', 'media_session']);
+  } catch {
+    return null;
+  }
   const track = parseNowPlaying(out);
   // Every art URI in the dump, primary first: the artwork fetcher tries them
   // in order because the first is occasionally a stale placeholder.
@@ -2905,11 +2933,34 @@ function cleanScrcpyLog(text) {
     .join('\n');
 }
 
+/**
+ * Best-effort kill of on-device scrcpy servers holding the CAMERA, by PID.
+ * Killing the PC-side child does not always take its server with it — when
+ * adb itself crashes, sockets vaporize while servers keep holding camera 0,
+ * and the next open EVICT-fights the ghost (or fails into a frozen frame).
+ * Mirror servers can never match (different video source), so this is safe
+ * to run on start and stop. Returns the kill count; never throws.
+ */
+async function killStaleCameraServers(serial) {
+  if (!serial) return 0;
+  let pids = [];
+  try {
+    const ps = await adb(['-s', serial, 'shell', 'ps', '-A', '-o', 'PID,ARGS']);
+    pids = findStaleCameraServerPids(ps);
+  } catch { return 0; }
+  let killed = 0;
+  for (const pid of pids) {
+    try { await adb(['-s', serial, 'shell', 'kill', '-9', pid]); killed += 1; }
+    catch { /* already gone */ }
+  }
+  return killed;
+}
+
 function closeCameraSession({ killScrcpy = false } = {}) {
   const session = cameraSession;
   cameraSession = null;
   if (!session) return;
-  if (session.bar && !session.bar.isDestroyed()) session.bar.destroy();
+  destroyDockBar(session);
   if (killScrcpy && session.child && session.child.exitCode === null) {
     try { session.child.kill(); } catch { /* already gone */ }
   }
@@ -2919,6 +2970,12 @@ async function startCameraSession(opts = {}) {
   const { serial } = opts;
   await assertDeviceReady(serial);
   assertCameraSupport();
+  // One camera client at a time: the preview and the virtual-webcam bridge run
+  // separate scrcpy processes, and the second opener EVICTs the first — both
+  // sides then stutter on a frozen frame. Refuse with directions, not glitches.
+  if (webcamHandle && webcamHandle.running) {
+    throw new Error('Virtual webcam is using the camera — stop it first (Multimedia → PC webcam off).');
+  }
   // If a recording is in flight and this restart would abandon it (mic toggle,
   // camera switch, rotate, …), finalize the file first instead of corrupting it
   // with the hard kill below. Best-effort: the restart itself must not fail
@@ -2927,6 +2984,10 @@ async function startCameraSession(opts = {}) {
     try { await finalizeCameraRecording(); } catch { cameraRecordingFile = null; }
   }
   closeCameraSession({ killScrcpy: true });
+  // Clear any ghost server left by a previous session (notably after an adb
+  // crash orphaned one) so this spawn never EVICT-fights for camera 0.
+  // Best-effort and mirror-safe: only video_source=camera servers can match.
+  try { await killStaleCameraServers(serial); } catch {}
   if (audioProcess) {
     try { audioProcess.kill(); } catch { /* ignore */ }
     audioProcess = null;
@@ -3051,6 +3112,7 @@ ipcMain.handle('camera:start', async (_e, opts = {}) => startCameraSession(opts)
 
 ipcMain.handle('camera:stop', async () => {
   const wasOpen = !!cameraSession || !!cameraRecordingFile;
+  const serial = cameraSession ? cameraSession.serial : null;
   // Stopping mid-record must finalize the file, not corrupt it: without this
   // the recorder is hard-killed and the MP4 never gets its moov index.
   // Never throws for a bad recording — the stream still stops; the outcome
@@ -3062,6 +3124,12 @@ ipcMain.handle('camera:stop', async () => {
     catch (err) { recordError = err.message; }
   }
   closeCameraSession({ killScrcpy: true });
+  // The PC-side kill does not always take the on-device server with it. Sweep
+  // camera-source servers so the next Start never EVICT-fights a ghost and
+  // freezes on its first frame. Best-effort: a failed sweep must not fail Stop.
+  if (serial) {
+    try { await killStaleCameraServers(serial); } catch {}
+  }
   return { stopped: wasOpen, recording, recordError };
 });
 
@@ -3645,6 +3713,15 @@ ipcMain.handle('webcam:start', async (_e, opts = {}) => {
   }
   if (!isWebcamRegistered()) {
     throw new Error('Virtual camera is not registered yet. Press "Register virtual camera" first (one UAC prompt).');
+  }
+  // One camera client at a time: a live preview would EVICT-war with the
+  // bridge (the next opener wins, the loser freezes on a dead frame).
+  if (cameraRecordingFile) {
+    throw new Error('Stop the camera recording first — the virtual webcam needs exclusive camera access.');
+  }
+  if (cameraSession) {
+    closeCameraSession({ killScrcpy: true });
+    try { await killStaleCameraServers(serial); } catch {}
   }
   const size = String(opts.size || '1280x720');
   const m = size.match(/^(\d+)x(\d+)$/);
