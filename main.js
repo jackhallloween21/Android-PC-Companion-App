@@ -1536,17 +1536,67 @@ ipcMain.handle('files:pull', async (e, { serial, remotePath }) => {
   }
 });
 
+/**
+ * Recursively lists files under a remote directory (paths relative to it),
+ * so a selected folder downloads as a tree instead of being skipped. Uses
+ * NUL separation to survive spaces, quotes, and newlines in names; throws
+ * when the device has no find(1), and the caller falls back to a whole-dir
+ * `adb pull` instead.
+ */
+async function listRemoteFilesRecursive(serial, remoteDir) {
+  const dir = String(remoteDir).replace(/\/?$/, '');
+  const out = await adb(['-s', serial, 'shell', 'find ' + JSON.stringify(dir) + ' -type f -print0']);
+  return String(out || '')
+    .split('\0')
+    .map((p) => p.replace(/\r$/, ''))
+    .filter((p) => p.startsWith(dir + '/'))
+    .map((p) => p.slice(dir.length + 1))
+    .filter(Boolean);
+}
+
 ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
   if (!destDir) {
     const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Select download folder' });
     if (result.canceled || !result.filePaths.length) return null;
     destDir = result.filePaths[0];
   }
+  // Expand selected folders into their contained files with structure
+  // preserved (destDir/<folder>/<relative path>), keeping per-file progress.
+  // A folder that walks empty — genuinely empty, or a device without find —
+  // stays a single whole-directory entry pulled natively below.
+  const queue = [];
+  for (const f of files) {
+    if (!f.isDir) { queue.push({ ...f, localRel: f.name }); continue; }
+    let rels = null;
+    try { rels = await listRemoteFilesRecursive(serial, f.path); } catch { rels = null; }
+    if (!rels || !rels.length) { queue.push({ ...f, isDir: true, localRel: f.name }); continue; }
+    const base = String(f.path).replace(/\/?$/, '');
+    for (const rel of rels) {
+      queue.push({ path: base + '/' + rel, name: f.name + '/' + rel, localRel: path.join(f.name, rel) });
+    }
+  }
   const results = [];
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 0 });
-    const localPath = path.join(destDir, f.name);
+  for (let i = 0; i < queue.length; i++) {
+    const f = queue[i];
+    e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 0 });
+    const localPath = path.join(destDir, f.localRel);
+    if (f.isDir) {
+      // Whole-directory fallback: `adb pull` recurses natively. destDir
+      // exists, so the folder lands as destDir/<name>/… — indeterminate
+      // progress while it runs, since adb reports no per-file signal.
+      // Pre-creating the target also preserves genuinely empty folders,
+      // which `adb pull` alone would silently skip.
+      try {
+        fs.mkdirSync(path.join(destDir, f.name), { recursive: true });
+        await adb(['-s', serial, 'pull', f.path, destDir]);
+        results.push({ name: f.name, ok: true, path: path.join(destDir, f.name) });
+      } catch (err) {
+        results.push({ name: f.name, ok: false, error: err.message });
+      }
+      e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 100 });
+      continue;
+    }
+    try { fs.mkdirSync(path.dirname(localPath), { recursive: true }); } catch { /* ignore */ }
     try {
       let totalBytes = 0;
       try {
@@ -1561,12 +1611,12 @@ ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
           bytesRead += chunk.length;
           ws.write(chunk);
           const pct = totalBytes > 0 ? Math.min(99, Math.round((bytesRead / totalBytes) * 100)) : -1;
-          e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
+          e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: pct, bytes: bytesRead, totalBytes });
         });
         proc.on('close', (code) => { ws.end(() => code === 0 ? resolve() : reject(new Error('exit ' + code))); });
         proc.on('error', (err) => { ws.end(); reject(err); });
       });
-      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
+      e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 100, bytes: bytesRead, totalBytes: bytesRead });
       results.push({ name: f.name, ok: true, path: localPath });
     } catch (err) {
       try {
@@ -1575,7 +1625,7 @@ ipcMain.handle('files:pullBatch', async (e, { serial, files, destDir }) => {
       } catch (pullErr) {
         results.push({ name: f.name, ok: false, error: pullErr.message });
       }
-      e.sender.send('files:pullProgress', { index: i, total: files.length, name: f.name, percent: 100 });
+      e.sender.send('files:pullProgress', { index: i, total: queue.length, name: f.name, percent: 100 });
     }
   }
   return { destDir, results };

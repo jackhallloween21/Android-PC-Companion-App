@@ -923,9 +923,6 @@ function updateFileToolbar() {
   const upBtn = el('file-upload-btn');
   if (dlBtn) dlBtn.disabled = count === 0;
   if (upBtn) upBtn.disabled = count === 0;
-  // count actual files (not dirs) for download
-  const fileCount = count - [...state.selectedFiles].filter((p) => p._isDir).length;
-  if (dlBtn) dlBtn.disabled = fileCount === 0;
 }
 
 qAll('#file-category-tabs .chip-tab').forEach((tab) => {
@@ -1127,9 +1124,10 @@ el('fi-pull-btn').onclick = async () => {
   setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 };
 
-// Batch download
+// Batch download — files and folders alike. Folders download recursively with
+// their structure preserved (see files:pullBatch); each entry reports progress.
 el('file-download-btn').onclick = async () => {
-  const files = [...state.selectedFiles].filter((f) => !f._isDir);
+  const files = [...state.selectedFiles];
   if (!files.length) return;
   const progress = el('file-transfer-progress');
   const fill = el('file-transfer-fill');
@@ -1150,12 +1148,12 @@ el('file-download-btn').onclick = async () => {
     }
   });
   try {
-    const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop() })));
+    const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop(), isDir: !!f._isDir })));
     if (res) {
       const ok = res.results.filter((r) => r.ok).length;
       const fail = res.results.filter((r) => !r.ok).length;
       label.textContent = 'Done: ' + ok + ' saved' + (fail ? ', ' + fail + ' failed' : '') + ' to ' + res.destDir;
-      toast('Downloaded ' + ok + ' file(s) to ' + res.destDir);
+      toast('Downloaded ' + ok + ' item(s) to ' + res.destDir);
     } else {
       label.textContent = 'Download cancelled.';
     }
