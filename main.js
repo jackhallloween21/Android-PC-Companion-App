@@ -1576,7 +1576,7 @@ ipcMain.handle('files:push', async (e, { serial, remoteDir }) => {
   const name = path.basename(localPath);
   const remotePath = remoteDir.replace(/\/?$/, '/') + name;
   const totalBytes = fs.statSync(localPath).size;
-  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: 0, bytes: 0, totalBytes });
+  e.sender.send('files:pushProgress', { index: 0, total: 1, name, percent: -1, bytes: 0, totalBytes });
   try {
     const tmpPath = '/data/local/tmp/_push_' + Date.now() + '_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
     await adb(['-s', serial, 'push', localPath, tmpPath]);
@@ -1598,7 +1598,7 @@ ipcMain.handle('files:pushBatch', async (e, { serial, remoteDir }) => {
   for (let i = 0; i < filePaths.length; i++) {
     const lp = filePaths[i];
     const name = path.basename(lp);
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 0, bytes: 0, totalBytes: 0 });
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
     let totalBytes = 0;
     try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
     try {
@@ -1618,7 +1618,7 @@ ipcMain.handle('files:pushBatchFiles', async (e, { serial, remoteDir, filePaths 
   for (let i = 0; i < filePaths.length; i++) {
     const lp = filePaths[i];
     const name = path.basename(lp);
-    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: 0, bytes: 0, totalBytes: 0 });
+    e.sender.send('files:pushProgress', { index: i, total: filePaths.length, name, percent: -1, bytes: 0, totalBytes: 0 });
     let totalBytes = 0;
     try { totalBytes = fs.statSync(lp).size; } catch { /* ignore */ }
     try {
@@ -2474,7 +2474,7 @@ ipcMain.handle('camera:list', async (_e, serial) => {
   return {
     cameras,
     limits,
-    mic: supportsMic(scrcpyInfo.help),
+    mic: supportsMic(scrcpyInfo.help, scrcpyInfo),
     v4l2: supportsV4l2(scrcpyInfo.help),
   };
 });
@@ -2567,7 +2567,7 @@ async function startCameraSession(opts = {}) {
     orientation: opts.orientation,
     record: opts.record,
     stayAwake: true,
-  }, scrcpyInfo.help);
+  }, scrcpyInfo.help, scrcpyInfo);
 
   const args = canDock
     ? [...baseArgs, ...buildWindowArgs(layout.video, scrcpyInfo.help, { borderless: !!opts.borderless })]
@@ -2585,6 +2585,7 @@ async function startCameraSession(opts = {}) {
     type: 'camera',
     title: cameraWindowTitle(serial),
     borderless: !!opts.borderless,
+    micActive: baseArgs.some((a) => /--audio-source=mic/.test(a)),
   };
 
   try {
@@ -2654,7 +2655,7 @@ ipcMain.handle('camera:status', () => ({
   running: !!(cameraSession && cameraSession.child && cameraSession.child.exitCode === null),
   serial: cameraSession ? cameraSession.serial : null,
   size: cameraSession ? (cameraSession.opts.size || null) : null,
-  mic: cameraSession ? !!cameraSession.opts.mic : false,
+  mic: cameraSession ? !!cameraSession.micActive : false,
   docked: !!(cameraSession && cameraSession.bar),
   zoom: cameraSession ? cameraSession.zoom : 1,
 }));

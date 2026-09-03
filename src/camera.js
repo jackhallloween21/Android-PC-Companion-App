@@ -136,8 +136,9 @@ function describeCamera(cam) {
  * @param {boolean} [o.mic]        also forward the phone microphone
  * @param {string} [o.v4l2Device]  Linux: write frames to this loopback device
  * @param {?string} help
+ * @param {object} [info]  scrcpyInfo { major, minor, help } for version-based detection
  */
-function buildCameraArgs(serial, o = {}, help = null) {
+function buildCameraArgs(serial, o = {}, help = null, info = null) {
   if (!serial) throw new Error('No device selected.');
   const source = pickFlag(help, CAMERA_FLAGS.videoSource);
   if (!source) throw new Error('This scrcpy build cannot use the camera as a video source (needs 2.2 or newer).');
@@ -164,7 +165,7 @@ function buildCameraArgs(serial, o = {}, help = null) {
   // Audio: the mic is a genuine capture source; without it there is nothing
   // worth forwarding from a camera session, so the default is silence.
   const audioFlag = pickFlag(help, CAMERA_FLAGS.audioSource);
-  if (o.mic && audioFlag && supportsMic(help)) args.push(`${audioFlag}=mic`);
+  if (o.mic && audioFlag && supportsMic(help, info)) args.push(`${audioFlag}=mic`);
   else if (supportsFlag(help, '--no-audio') ?? true) args.push('--no-audio');
 
   if (o.v4l2Device) {
@@ -178,8 +179,10 @@ function buildCameraArgs(serial, o = {}, help = null) {
 }
 
 /** Whether `--audio-source=mic` is available (scrcpy 2.2+ on Android 11+). */
-function supportsMic(help) {
+function supportsMic(help, info) {
   if (!help) return true;
+  // Fast path: version >= 2.2 always supports mic regardless of help parsing.
+  if (info && (info.major > 2 || (info.major === 2 && info.minor >= 2))) return true;
   // scrcpy 2.x-3.x: --audio-source listed with mic option
   if (/--audio-source[^\n]*\bmic\b/i.test(help)) return true;
   const match = (help.match(/--audio-source[\s\S]{0,400}/) || [''])[0];
