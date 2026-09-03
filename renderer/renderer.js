@@ -935,31 +935,317 @@ qAll('#file-category-tabs .chip-tab').forEach((tab) => {
 });
 
 el('list-files-btn').onclick = loadFiles;
+
+// ---------------------------------------------------------------------------
+// Transfer center: one floating sheet for uploads and downloads, modelled on
+// a phone-style transfer manager (overall %, ETA, speed, totals, active item,
+// per-file queue) but drawn entirely with theme variables so dark and light
+// mode both work. A single persistent listener per direction feeds it — the
+// old code registered a new ipcRenderer listener on every transfer and never
+// removed it.
+// ---------------------------------------------------------------------------
+const TransferCenter = {
+  active: false,
+  done: false,
+  cancelled: false,
+  failed: false,
+  direction: 'download', // 'download' | 'upload'
+  items: [], // { name, isDir, status: queued|active|done|failed, bytes, totalBytes, percent, error }
+  from: '',
+  to: '',
+  startedAt: 0,
+  samples: [], // { t, bytes } trailing window for speed/ETA
+  collapsed: false,
+  _raf: false,
+
+  start({ direction, items, from, to }) {
+    this.active = true;
+    this.done = false;
+    this.cancelled = false;
+    this.failed = false;
+    this.direction = direction === 'upload' ? 'upload' : 'download';
+    this.items = (Array.isArray(items) ? items : []).map((it) => ({
+      name: it && it.name ? String(it.name) : 'Preparing…',
+      isDir: !!(it && it.isDir),
+      status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '',
+    }));
+    this.from = from || '';
+    this.to = to || '';
+    this.startedAt = Date.now();
+    this.samples = [];
+    el('transfer-center').classList.remove('hidden');
+    el('transfer-pill').classList.add('hidden');
+    el('tc-icon').textContent = this.direction === 'upload' ? '⬆' : '⬇';
+    el('transfer-pill-icon').textContent = this.direction === 'upload' ? '⬆' : '⬇';
+    this.render();
+  },
+
+  rowFor(data) {
+    const name = data && data.name ? String(data.name) : '';
+    // Name first: main expands folders server-side, so event indexes address
+    // the expanded queue — using them blindly would rename the parent folder
+    // row to its first child. Index is only a fallback for unnamed rows.
+    if (name) {
+      const hit = this.items.find((it) => it.name === name);
+      if (hit) return hit;
+    }
+    if (Number.isInteger(data.index) && this.items[data.index]
+        && (!name || this.items[data.index].name === name || this.items[data.index].name === 'Preparing…')) {
+      return this.items[data.index];
+    }
+    const row = { name: name || 'Item', isDir: false, status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '' };
+    this.items.push(row);
+    return row;
+  },
+
+  onEvent(data) {
+    if (!this.active || this.done || !data) return;
+    const row = this.rowFor(data);
+    if (data.name && (!row.name || row.name === 'Preparing…')) row.name = String(data.name);
+    row.status = 'active';
+    if (Number.isFinite(data.bytes)) row.bytes = data.bytes;
+    if (Number.isFinite(data.totalBytes) && data.totalBytes > 0) row.totalBytes = data.totalBytes;
+    if (data.percent === 100) {
+      row.percent = 100;
+      row.status = 'done';
+      if (row.totalBytes) row.bytes = row.totalBytes;
+    } else if (typeof data.percent === 'number' && data.percent >= 0) {
+      row.percent = data.percent;
+    } else {
+      row.percent = -1; // indeterminate: working, no measurable fraction
+    }
+    const snap = this.totals();
+    const now = Date.now();
+    const last = this.samples[this.samples.length - 1];
+    if (!last || now - last.t > 250 || snap.done !== last.bytes) this.samples.push({ t: now, bytes: snap.done });
+    this.scheduleRender();
+  },
+
+  totals() {
+    let done = 0;
+    let known = 0;
+    let doneCount = 0;
+    for (const it of this.items) {
+      if (it.totalBytes > 0) { known += it.totalBytes; done += Math.min(it.bytes, it.totalBytes); }
+      if (it.status === 'done') doneCount += 1;
+    }
+    return { done, known, doneCount, total: this.items.length };
+  },
+
+  speed() {
+    const now = Date.now();
+    this.samples = this.samples.filter((s) => now - s.t < 4000);
+    if (this.samples.length < 2) return 0;
+    const first = this.samples[0];
+    const last = this.samples[this.samples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    return dt > 0.3 ? Math.max(0, (last.bytes - first.bytes) / dt) : 0;
+  },
+
+  scheduleRender() {
+    if (this._raf) return;
+    this._raf = true;
+    const paint = () => { this._raf = false; this.render(); };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(paint);
+    else setTimeout(paint, 100);
+  },
+
+  fmtEta(sec) {
+    if (!Number.isFinite(sec) || sec < 0) return 'Calculating…';
+    if (sec < 2) return 'Almost done…';
+    if (sec < 60) return `About ${Math.round(sec)}s left`;
+    const m = Math.round(sec / 60);
+    return m < 60 ? `About ${m}m left` : `About ${Math.floor(m / 60)}h ${m % 60}m left`;
+  },
+
+  activeRow() {
+    return this.items.find((it) => it.status === 'active')
+      || this.items.filter((it) => it.status === 'done').slice(-1)[0]
+      || null;
+  },
+
+  render() {
+    const doPaint = () => {
+      const snap = this.totals();
+      const sheet = el('transfer-center');
+      const hidden = sheet.classList.contains('hidden');
+      const pctText = snap.known > 0
+        ? `${Math.min(100, Math.round((snap.done / snap.known) * 100))}%`
+        : (snap.total ? `${Math.round((snap.doneCount / snap.total) * 100)}%` : '0%');
+      el('transfer-pill-text').textContent = this.done ? 'Done' : pctText;
+      if (hidden) return;
+      const isUp = this.direction === 'upload';
+      el('tc-title').textContent = this.failed ? 'Transfer failed'
+        : this.cancelled ? 'Transfer cancelled'
+        : this.done ? (isUp ? 'Upload complete' : 'Download complete')
+        : (isUp ? 'Uploading Files' : 'Downloading Files');
+      el('tc-count').textContent = `${snap.total} item${snap.total === 1 ? '' : 's'}`;
+      el('tc-pct').textContent = this.done && snap.doneCount === snap.total && snap.total ? '100%' : pctText;
+      const spd = this.done ? 0 : this.speed();
+      const remaining = snap.known - snap.done;
+      el('tc-eta').textContent = this.done ? (snap.doneCount === snap.total && snap.total ? 'Finished' : '')
+        : (snap.known > 0 && spd > 0 ? this.fmtEta(remaining / spd) : 'Calculating…');
+      const fill = el('tc-overall-fill');
+      if (snap.known > 0) {
+        fill.classList.remove('indet');
+        fill.style.width = `${snap.known ? Math.min(100, (snap.done / snap.known) * 100) : 0}%`;
+      } else if (snap.doneCount > 0 && snap.total) {
+        fill.classList.remove('indet');
+        fill.style.width = `${(snap.doneCount / snap.total) * 100}%`;
+      } else {
+        fill.classList.add('indet');
+        fill.style.width = '';
+      }
+      el('tc-speed').textContent = spd > 0 ? `${formatSize(spd)}/s` : '—';
+      el('tc-totals').textContent = snap.known > 0
+        ? `${formatSize(snap.done)} / ${formatSize(snap.known)}`
+        : `${snap.doneCount} / ${snap.total} items`;
+      el('tc-route').textContent = this.from && this.to ? `${this.from} → ${this.to}` : '';
+      // Active item card.
+      const active = this.done ? null : this.activeRow();
+      const activeBox = el('tc-active');
+      if (!active) {
+        activeBox.classList.add('hidden');
+      } else {
+        activeBox.classList.remove('hidden');
+        const idx = this.items.indexOf(active);
+        el('tc-active-idx').textContent = `ACTIVE ITEM (${idx + 1} OF ${snap.total})`;
+        el('tc-active-pct').textContent = active.percent >= 0 ? `${Math.round(active.percent)}%` : '…';
+        el('tc-active-icon').textContent = fileIcon(active.name, active.isDir, false);
+        el('tc-active-name').textContent = active.name;
+        el('tc-active-name').title = active.name;
+        const parts = [];
+        if (active.totalBytes > 0) parts.push(`${formatSize(active.bytes)} of ${formatSize(active.totalBytes)}`);
+        else if (active.bytes > 0) parts.push(formatSize(active.bytes));
+        if (spd > 0 && active.status === 'active') parts.push(`${formatSize(spd)}/s`);
+        if (!parts.length) parts.push(active.status === 'done' ? 'Done' : active.isDir ? 'Folder • working…' : 'Working…');
+        el('tc-active-sub').textContent = parts.join(' • ');
+        const afill = el('tc-active-fill');
+        if (active.percent >= 0) { afill.classList.remove('indet'); afill.style.width = `${active.percent}%`; }
+        else { afill.classList.add('indet'); afill.style.width = ''; }
+      }
+      // Queue.
+      el('tc-queue-title').innerHTML = `Transfer Queue <span class="muted">(${snap.total} item${snap.total === 1 ? '' : 's'})</span>`;
+      const list = el('tc-queue');
+      const scroll = list.scrollTop;
+      list.innerHTML = this.items.map((it) => {
+        let sub;
+        let state;
+        let mark;
+        if (it.status === 'done') {
+          sub = `Completed${it.totalBytes > 0 ? ' • ' + formatSize(it.totalBytes) : ''}`;
+          state = 'ok'; mark = '✓';
+        } else if (it.status === 'failed') {
+          sub = it.error ? `Failed • ${it.error}` : 'Failed';
+          state = 'err'; mark = '✕';
+        } else if (it.status === 'active') {
+          sub = it.totalBytes > 0 ? `${formatSize(it.bytes)} of ${formatSize(it.totalBytes)}` : (it.bytes > 0 ? formatSize(it.bytes) : 'Working…');
+          state = 'idle'; mark = `${it.percent >= 0 ? Math.round(it.percent) + '%' : '…'}`;
+        } else {
+          sub = it.isDir ? 'Folder • Queued' : (it.totalBytes > 0 ? `Queued • ${formatSize(it.totalBytes)}` : 'Queued');
+          state = 'idle'; mark = '◷';
+        }
+        return `<div class="tc-row"><span class="tc-item-icon">${fileIcon(it.name, it.isDir, false)}</span>`
+          + `<span class="tc-row-text"><span class="tc-row-name" title="${esc(it.name)}">${esc(it.name)}</span>`
+          + `<span class="tc-row-sub ${state === 'ok' ? 'ok' : state === 'err' ? 'err' : ''}"${state === 'err' && it.error ? ` title="${esc(it.error)}"` : ''}>${esc(sub)}</span></span>`
+          + `<span class="tc-row-state ${state}">${mark}</span></div>`;
+      }).join('');
+      list.scrollTop = scroll;
+    };
+    doPaint();
+  },
+
+  finish({ results, single, cancelled, destDir, error } = {}) {
+    if (Array.isArray(results)) {
+      for (const r of results) {
+        if (!r) continue;
+        let row = (r.name && this.items.find((it) => it.name === r.name)) || null;
+        if (!row && this.items.length === 1) row = this.items[0];
+        if (!row) {
+          row = { name: r.name || 'Item', isDir: false, status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '' };
+          this.items.push(row);
+        }
+        if (r.ok) {
+          row.status = 'done';
+          row.percent = 100;
+          if (row.totalBytes) row.bytes = row.totalBytes;
+        } else {
+          row.status = 'failed';
+          row.error = r.error ? cleanIpcError(String(r.error)) : 'Failed';
+        }
+      }
+      // Folders expand server-side into sub-entries: retire a leftover queued
+      // parent once any of its children completed.
+      for (const it of this.items) {
+        if (it.status !== 'queued') continue;
+        const covered = this.items.some((o) => o !== it && o.status === 'done' && o.name.startsWith(it.name + '/'));
+        if (covered) { it.status = 'done'; it.percent = 100; }
+      }
+    } else if (single) {
+      let row = this.items.find((it) => it.status !== 'queued') || this.items[0];
+      if (!row) {
+        row = { name: String(single).split(/[\\/]/).pop(), isDir: false, status: 'queued', bytes: 0, totalBytes: 0, percent: 0, error: '' };
+        this.items.push(row);
+      }
+      row.status = 'done';
+      row.percent = 100;
+    }
+    if (typeof destDir === 'string' && destDir) this.to = destDir;
+    this.done = true;
+    this.cancelled = !!cancelled;
+    this.failed = !!error || (Array.isArray(results) && results.some((r) => r && !r.ok));
+    el('transfer-pill').classList.add('hidden');
+    this.render();
+  },
+
+  fail(err) {
+    this.finish({ error: err ? cleanIpcError(String((err && err.message) || err)) : 'Failed' });
+  },
+
+  cancel() {
+    this.finish({ cancelled: true });
+  },
+
+  hide() {
+    el('transfer-center').classList.add('hidden');
+    if (this.active && !this.done) {
+      el('transfer-pill').classList.remove('hidden');
+    } else {
+      el('transfer-pill').classList.add('hidden');
+    }
+  },
+
+  show() {
+    el('transfer-center').classList.remove('hidden');
+    el('transfer-pill').classList.add('hidden');
+    this.render();
+  },
+};
+
+el('tc-close').onclick = () => TransferCenter.hide();
+el('tc-collapse').onclick = () => {
+  TransferCenter.collapsed = !TransferCenter.collapsed;
+  el('tc-body').classList.toggle('hidden', TransferCenter.collapsed);
+  el('tc-collapse').innerHTML = TransferCenter.collapsed ? '&#9656;' : '&#9662;';
+};
+el('transfer-pill').onclick = () => TransferCenter.show();
+// One persistent listener per direction (also fixes the old per-transfer leak).
+window.api.onPushProgress((data) => {
+  if (TransferCenter.active && !TransferCenter.done && TransferCenter.direction === 'upload') TransferCenter.onEvent(data);
+});
+window.api.onPullProgress((data) => {
+  if (TransferCenter.active && !TransferCenter.done && TransferCenter.direction === 'download') TransferCenter.onEvent(data);
+});
+
 el('push-file-btn').onclick = async () => {
   if (!state.selected) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPushProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      label.textContent = 'Uploading ' + data.name + '...';
-    } else {
-      fill.style.background = '';
-      fill.style.width = data.percent + '%';
-      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%');
-    }
-  });
+  TransferCenter.start({ direction: 'upload', items: [], from: 'This PC', to: 'Phone ' + el('remote-path').value });
   try {
     const result = await window.api.pushFile(state.selected, el('remote-path').value);
-    if (result) { toast('Uploaded ' + result.split('/').pop()); label.textContent = 'Done \u2014 ' + result; }
-    else { label.textContent = 'Cancelled.'; }
-  } catch (err) { label.textContent = 'Error: ' + err.message; }
+    if (result) { TransferCenter.finish({ single: result }); toast('Uploaded ' + result.split('/').pop()); }
+    else { TransferCenter.cancel(); }
+  } catch (err) { TransferCenter.fail(err); }
   loadFiles();
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 3000);
 };
 
 // Select-all checkbox
@@ -1099,29 +1385,17 @@ async function selectFile(name, fullPath, itemInfo) {
 // Single-file download
 el('fi-pull-btn').onclick = async () => {
   if (!state.selectedFile) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPullProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      const dl = data.bytes ? formatSize(data.bytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '');
-    } else {
-      fill.style.background = '';
-      fill.style.width = data.percent + '%';
-      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%');
-    }
+  TransferCenter.start({
+    direction: 'download',
+    items: [{ name: state.selectedFile.name }],
+    from: 'Phone ' + state.selectedFile.fullPath,
+    to: 'This PC',
   });
   try {
     const saved = await window.api.pullFile(state.selected, state.selectedFile.fullPath);
-    if (saved) { toast('Saved to ' + saved); label.textContent = 'Done \u2014 ' + saved; }
-    else { label.textContent = 'Cancelled.'; }
-  } catch (err) { label.textContent = 'Error: ' + err.message; }
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
+    if (saved) { TransferCenter.finish({ single: saved, destDir: saved }); toast('Saved to ' + saved); }
+    else { TransferCenter.cancel(); }
+  } catch (err) { TransferCenter.fail(err); }
 };
 
 // Batch download — files and folders alike. Folders download recursively with
@@ -1129,108 +1403,65 @@ el('fi-pull-btn').onclick = async () => {
 el('file-download-btn').onclick = async () => {
   const files = [...state.selectedFiles];
   if (!files.length) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPullProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      const dl = data.bytes ? formatSize(data.bytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    } else {
-      fill.style.background = '';
-      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
-      fill.style.width = overall + '%';
-      const dl = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Downloading ' + data.name + (dl ? ' \u2014 ' + dl : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    }
+  TransferCenter.start({
+    direction: 'download',
+    items: files.map((f) => ({ name: f.name || f.path.split('/').pop(), isDir: !!f._isDir })),
+    from: 'Phone ' + el('remote-path').value,
+    to: 'This PC',
   });
   try {
     const res = await window.api.pullBatch(state.selected, files.map((f) => ({ path: f.path, name: f.name || f.path.split('/').pop(), isDir: !!f._isDir })));
     if (res) {
       const ok = res.results.filter((r) => r.ok).length;
-      const fail = res.results.filter((r) => !r.ok).length;
-      label.textContent = 'Done: ' + ok + ' saved' + (fail ? ', ' + fail + ' failed' : '') + ' to ' + res.destDir;
+      TransferCenter.finish({ results: res.results, destDir: res.destDir });
       toast('Downloaded ' + ok + ' item(s) to ' + res.destDir);
     } else {
-      label.textContent = 'Download cancelled.';
+      TransferCenter.cancel();
     }
   } catch (err) {
-    label.textContent = 'Error: ' + err.message;
+    TransferCenter.fail(err);
   }
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 };
 
 // Batch upload
 async function uploadFiles(filePaths) {
   if (!filePaths || !filePaths.length || !state.selected) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPushProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      const ul = data.bytes ? formatSize(data.bytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : '') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    } else {
-      fill.style.background = '';
-      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
-      fill.style.width = overall + '%';
-      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    }
+  TransferCenter.start({
+    direction: 'upload',
+    items: filePaths.map((p) => ({ name: String(p).split(/[\\/]/).pop() })),
+    from: 'This PC',
+    to: 'Phone ' + el('remote-path').value,
   });
   try {
     const results = await window.api.pushBatchFiles(state.selected, el('remote-path').value, filePaths);
     if (results && results.length) {
       const ok = results.filter((r) => r.ok).length;
-      const fail = results.filter((r) => !r.ok).length;
-      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
+      TransferCenter.finish({ results });
       toast('Uploaded ' + ok + ' file(s)');
       loadFiles();
     } else {
-      label.textContent = 'Upload cancelled.';
+      TransferCenter.cancel();
     }
   } catch (err) {
-    label.textContent = 'Error: ' + err.message;
+    TransferCenter.fail(err);
   }
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 }
-
 el('file-upload-btn').onclick = async () => {
   if (!state.selected) return;
-  const progress = el('file-transfer-progress');
-  const fill = el('file-transfer-fill');
-  const label = el('file-transfer-label');
-  progress.classList.remove('hidden');
-  window.api.onPushProgress((data) => {
-    if (data.percent === -1) {
-      fill.style.width = '100%';
-      fill.style.background = 'repeating-linear-gradient(90deg, var(--signal) 0 12px, var(--panel-strong) 12px 24px)';
-      label.textContent = 'Uploading ' + data.name + ' (' + (data.index + 1) + '/' + data.total + ')';
-    } else {
-      fill.style.background = '';
-      const overall = data.total > 1 ? (data.index / data.total * 100) + (data.percent / data.total) : data.percent;
-      fill.style.width = overall + '%';
-      const ul = data.totalBytes ? formatSize(data.bytes) + ' / ' + formatSize(data.totalBytes) : '';
-      label.textContent = 'Uploading ' + data.name + (ul ? ' \u2014 ' + ul : ' ' + data.percent + '%') + ' (' + (data.index + 1) + '/' + data.total + ')';
-    }
+  TransferCenter.start({
+    direction: 'upload',
+    items: [],
+    from: 'This PC',
+    to: 'Phone ' + el('remote-path').value,
   });
   try {
     const results = await window.api.pushBatch(state.selected, el('remote-path').value);
     if (results && results.length) {
-      const ok = results.filter((r) => r.ok).length;
-      const fail = results.filter((r) => !r.ok).length;
-      label.textContent = 'Done: ' + ok + ' uploaded' + (fail ? ', ' + fail + ' failed' : '');
-      toast('Uploaded ' + ok + ' file(s)');
-    } else { label.textContent = 'Upload cancelled.'; }
-  } catch (err) { label.textContent = 'Error: ' + err.message; }
+      TransferCenter.finish({ results });
+      toast('Uploaded ' + results.filter((r) => r.ok).length + ' file(s)');
+    } else { TransferCenter.cancel(); }
+  } catch (err) { TransferCenter.fail(err); }
   loadFiles();
-  setTimeout(() => { progress.classList.add('hidden'); fill.style.width = '0%'; fill.style.background = ''; }, 4000);
 };
 
 // Drag-and-drop upload
