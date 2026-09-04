@@ -75,7 +75,24 @@ function buildScrcpyCameraArgs(serial, o = {}, help = null) {
   return args;
 }
 
-/** ffmpeg: demux mkv from stdin, emit raw bgr24 frames on stdout. */
+/**
+ * ffmpeg: demux mkv from stdin, emit raw bgr24 frames on stdout.
+ *
+ * Tuned for LIVE latency, not archival fidelity. The one change from a plain
+ * transcode is `-vsync 0` (frame passthrough): emit each decoded frame as-is
+ * instead of buffering to regulate a constant output rate (the default with a
+ * `-r` target). Forcing CFR is what let latency creep upward over a long
+ * session -- every hiccup added a frame to ffmpeg's rate-conversion queue that
+ * never drained. softcam always serves the newest frame anyway, so a steady
+ * wall-clock cadence out of ffmpeg buys nothing here. `fps` is still validated
+ * (the bridge is told the declared rate via --fps) but no longer pins output.
+ *
+ * Deliberately conservative on decode flags: `-fflags nobuffer` / `-flags
+ * low_delay` were tried and destabilised this exact pipeline (ffmpeg faulted
+ * mid-stream, Windows exit 3221225477 = access violation), so they are left
+ * off. `-vsync 0` uses the portable spelling, not `-fps_mode` (ffmpeg >= 5.1
+ * only), so 4.x builds keep working.
+ */
 function buildFfmpegArgs({ width, height, fps }) {
   if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
     throw new Error(`Invalid frame size ${width}x${height}.`);
@@ -86,7 +103,7 @@ function buildFfmpegArgs({ width, height, fps }) {
     '-i', 'pipe:0',
     '-map', '0:v:0',
     '-vf', `scale=${width}:${height}`,
-    '-r', String(fps),
+    '-vsync', '0',
     '-f', 'rawvideo',
     '-pix_fmt', 'bgr24',
     'pipe:1',
@@ -208,9 +225,22 @@ function startWebcamBridge({
   const sockets = new Set();
   const splitter = createFrameSplitter(frameBytes);
   const pending = []; // frames waiting on bridge backpressure
-  const MAX_PENDING = 120;
+  // Live stream: never let a backlog build. If the bridge applies backpressure
+  // we hold at most a couple of frames and always favour the freshest, so a
+  // momentary stall costs a dropped frame or two, never accumulating latency
+  // (the old 120-frame cap could sit on ~4s of stale video before shedding).
+  const MAX_PENDING = 2;
   let dropped = 0;
   let server = null;
+  // Liveness stats: the bridge keeps serving its last frame to DirectShow
+  // clients after the feeder dies, so "running" alone cannot tell a live
+  // picture from a frozen one. Frames + byte counters let callers detect a
+  // stall (e.g. the phone encoder wedged with all processes still alive).
+  const startedAt = Date.now();
+  let framesSent = 0;
+  let firstFrameAt = 0;
+  let lastFrameAt = 0;
+  let bytesForwarded = 0;
 
   function log(msg) { try { onLog(String(msg)); } catch { /* logging never breaks the pipe */ } }
   function finish(origin, code) {
@@ -252,6 +282,10 @@ function startWebcamBridge({
   function onFrame(frame) {
     const sink = bridgeProc && bridgeProc.stdin && bridgeProc.stdin.writable ? bridgeProc.stdin : null;
     if (!sink) return;
+    const now = Date.now();
+    if (!firstFrameAt) firstFrameAt = now;
+    lastFrameAt = now;
+    framesSent += 1;
     const packet = packFrame(frame);
     if (pending.length) {
       // Still draining: queue behind, dropping oldest past the cap rather
@@ -275,6 +309,9 @@ function startWebcamBridge({
     sock.on('error', (err) => log(`pipe socket error: ${err.message}`));
     sock.on('close', () => sockets.delete(sock));
     // Bytes flow scrcpy -> ffmpeg; the server itself only forwards them.
+    // Count them: bytes flowing with zero decoded frames means ffmpeg (not
+    // scrcpy) is the stuck stage; zero bytes means scrcpy/phone is silent.
+    sock.on('data', (chunk) => { bytesForwarded += chunk.length; });
     sock.pipe(ffmpegProc.stdin, { end: false });
     sock.on('end', () => { /* scrcpy closed its end; ffmpeg drains what it has */ });
   });
@@ -341,6 +378,12 @@ function startWebcamBridge({
     stop,
     get running() { return running; },
     get pipePath() { return pipePath; },
+    get startedAt() { return startedAt; },
+    get framesSent() { return framesSent; },
+    get firstFrameAt() { return firstFrameAt; },
+    get lastFrameAt() { return lastFrameAt; },
+    get droppedFrames() { return dropped; },
+    get bytesForwarded() { return bytesForwarded; },
   };
 }
 

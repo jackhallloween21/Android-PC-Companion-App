@@ -21,7 +21,7 @@ Module._load = function (request, parent, isMain) {
   return realLoad(request, parent, isMain);
 };
 
-const { pickScrcpyAsset, findExecutable } = require('../src/downloader');
+const { pickScrcpyAsset, pickFfmpegAsset, findExecutable } = require('../src/downloader');
 
 Module._load = realLoad;
 
@@ -95,6 +95,66 @@ test('the executable is found inside the nested versioned folder', () => {
 
 test('a missing directory returns null instead of throwing', () => {
   assert.strictEqual(findExecutable(path.join(os.tmpdir(), 'definitely-not-here'), 'scrcpy'), null);
+});
+
+// A trimmed copy of a real BtbN/FFmpeg-Builds release asset list. Both gpl and
+// lgpl, shared and static, across platforms.
+const FF_ASSETS = [
+  { name: 'ffmpeg-master-latest-win64-gpl.zip' },
+  { name: 'ffmpeg-master-latest-win64-gpl-shared.zip' },
+  { name: 'ffmpeg-master-latest-win64-lgpl.zip' },
+  { name: 'ffmpeg-master-latest-win64-lgpl-shared.zip' },
+  { name: 'ffmpeg-master-latest-winarm64-lgpl-shared.zip' },
+  { name: 'ffmpeg-master-latest-linux64-gpl.tar.xz' },
+  { name: 'ffmpeg-master-latest-linux64-lgpl.tar.xz' },
+  { name: 'ffmpeg-master-latest-linux64-lgpl-shared.tar.xz' },
+  { name: 'ffmpeg-master-latest-linuxarm64-lgpl-shared.tar.xz' },
+];
+
+test('ffmpeg picker takes the LGPL shared build for the platform/arch', () => {
+  assert.strictEqual(
+    asPlatform('win32', 'x64', () => pickFfmpegAsset(FF_ASSETS)).name,
+    'ffmpeg-master-latest-win64-lgpl-shared.zip'
+  );
+  assert.strictEqual(
+    asPlatform('win32', 'arm64', () => pickFfmpegAsset(FF_ASSETS)).name,
+    'ffmpeg-master-latest-winarm64-lgpl-shared.zip'
+  );
+  assert.strictEqual(
+    asPlatform('linux', 'x64', () => pickFfmpegAsset(FF_ASSETS)).name,
+    'ffmpeg-master-latest-linux64-lgpl-shared.tar.xz'
+  );
+  assert.strictEqual(
+    asPlatform('linux', 'arm64', () => pickFfmpegAsset(FF_ASSETS)).name,
+    'ffmpeg-master-latest-linuxarm64-lgpl-shared.tar.xz'
+  );
+});
+
+test('ffmpeg picker NEVER selects a GPL build (license safety)', () => {
+  // The whole point: bundling a -gpl- build would contaminate this MIT app.
+  for (const plat of ['win32', 'linux']) {
+    const chosen = asPlatform(plat, 'x64', () => pickFfmpegAsset(FF_ASSETS));
+    assert.ok(chosen, `expected a build for ${plat}`);
+    assert.ok(/lgpl/i.test(chosen.name), `${chosen.name} must be lgpl`);
+    assert.ok(!/(^|-)gpl(-|\.)/i.test(chosen.name), `${chosen.name} must not be a plain gpl build`);
+  }
+  // If ONLY gpl builds exist, pick nothing rather than contaminate.
+  const gplOnly = [
+    { name: 'ffmpeg-master-latest-win64-gpl.zip' },
+    { name: 'ffmpeg-master-latest-win64-gpl-shared.zip' },
+  ];
+  assert.strictEqual(asPlatform('win32', 'x64', () => pickFfmpegAsset(gplOnly)), null);
+});
+
+test('ffmpeg picker falls back to a static LGPL build when no shared one exists', () => {
+  const noShared = [
+    { name: 'ffmpeg-master-latest-win64-gpl.zip' },
+    { name: 'ffmpeg-master-latest-win64-lgpl.zip' },
+  ];
+  assert.strictEqual(
+    asPlatform('win32', 'x64', () => pickFfmpegAsset(noShared)).name,
+    'ffmpeg-master-latest-win64-lgpl.zip'
+  );
 });
 
 test('the recursion depth is bounded', () => {

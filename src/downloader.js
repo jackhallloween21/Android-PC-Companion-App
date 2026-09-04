@@ -11,15 +11,18 @@ function binDir() {
 }
 
 // Node 18+/Electron ships a global fetch — no extra HTTP dependency needed.
-async function download(url, destFile, onProgress) {
+// The abort timer guards against a *stalled* connection: it is reset on every
+// chunk, so a slow-but-progressing download (ffmpeg is ~40 MB) is not killed
+// mid-flight — only a connection that goes silent for `idleMs` is aborted.
+async function download(url, destFile, onProgress, idleMs = 30000) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  let timer = setTimeout(() => controller.abort(), idleMs);
+  const bump = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort(), idleMs); };
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'android-pc-companion' },
       signal: controller.signal,
     });
-    clearTimeout(timeout);
     if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
     const total = Number(res.headers.get('content-length') || 0);
     let received = 0;
@@ -28,14 +31,16 @@ async function download(url, destFile, onProgress) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      bump(); // progress resets the stall timer
       received += value.length;
       fileStream.write(Buffer.from(value));
       if (onProgress && total) onProgress(received / total);
     }
     await new Promise((resolve, reject) => fileStream.end((err) => (err ? reject(err) : resolve())));
   } catch (err) {
-    clearTimeout(timeout);
     throw new Error(`Download failed: ${err.message}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -177,4 +182,115 @@ async function ensureScrcpy(onProgress) {
   return exePath;
 }
 
-module.exports = { ensurePlatformTools, ensureScrcpy, findExecutable, pickScrcpyAsset };
+// ---------------------------------------------------------------------------
+// ffmpeg — needed only by the softcam virtual-webcam pipeline. Fetched from
+// BtbN/FFmpeg-Builds, which publishes per-commit release archives with an
+// API to enumerate them.
+//
+// LICENSE (do not relax): this app is MIT, so we must fetch an **LGPL** build.
+// BtbN ships both -gpl and -lgpl variants; the -gpl one links x264/x265 (GPL)
+// and would contaminate the app if we redistributed it. We only ever match
+// assets whose name contains "lgpl", and pick the *shared* variant (ffmpeg.exe
+// beside its avcodec/avformat DLLs) which is smaller and all we need to decode.
+// The archive is extracted whole so those sibling DLLs land next to the exe.
+//
+// BtbN asset name shape (Windows): ffmpeg-master-latest-win64-lgpl-shared.zip
+// (linux/arm variants exist too). Match loosely on platform/arch + lgpl +
+// shared so a naming drift doesn't hard-fail.
+// ---------------------------------------------------------------------------
+
+function pickFfmpegAsset(assets) {
+  const archives = assets.filter((a) => /\.(zip|tar\.xz|tar\.gz)$/i.test(a.name));
+  // LGPL only — never a plain -gpl- build (links x264/x265, GPL) which would
+  // contaminate this MIT app on redistribution. "lgpl" is BtbN's exact token
+  // for the LGPL variant, so matching it is both necessary and sufficient.
+  const lgpl = archives.filter((a) => /lgpl/i.test(a.name));
+  const arm = process.arch === 'arm64';
+
+  const platformRe = {
+    win32: /win64|winarm64/i,
+    darwin: /(macos|osx|darwin)/i, // BtbN does not ship macOS; kept for symmetry
+    linux: arm ? /linuxarm64|linux.*arm64/i : /linux64|linux.*(x86_64|x64)/i,
+  }[process.platform] || /linux64/i;
+
+  const archRe = process.platform === 'win32'
+    ? (arm ? /winarm64/i : /win64/i)
+    : platformRe;
+
+  // Prefer the shared build (exe + DLLs); accept a static one as a fallback.
+  const tiers = [
+    (a) => archRe.test(a.name) && /shared/i.test(a.name),
+    (a) => archRe.test(a.name),
+    (a) => platformRe.test(a.name),
+  ];
+  for (const match of tiers) {
+    const hit = lgpl.find(match);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function latestFfmpegAsset() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch('https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest', {
+      headers: { 'User-Agent': 'android-pc-companion' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`Could not check the latest ffmpeg release (HTTP ${res.status})`);
+    const data = await res.json();
+    const asset = pickFfmpegAsset(data.assets || []);
+    if (!asset) {
+      throw new Error(`No LGPL ffmpeg build matched ${process.platform}/${process.arch}`);
+    }
+    return asset;
+  } catch (err) {
+    clearTimeout(timeout);
+    throw new Error(`Could not check the latest ffmpeg release: ${err.message}`);
+  }
+}
+
+async function ensureFfmpeg(onProgress) {
+  const dir = binDir();
+  // Kept in its own softcam/ subfolder so it sits beside the native binaries
+  // the webcam bridge also resolves from (WEBCAM_BIN_DIR in main.js).
+  const ffDir = path.join(dir, 'softcam');
+  const exeName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+
+  // A shared ffmpeg needs its sibling DLLs; the extracted build keeps the exe
+  // in a bin/ subdir alongside them, so resolve wherever the walk finds it.
+  const cached = findExecutable(ffDir, exeName);
+  if (cached) return cached;
+
+  const asset = await latestFfmpegAsset();
+  const archivePath = path.join(dir, asset.name);
+  await download(asset.browser_download_url, archivePath, onProgress, 60000);
+  fs.mkdirSync(ffDir, { recursive: true });
+
+  if (/\.zip$/i.test(asset.name)) {
+    await extract(archivePath, { dir: ffDir });
+  } else {
+    await tar.x({ file: archivePath, cwd: ffDir }); // tar handles .tar.xz/.tar.gz
+  }
+  fs.unlinkSync(archivePath);
+
+  const exePath = findExecutable(ffDir, exeName);
+  if (!exePath) {
+    throw new Error(`Extracted ${asset.name} but could not find ${exeName} inside it`);
+  }
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(exePath, 0o755); } catch { /* best effort */ }
+  }
+  return exePath;
+}
+
+module.exports = {
+  ensurePlatformTools,
+  ensureScrcpy,
+  ensureFfmpeg,
+  findExecutable,
+  pickScrcpyAsset,
+  pickFfmpegAsset,
+};

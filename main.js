@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, screen, session, desktopCapturer, n
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
-const { ensurePlatformTools, ensureScrcpy } = require('./src/downloader');
+const { ensurePlatformTools, ensureScrcpy, ensureFfmpeg, findExecutable } = require('./src/downloader');
 const { sanitizeSettings } = require('./src/theme');
 const {
   POWER_SCRIPT,
@@ -332,6 +332,28 @@ async function initTools(win) {
       return;
     }
     send({ step: 'scrcpy', status: 'done', message: scrcpyInfo.version });
+
+    // ffmpeg: only the Windows softcam webcam pipeline needs it, and only if the
+    // user hasn't already supplied one (APC_FFMPEG_PATH / prior download / PATH).
+    // Best-effort and non-fatal — the rest of the app works without it, so a
+    // failure here must never block setup. Fetches an LGPL build (see
+    // ensureFfmpeg) to keep this MIT app's redistribution clean.
+    if (process.platform === 'win32') {
+      try {
+        send({ step: 'ffmpeg', status: 'checking' });
+        if (await resolveFfmpegPath()) {
+          send({ step: 'ffmpeg', status: 'done' });
+        } else {
+          send({ step: 'ffmpeg', status: 'downloading', progress: 0 });
+          tools.ffmpeg = await ensureFfmpeg((p) => send({ step: 'ffmpeg', status: 'downloading', progress: p }));
+          send({ step: 'ffmpeg', status: 'done' });
+        }
+      } catch (err) {
+        // Surface it but keep going: webcam status line will still guide the user.
+        send({ step: 'ffmpeg', status: 'error', message: err.message });
+      }
+    }
+
     completeSetup();
   } finally {
     clearTimeout(safetyTimer);
@@ -3635,14 +3657,34 @@ function resolveWebcamPaths() {
   };
 }
 
-/** ffmpeg with a PATH fallback (covers winget installs). Async: PATH lookup shells out. */
+/**
+ * ffmpeg resolution, in priority order:
+ *   1. a path this session already resolved/downloaded (tools.ffmpeg)
+ *   2. APC_FFMPEG_PATH / a flat userData/bin/softcam/ffmpeg.exe (resolveWebcamPaths)
+ *   3. the auto-downloaded build — extracted nested as
+ *      softcam/ffmpeg-<ver>/bin/ffmpeg.exe, so walk the softcam dir to find it
+ *      (ensureFfmpeg lands it there)
+ *   4. PATH (covers a winget/manual install)
+ * Async because the PATH lookup shells out.
+ */
 async function resolveFfmpegPath() {
+  if (tools.ffmpeg && fs.existsSync(tools.ffmpeg)) return tools.ffmpeg;
+
   const paths = resolveWebcamPaths();
-  if (paths.ffmpeg) return paths.ffmpeg;
+  if (paths.ffmpeg) { tools.ffmpeg = paths.ffmpeg; return paths.ffmpeg; }
+
+  // Auto-downloaded shared build sits in a nested bin/ dir next to its DLLs.
+  try {
+    const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+    const softcamDir = path.join(app.getPath('userData'), 'bin', 'softcam');
+    const walked = findExecutable(softcamDir, exe, 5);
+    if (walked) { tools.ffmpeg = walked; return walked; }
+  } catch { /* fall through to PATH */ }
+
   if (process.platform === 'win32') {
     try {
       const onPath = await resolveOnPath('ffmpeg');
-      if (onPath) return onPath;
+      if (onPath) { tools.ffmpeg = onPath; return onPath; }
     } catch { /* not on PATH */
     }
   }
@@ -3666,6 +3708,19 @@ function isWebcamRegistered() {
 
 let webcamHandle = null;
 const webcamLog = [];
+// Last pipeline death (origin/code/at), kept after the handle is cleared so
+// the UI can say *why* a stream died instead of silently unchecking.
+let webcamLastEnd = null;
+// Softcam-instance counter for the current run: every "camera WxH ready"
+// bridge line is a fresh instance, and viewers bound to a deleted instance
+// keep showing its frozen last frame until they re-select the camera.
+let webcamCamReadyCount = 0;
+// No decoded frame for this long while the pipeline claims to run = the
+// virtual camera is showing a frozen frame (softcam replays its last frame
+// to DirectShow clients after the feeder stalls).
+const WEBCAM_STALL_MS = 5000;
+// Grace for the first frame: camera open + encoder spin-up takes seconds.
+const WEBCAM_FIRST_FRAME_MS = 15000;
 function webcamLogLine(msg) {
   webcamLog.push(`[${new Date().toISOString()}] ${String(msg).trim()}`);
   if (webcamLog.length > 40) webcamLog.splice(0, webcamLog.length - 40);
@@ -3681,9 +3736,29 @@ function stopWebcamBridge() {
 ipcMain.handle('webcam:status', async () => {
   if (!scrcpyInfo.version) await probeScrcpyVersion().catch(() => {});
   const paths = resolveWebcamPaths();
+  const running = !!(webcamHandle && webcamHandle.running);
+  let stats = null;
+  if (webcamHandle && running) {
+    const now = Date.now();
+    const frames = Number(webcamHandle.framesSent) || 0;
+    const lastAt = Number(webcamHandle.lastFrameAt) || 0;
+    const startAt = Number(webcamHandle.startedAt) || now;
+    const lastAgeMs = frames > 0 ? now - lastAt : now - startAt;
+    const stalled = frames > 0 ? lastAgeMs > WEBCAM_STALL_MS : (now - startAt) > WEBCAM_FIRST_FRAME_MS;
+    stats = {
+      framesSent: frames,
+      droppedFrames: Number(webcamHandle.droppedFrames) || 0,
+      bytesForwarded: Number(webcamHandle.bytesForwarded) || 0,
+      lastFrameAgeMs: lastAgeMs,
+      stalled,
+      cameraInstances: webcamCamReadyCount,
+    };
+  }
   return {
     supported: process.platform === 'win32',
-    running: !!(webcamHandle && webcamHandle.running),
+    running,
+    stats,
+    lastEnd: webcamLastEnd,
     bridgePresent: !!paths.bridge,
     ffmpegPresent: !!(await resolveFfmpegPath()),
     installerPresent: !!paths.installer,
@@ -3695,6 +3770,7 @@ ipcMain.handle('webcam:status', async () => {
 });
 
 ipcMain.handle('webcam:start', async (_e, opts = {}) => {
+  const startWin = BrowserWindow.fromWebContents(_e.sender);
   if (process.platform !== 'win32') {
     throw new Error('The native virtual webcam is Windows-only; use the OBS route on macOS or v4l2 loopback on Linux (see camera:bridge).');
   }
@@ -3707,7 +3783,21 @@ ipcMain.handle('webcam:start', async (_e, opts = {}) => {
   if (!paths.bridge) {
     throw new Error('softcam-bridge.exe is not bundled yet — the native bridge ships with a future release. Use the OBS route meanwhile.');
   }
-  const ffmpegPath = await resolveFfmpegPath();
+  let ffmpegPath = await resolveFfmpegPath();
+  if (!ffmpegPath && process.platform === 'win32') {
+    // Self-heal: setup normally fetches ffmpeg, but if that was skipped or
+    // failed (offline first run, etc.), fetch it now so the user isn't sent to
+    // a manual install. LGPL build only — see ensureFfmpeg.
+    try {
+      webcamLog.push('[ffmpeg] not found — downloading an LGPL build…');
+      tools.ffmpeg = await ensureFfmpeg((p) => {
+        if (startWin && !startWin.isDestroyed()) startWin.webContents.send('setup:progress', { step: 'ffmpeg', status: 'downloading', progress: p });
+      });
+      ffmpegPath = tools.ffmpeg;
+    } catch (err) {
+      throw new Error(`ffmpeg could not be downloaded automatically (${err.message}). Install an LGPL build (\`winget install -e --id BtbN.FFmpeg.LGPL.Shared.8.1\`) or point APC_FFMPEG_PATH at ffmpeg.exe. A GPL build would contaminate this MIT app, so only LGPL is used.`);
+    }
+  }
   if (!ffmpegPath) {
     throw new Error('ffmpeg not found. Install an LGPL build (`winget install -e --id BtbN.FFmpeg.LGPL.Shared.8.1`) or point APC_FFMPEG_PATH at ffmpeg.exe (bundling a GPL build would contaminate this MIT app).');
   }
@@ -3740,6 +3830,8 @@ ipcMain.handle('webcam:start', async (_e, opts = {}) => {
     recordTarget: 'probe',
   }, scrcpyInfo.help);
   webcamLogLine(`starting bridge ${width}x${height}@${fps} for ${serial}`);
+  webcamLastEnd = null;
+  webcamCamReadyCount = 0;
   webcamHandle = startWebcamBridge({
     serial,
     scrcpyPath: tools.scrcpy,
@@ -3751,8 +3843,14 @@ ipcMain.handle('webcam:start', async (_e, opts = {}) => {
     fps,
     bitrate,
     help: scrcpyInfo.help,
-    onLog: webcamLogLine,
-    onExit: ({ code, origin }) => webcamLogLine(`pipeline ended via ${origin} (code ${code})`),
+    onLog: (msg) => {
+      webcamLogLine(msg);
+      if (String(msg).includes('softcam-bridge: camera')) webcamCamReadyCount += 1;
+    },
+    onExit: ({ code, origin }) => {
+      webcamLastEnd = { origin, code: code ?? null, at: Date.now() };
+      webcamLogLine(`pipeline ended via ${origin} (code ${code})`);
+    },
   });
   // Grace window: a DOA pipeline (bad camera id, missing provider) exits
   // immediately; surfacing that now beats a silent dead toggle.

@@ -60,11 +60,18 @@ test('ffmpeg args demux stdin mkv to bgr24 stdout, video stream only', () => {
     '-i', 'pipe:0',
     '-map', '0:v:0',
     '-vf', 'scale=1280:720',
-    '-r', '30',
+    '-vsync', '0',
     '-f', 'rawvideo',
     '-pix_fmt', 'bgr24',
     'pipe:1',
   ]);
+  // -fps_mode is ffmpeg >= 5.1 only; must use the portable -vsync spelling so
+  // 4.x builds don't exit immediately (crash code 3221225477 on Windows).
+  const a = buildFfmpegArgs({ width: 640, height: 480, fps: 30 });
+  assert.ok(!a.includes('-fps_mode'), 'must not emit -fps_mode (breaks ffmpeg 4.x)');
+  // nobuffer/low_delay destabilised this pipeline (mid-stream fault); keep off.
+  assert.ok(!a.includes('nobuffer') && !a.includes('low_delay'),
+    'must not emit nobuffer/low_delay decode flags');
   assert.throws(() => buildFfmpegArgs({ width: 0, height: 720, fps: 30 }), /frame size/);
   assert.throws(() => buildFfmpegArgs({ width: 640, height: 480, fps: 0 }), /fps/);
 });

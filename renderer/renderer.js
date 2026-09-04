@@ -2690,9 +2690,36 @@ async function refreshWebcamStatus() {
   if (toggle) toggle.disabled = false;
   if (!val) return;
   if (st.running) {
-    val.textContent = 'Live';
-    val.className = 'cam-info-value green';
-    if (toggle) toggle.checked = true;
+    startWebcamPoll();
+    if (st.stats && st.stats.stalled) {
+      const age = Math.round((st.stats.lastFrameAgeMs || 0) / 1000);
+      val.textContent = st.stats.framesSent > 0 ? `Stalled — no frames for ${age}s` : 'No frames yet';
+      val.className = 'cam-info-value yellow';
+      // The virtual camera keeps replaying its last frame after the feeder
+      // stalls, so say so explicitly instead of leaving a fake "Live".
+      setCameraStatus('Webcam stream stalled (Zoom/Meet shows a frozen frame). Toggle PC webcam off and on to restart it.', 'err');
+    } else {
+      const n = st.stats ? ` · ${st.stats.framesSent} frames` : '';
+      const re = st.stats && st.stats.cameraInstances > 1 ? ' · re-pick camera in viewers' : '';
+      val.textContent = `Live${n}${re}`;
+      val.className = 'cam-info-value green';
+      if (toggle) toggle.checked = true;
+      // A recreated softcam instance orphans every viewer that opened the
+      // previous one: they keep its frozen last frame until re-selected.
+      if (st.stats && st.stats.cameraInstances > 1 && !webcamRecreateWarned) {
+        webcamRecreateWarned = true;
+        setCameraStatus('Webcam restarted its picture feed — re-select "DirectShow Softcam" in the browser/Zoom/Meet to unfreeze it.', 'err');
+      }
+    }
+  } else if (toggle && toggle.checked) {
+    // The pipeline died on its own (phone encoder, cable, sleep) while the
+    // toggle still showed on — report the recorded death instead of lying.
+    toggle.checked = false;
+    stopWebcamPoll();
+    const end = st.lastEnd ? ` (ended via ${st.lastEnd.origin}, code ${st.lastEnd.code})` : '';
+    val.textContent = 'Stopped';
+    val.className = 'cam-info-value yellow';
+    setCameraStatus(`Virtual webcam stopped by itself${end}. Toggle PC webcam on to restart it.`, 'err');
   } else if (!st.bridgePresent || !st.ffmpegPresent) {
     val.textContent = 'Binaries missing';
     val.className = 'cam-info-value yellow';
@@ -2705,6 +2732,19 @@ async function refreshWebcamStatus() {
   }
 }
 
+// While the toggle is on, re-check the pipeline every few seconds: a dead
+// or stalled bridge otherwise keeps a fake "Live" (and Zoom/Meet a frozen
+// frame) with nobody noticing.
+let webcamPollTimer = null;
+let webcamRecreateWarned = false;
+function stopWebcamPoll() {
+  if (webcamPollTimer) { clearInterval(webcamPollTimer); webcamPollTimer = null; }
+}
+function startWebcamPoll() {
+  stopWebcamPoll();
+  webcamPollTimer = setInterval(() => { refreshWebcamStatus().catch(() => {}); }, 3000);
+}
+
 el('camera-webcam').onchange = async () => {
   const toggle = el('camera-webcam');
   const val = el('webcam-status-value');
@@ -2712,6 +2752,7 @@ el('camera-webcam').onchange = async () => {
     if (val) { val.textContent = text; val.className = `cam-info-value${cls ? ` ${cls}` : ''}`; }
   };
   if (!toggle.checked) {
+    stopWebcamPoll();
     try { await window.api.webcamStop(); } catch { /* already stopped */ }
     paint('Off', '');
     setCameraStatus('Virtual webcam stopped.');
@@ -2749,7 +2790,10 @@ el('camera-webcam').onchange = async () => {
     });
     paint(`Live ${res.width}x${res.height}@${res.fps}`, 'green');
     setCameraStatus('Phone camera is live as "DirectShow Softcam" — pick it in Zoom/Meet/Teams.', 'ok');
+    webcamRecreateWarned = false;
+    startWebcamPoll();
   } catch (err) {
+    stopWebcamPoll();
     toggle.checked = false;
     paint('Failed', 'yellow');
     setCameraStatus('Virtual webcam failed: ' + cleanIpcError(err.message), 'err');
